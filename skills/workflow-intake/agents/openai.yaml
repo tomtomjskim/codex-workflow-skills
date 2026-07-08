@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workflow Intake"
+  short_description: "Guided intake and autonomy gates"
+  default_prompt: "Use $workflow-intake to turn my rough task into a scoped plan with approval gates."

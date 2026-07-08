@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adversarial Review Loop"
+  short_description: "Evidence-based adversarial review loop"
+  default_prompt: "Use $adversarial-review-loop to review this plan or diff and classify findings with evidence."
