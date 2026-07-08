@@ -72,6 +72,32 @@ Run adversarial review when a plan, diff, or implementation exists:
 Use $adversarial-review-loop to review this diff and classify findings.
 ```
 
+## Examples
+
+Route a broad task:
+
+```text
+Use $workflow to plan a multi-step checkout error-state cleanup before implementation.
+```
+
+Expected behavior: route to `workflow-intake`, ask for a missing repo/path if needed, choose an artifact level, set autonomy gates, and create a validation plan before implementation.
+
+Scope an AI feature:
+
+```text
+Use $workflow-intake to plan a product-facing AI support assistant that answers refund-policy questions from internal docs.
+```
+
+Expected behavior: require PRD when product behavior is being defined, require `EVAL_PLAN` for AI/LLM answer quality, keep `validation_level` to the supported enum, and keep browser E2E decisions separate from AI evaluation.
+
+Review an existing diff:
+
+```text
+Use $adversarial-review-loop to review this diff and classify findings with evidence.
+```
+
+Expected behavior: select reviewer lenses from changed surfaces, classify findings with evidence, avoid false passes from weak tests, and record residual risk.
+
 ## Context Discovery
 
 The skills support bounded discovery of:
