@@ -11,7 +11,9 @@ Resolve validation and forward-test risk before publishing or wiring the new wor
 - Local path: `/Users/jeongsik/dev/codex-workflow-skills`
 - Branch: `main`
 - GitHub owner requested by TOM: `tomtomjskim`
-- Current state: new local git repository, no commits yet
+- Current state: public GitHub repository pushed and tracking `origin/main`
+- GitHub URL: `https://github.com/tomtomjskim/codex-workflow-skills`
+- Latest commit: `f2d0756 Initial workflow skills scaffold`
 - `gh` active account: `tomtomjskim`
 - Local git user: `tomtomjskim <124156309+tomtomjskim@users.noreply.github.com>`
 
@@ -28,7 +30,6 @@ In scope:
 
 Out of scope until explicitly approved:
 
-- Publishing a public GitHub repository.
 - Installing the plugin into a shared marketplace.
 - Enabling the skills globally via symlink or copy.
 - Creating a wrapper `workflow` skill.
@@ -63,13 +64,16 @@ Out of scope until explicitly approved:
 - Post-plan-change `quick_validate.py skills/adversarial-review-loop`: pass
 - Post-plan-change `validate_plugin.py .`: pass
 - Post-plan-change scaffold/wording scan: pass
+- Initial commit created: `f2d0756 Initial workflow skills scaffold`
+- Public GitHub repository created: `tomtomjskim/codex-workflow-skills`
+- `main` pushed to `origin/main`: pass
 
 ## Risk Closure Status
 
 - Fresh-context over-trigger, full-auto, MED hard-stop, false-pass, and wiki/project-map scope risks have been tested and patched.
 - Plan management, mid-task change control, side-effect checks, and E2E decision policy have been added behind the existing intake activation boundary.
-- Remaining publication decision: GitHub repository visibility has not been specified, so remote creation is intentionally blocked.
-- Remaining git decision: no initial commit has been created yet.
+- Public GitHub publication is complete.
+- Local `main` tracks `origin/main`.
 
 ## Forward-Test Findings Applied
 
@@ -88,6 +92,6 @@ Out of scope until explicitly approved:
 
 ## Next Steps
 
-1. Create initial commit if TOM wants the local scaffold checkpointed.
-2. Ask before creating a public/private GitHub remote because repository visibility has not been specified.
-3. After visibility is chosen, create `tomtomjskim/codex-workflow-skills` remote and push `main`.
+1. Optionally install the skills locally via symlink or plugin flow.
+2. Optionally reflect the common workflow/review skill in `codex-project-guide`.
+3. Optionally create a route-only wrapper skill later; do not duplicate policy there.
