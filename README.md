@@ -90,6 +90,14 @@ Use $workflow-intake to plan a product-facing AI support assistant that answers 
 
 Expected behavior: require PRD when product behavior is being defined, require `EVAL_PLAN` for AI/LLM answer quality, keep `validation_level` to the supported enum, and keep browser E2E decisions separate from AI evaluation.
 
+Plan a UI/product workflow with artifact approval:
+
+```text
+Use $workflow-intake to plan a new settings workflow with several screens and a design refresh. I am not sure which docs we need.
+```
+
+Expected behavior: emit `artifact_decision` with separate planning and design doc recommendations, propose the smallest useful PRD/SPEC/TASK/TEST_PLAN and UX_CONCEPT/IA/UI_SPEC set for the repo, and ask before creating durable docs unless the user or repo already approved them.
+
 Review an existing diff:
 
 ```text

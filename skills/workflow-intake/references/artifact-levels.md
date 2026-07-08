@@ -32,7 +32,7 @@ artifact_decision:
 
 Planning docs include PRD, SPEC, TASK, TEST_PLAN, EVAL_PLAN, or repo-equivalent artifacts. Design docs include UX_CONCEPT, IA, UI_SPEC, DESIGN, design SPEC, asset brief, wireframe, or repo-equivalent artifacts.
 
-Set `create_now: yes` only when the user explicitly asked for the artifact, repo instructions require it, or prior approval already covers it. Set `create_now: ask` when the artifact would materially reduce ambiguity or risk but durable creation is not yet approved. Set `create_now: no` for A0/A1 work or when the final response or lightweight plan is enough.
+Set `create_now: yes` only when the user explicitly asked for the artifact, repo instructions require it, or prior approval already covers it. Set `create_now: ask` when the artifact would materially reduce ambiguity or risk but durable creation is not yet approved, the target path is blocked, or the current turn is intake-only/read-only. Set `create_now: no` only when durable artifact creation is not useful for the task, such as A0/A1 work or when the final response or lightweight plan is enough.
 
 For UI/product planning, separate planning docs from design docs. Example: a new multi-screen settings workflow may need PRD/SPEC/TEST_PLAN for product behavior and UX_CONCEPT/IA/UI_SPEC for design decisions. Brief both sets and ask one approval question before writing durable docs unless approval is already clear.
 

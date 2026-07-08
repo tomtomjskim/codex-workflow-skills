@@ -74,6 +74,8 @@ For mid-task changes, compare the new request against `task_goal`, `target_scope
 
 When blocked before implementation, still emit the `workflow_intake` block with unresolved fields marked `pending` or `unresolved`, include request-specific hard stops, and set `next_step` to the single blocking question.
 
+Use exact enum values from the relevant references for `autonomy_level`, `validation_level`, and `e2e_decision`. Put qualifiers such as read-only, blocked path, or future-only work in rationale, blocker, or notes fields instead of inventing combined enum values.
+
 Return this block before implementation for non-trivial work:
 
 ```yaml
