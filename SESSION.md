@@ -13,7 +13,7 @@ Resolve validation and forward-test risk before publishing or wiring the new wor
 - GitHub owner requested by TOM: `tomtomjskim`
 - Current state: public GitHub repository pushed and tracking `origin/main`
 - GitHub URL: `https://github.com/tomtomjskim/codex-workflow-skills`
-- Latest commit: `f2d0756 Initial workflow skills scaffold`
+- Initial scaffold commit: `f2d0756 Initial workflow skills scaffold`
 - `gh` active account: `tomtomjskim`
 - Local git user: `tomtomjskim <124156309+tomtomjskim@users.noreply.github.com>`
 
