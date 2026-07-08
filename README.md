@@ -23,7 +23,8 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
 │   └── adversarial-review-loop/
 ├── docs/
 │   ├── design-draft.md
-│   └── readme-reference-review.md
+│   ├── readme-reference-review.md
+│   └── sample-workflow-intake.md
 └── tests/
     └── acceptance-scenarios.md
 ```
@@ -51,6 +52,26 @@ ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-l
 ```
 
 If a symlink already exists, remove or update that symlink first. For plugin distribution, keep `.codex-plugin/plugin.json` and add this repository through your Codex plugin source or marketplace flow.
+
+### Post-install Check
+
+Confirm the skill files are visible:
+
+```bash
+test -f ~/.codex/skills/workflow/SKILL.md
+test -f ~/.codex/skills/workflow-intake/SKILL.md
+test -f ~/.codex/skills/adversarial-review-loop/SKILL.md
+```
+
+If the Codex validation scripts are available, run the checks in the [Validation](#validation) section from the cloned repository.
+
+Then start a new Codex session and try:
+
+```text
+Use $workflow-intake to scope a multi-step settings workflow before implementation. I am not sure which planning or design docs we need.
+```
+
+Expected behavior: `workflow-intake` emits a `workflow_intake` block, proposes an `artifact_decision`, and asks before creating durable planning or design docs unless the repo or user already approved them.
 
 ## Usage
 
@@ -97,6 +118,8 @@ Use $workflow-intake to plan a new settings workflow with several screens and a 
 ```
 
 Expected behavior: emit `artifact_decision` with separate planning and design doc recommendations, propose the smallest useful PRD/SPEC/TASK/TEST_PLAN and UX_CONCEPT/IA/UI_SPEC set for the repo, and ask before creating durable docs unless the user or repo already approved them.
+
+See [sample-workflow-intake.md](docs/sample-workflow-intake.md) for an illustrative `workflow_intake` output.
 
 Review an existing diff:
 
