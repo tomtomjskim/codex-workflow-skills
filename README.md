@@ -12,6 +12,62 @@ This repository is plugin-ready. It contains:
 
 Most agent failures in larger tasks are not raw coding mistakes. They are scope drift, skipped context, vague autonomy, weak review evidence, or over-trusting external text. These skills make those boundaries explicit before work starts and before review is called complete.
 
+## Quick Start
+
+```bash
+git clone https://github.com/tomtomjskim/codex-workflow-skills.git
+cd codex-workflow-skills
+mkdir -p ~/.codex/skills
+ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
+ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
+ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
+./scripts/validate_repo.sh
+```
+
+Then start a new Codex session and try:
+
+```text
+Use $workflow-intake to scope a multi-step settings workflow before implementation.
+```
+
+For plugin distribution, keep `.codex-plugin/plugin.json` and add this repository through your Codex plugin source or marketplace flow.
+
+## Which Skill Should I Use?
+
+| Situation | Use | Expected outcome |
+| --- | --- | --- |
+| You have a broad, risky, ambiguous, or multi-step task | `$workflow` or `$workflow-intake` | Scoped session policy, artifact decision, validation plan, and approval gates |
+| You need PRD/SPEC/design/test-plan decisions before implementation | `$workflow-intake` | Explicit recommendation for planning docs, design docs, E2E, and AI eval needs |
+| You already have a plan, diff, PR, or implementation to inspect | `$adversarial-review-loop` | Evidence-based findings, reviewer lenses, disposition, re-checks, and residual risk |
+| You are unsure whether intake or review is the right next step | `$workflow` | Route to the narrower skill with a short briefing |
+
+## Recommended Workflow
+
+1. Start with `$workflow-intake` when task scope, autonomy, affected files, artifacts, or validation level are unclear.
+2. Let intake identify required project context such as `AGENTS.md`, README, project maps, wiki indexes, Serena state, diffs, tests, and task-specific docs.
+3. Approve or revise the generated artifact plan before durable PRD, SPEC, TASK, TEST_PLAN, UX_CONCEPT, IA, UI_SPEC, or EVAL_PLAN documents are created.
+4. Implement using the repository's own conventions and validation commands.
+5. Run `$adversarial-review-loop` against the plan, diff, or implementation before treating the work as ready.
+6. Resolve accepted findings, rerun the relevant checks, and record residual risk when anything remains unverified.
+
+## Artifact and Eval Decisions
+
+`workflow-intake` separates planning artifacts from design artifacts. It should ask before creating durable docs unless the user or repository rules already approve them.
+
+Common planning artifacts:
+
+- PRD for product behavior, user goals, scope, success criteria, and release constraints.
+- SPEC for technical design, data flow, APIs, state, errors, migrations, and integration points.
+- TASK for implementation slices, dependencies, and ownership boundaries.
+- TEST_PLAN for unit, integration, E2E, regression, and manual validation coverage.
+- EVAL_PLAN for AI/LLM output quality, acceptance criteria, failure cases, regression evals, and monitoring.
+
+Common design artifacts:
+
+- UX_CONCEPT for interaction model and user intent.
+- IA for navigation, content structure, and workflow organization.
+- UI_SPEC for screen states, layout rules, responsive behavior, accessibility, and handoff details.
+
 ## Repository Layout
 
 ```text
@@ -26,6 +82,7 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
 │   └── adversarial-review-loop/
 ├── docs/
 │   ├── design-draft.md
+│   ├── forward-test-report.md
 │   ├── readme-reference-review.md
 │   ├── sample-adversarial-review.md
 │   └── sample-workflow-intake.md
@@ -56,7 +113,7 @@ ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ```
 
-If a symlink already exists, remove or update that symlink first. For plugin distribution, keep `.codex-plugin/plugin.json` and add this repository through your Codex plugin source or marketplace flow.
+If a symlink already exists, remove or update that symlink first.
 
 ### Post-install Check
 

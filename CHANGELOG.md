@@ -4,7 +4,9 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
-- No unreleased changes yet.
+### Changed
+
+- Expanded README quick start, skill selection guidance, recommended workflow, and artifact/eval decision documentation.
 
 ## [0.1.4] - 2026-07-08
 
