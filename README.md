@@ -5,7 +5,7 @@ Reusable Codex skills for structured task intake and evidence-based adversarial 
 This repository is plugin-ready. It contains:
 
 - `workflow`: route-only wrapper for choosing intake or review when explicitly requested.
-- `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, and E2E decisions after intake activates.
+- `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, E2E decisions, and AI eval handoffs after intake activates.
 - `adversarial-review-loop`: reviews plans, diffs, and implementations with evidence, reviewer routing, finding disposition, loop limits, and verification gates.
 
 ## Why This Exists
@@ -28,20 +28,29 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
     └── acceptance-scenarios.md
 ```
 
-## Install Locally While Developing
+## Prerequisites
+
+- Codex with local skill support.
+- Git for cloning this repository.
+- Python 3 only for optional validation scripts.
+- Optional: access to Codex system `skill-creator` and `plugin-creator` scripts for structure validation.
+
+## Install Locally
 
 Direct skill folders are useful for local authoring. For reusable distribution, Codex recommends packaging multiple skills as a plugin.
 
-For local skill testing, symlink or copy individual skill folders into your Codex skills directory:
+Clone the repository, then symlink or copy individual skill folders into your Codex skills directory:
 
 ```bash
+git clone https://github.com/tomtomjskim/codex-workflow-skills.git
+cd codex-workflow-skills
 mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ```
 
-For plugin distribution, keep `.codex-plugin/plugin.json` and publish the repo or add it to a Codex marketplace source.
+If a symlink already exists, remove or update that symlink first. For plugin distribution, keep `.codex-plugin/plugin.json` and add this repository through your Codex plugin source or marketplace flow.
 
 ## Usage
 
@@ -55,7 +64,7 @@ Use $workflow to route this task.
 Use $workflow-intake to scope this task before implementation.
 ```
 
-For long-running or user-facing work, intake also records plan revisions, expected side effects, validation level, and whether Playwright/E2E is required, recommended, not needed, or blocked.
+For long-running or user-facing work, intake also records plan revisions, expected side effects, validation level, whether Playwright/E2E is required, recommended, not needed, or blocked, and whether AI/LLM output quality needs an `EVAL_PLAN`.
 
 Run adversarial review when a plan, diff, or implementation exists:
 
@@ -76,7 +85,7 @@ These sources are not broad-scanned by default. They are used only when they are
 
 ## Validation
 
-Validate skill structure:
+Validate skill structure when the Codex system validation scripts are available:
 
 ```bash
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow
@@ -90,7 +99,13 @@ Validate plugin structure:
 python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
 ```
 
-Skill behavior still needs forward-testing with the scenarios in `tests/acceptance-scenarios.md`.
+If those scripts are unavailable, at minimum confirm each skill has valid YAML frontmatter with `name` and `description`, each skill folder contains `SKILL.md`, and `.codex-plugin/plugin.json` points `skills` at `./skills/`.
+
+Forward-test behavior with the scenarios in `tests/acceptance-scenarios.md` before relying on these skills for high-risk work.
+
+## Public Repo Hygiene
+
+Do not commit local session logs, secrets, private paths, customer data, or environment-specific notes. Keep those in untracked local files such as `SESSION.md`.
 
 ## License
 

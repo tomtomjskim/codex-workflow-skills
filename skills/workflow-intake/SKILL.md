@@ -97,6 +97,8 @@ workflow_intake:
   validation_plan:
     validation_level:
     e2e_decision:
+    eval_plan_required:
+    eval_plan_reason:
     scenarios:
     evidence_threshold:
     fallback_plan:
@@ -126,7 +128,7 @@ Always ask before changing or executing work involving:
 ## References
 
 - Read `references/autonomy-levels.md` when autonomy is absent, ambiguous, or greater than L2.
-- Read `references/artifact-levels.md` when deciding whether to create PRD, SPEC, TASK, TEST_PLAN, or no artifact.
+- Read `references/artifact-levels.md` when deciding whether to create PRD, SPEC, TASK, TEST_PLAN, EVAL_PLAN, or no artifact.
 - Read `references/context-discovery.md` when a repo, project map, Serena project, or wiki may affect the work.
 - Read `references/session-conduct.md` for A2+ work, long-running work, user-facing flows, mid-task requirement changes, side-effect checks, or TEST_PLAN/E2E decisions.
 - Read `references/review-packet.md` before handing off to `adversarial-review-loop`.
