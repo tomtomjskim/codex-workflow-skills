@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workflow"
+  short_description: "Route to intake or review"
+  default_prompt: "Use $workflow to route my request to workflow-intake or adversarial-review-loop."

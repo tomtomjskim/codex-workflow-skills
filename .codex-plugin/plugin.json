@@ -17,7 +17,7 @@
   "interface": {
     "displayName": "Codex Workflow Skills",
     "shortDescription": "Guided intake and adversarial review loops.",
-    "longDescription": "Codex Workflow Skills adds two reusable skills: workflow-intake for scoping multi-step work with autonomy gates, and adversarial-review-loop for evidence-based review, finding disposition, and verification handoff.",
+    "longDescription": "Codex Workflow Skills adds reusable skills for workflow routing, scoped intake, and evidence-based adversarial review.",
     "developerName": "TOM",
     "category": "Productivity",
     "capabilities": [
@@ -25,6 +25,7 @@
       "Review"
     ],
     "defaultPrompt": [
+      "Use $workflow to route my request to intake or review.",
       "Use $workflow-intake to scope this task before implementation.",
       "Use $adversarial-review-loop to review this plan or diff."
     ]

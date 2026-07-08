@@ -4,6 +4,7 @@ Reusable Codex skills for structured task intake and evidence-based adversarial 
 
 This repository is plugin-ready. It contains:
 
+- `workflow`: route-only wrapper for choosing intake or review when explicitly requested.
 - `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, and E2E decisions after intake activates.
 - `adversarial-review-loop`: reviews plans, diffs, and implementations with evidence, reviewer routing, finding disposition, loop limits, and verification gates.
 
@@ -17,6 +18,7 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
 .
 ├── .codex-plugin/plugin.json
 ├── skills/
+│   ├── workflow/
 │   ├── workflow-intake/
 │   └── adversarial-review-loop/
 ├── docs/
@@ -34,6 +36,7 @@ For local skill testing, symlink or copy individual skill folders into your Code
 
 ```bash
 mkdir -p ~/.codex/skills
+ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ```
@@ -43,6 +46,10 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and publish the repo o
 ## Usage
 
 Start with intake for ambiguous, multi-step, or risky work:
+
+```text
+Use $workflow to route this task.
+```
 
 ```text
 Use $workflow-intake to scope this task before implementation.
@@ -72,6 +79,7 @@ These sources are not broad-scanned by default. They are used only when they are
 Validate skill structure:
 
 ```bash
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow-intake
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/adversarial-review-loop
 ```

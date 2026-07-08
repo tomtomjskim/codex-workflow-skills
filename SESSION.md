@@ -27,12 +27,12 @@ In scope:
 - Patch skill docs for any confirmed gaps.
 - Configure local GitHub/Git identity for `tomtomjskim`.
 - Prepare local repo for first commit and remote setup.
+- Install local skill symlinks.
+- Add route-only `workflow` wrapper without duplicating policy.
 
 Out of scope until explicitly approved:
 
 - Installing the plugin into a shared marketplace.
-- Enabling the skills globally via symlink or copy.
-- Creating a wrapper `workflow` skill.
 
 ## Known Risks To Close
 
@@ -67,6 +67,8 @@ Out of scope until explicitly approved:
 - Initial commit created: `f2d0756 Initial workflow skills scaffold`
 - Public GitHub repository created: `tomtomjskim/codex-workflow-skills`
 - `main` pushed to `origin/main`: pass
+- Local symlinks installed: `workflow`, `workflow-intake`, `adversarial-review-loop`
+- Route-only `workflow` wrapper added and static forward-tested: pass
 
 ## Risk Closure Status
 
@@ -74,6 +76,8 @@ Out of scope until explicitly approved:
 - Plan management, mid-task change control, side-effect checks, and E2E decision policy have been added behind the existing intake activation boundary.
 - Public GitHub publication is complete.
 - Local `main` tracks `origin/main`.
+- Local Codex skill symlinks are installed.
+- `workflow` exists only as a router; canonical policy remains in `workflow-intake` and `adversarial-review-loop`.
 
 ## Forward-Test Findings Applied
 
@@ -89,9 +93,10 @@ Out of scope until explicitly approved:
 - Added plan revision, side-effect, validation plan, and scope-change fields to review packets and output contracts.
 - Added acceptance scenarios for plan initialization, mid-task scope changes, side-effect hard stops, E2E requirement, Playwright fallback, and review packet revisions.
 - Tightened approval wording for public API/scope changes and separated `e2e_decision` from execution evidence to reduce false-complete risk.
+- Added route-only `workflow` wrapper and router acceptance scenarios.
 
 ## Next Steps
 
-1. Optionally install the skills locally via symlink or plugin flow.
-2. Optionally reflect the common workflow/review skill in `codex-project-guide`.
-3. Optionally create a route-only wrapper skill later; do not duplicate policy there.
+1. Optionally install the plugin through a Codex marketplace flow if needed.
+2. Keep `codex-project-guide` aligned when workflow policy changes.
+3. Add project-local wrappers only when they route to canonical skills without copying policy.

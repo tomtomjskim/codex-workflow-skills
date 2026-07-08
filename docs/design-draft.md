@@ -2,17 +2,19 @@
 
 ## Goal
 
-Create two reusable Codex skills:
+Create reusable Codex skills:
 
+- `workflow`: route-only wrapper for explicit workflow requests.
 - `workflow-intake`: guided intake, scope, artifact, autonomy, context discovery, and review handoff.
 - `adversarial-review-loop`: evidence-based review, reviewer routing, finding disposition, auto-apply limits, and re-verification.
 
-The skills should work as standalone top-level skills. A future `workflow` wrapper can route to them later, but it should not become a third policy store.
+The canonical skills should work as standalone top-level skills. The `workflow` wrapper only routes; it must not become a third policy store.
 
 ## Architecture
 
 ```text
 User request
+  -> workflow (optional explicit router)
   -> workflow-intake
       -> session policy
       -> optional docs/artifact decision
@@ -86,7 +88,7 @@ Avoid claiming the skills are production-ready until forward-testing passes.
 | Review loop becomes generic checklist | Select reviewer lenses by changed surface |
 | False pass from weak evidence | Separate finding evidence and verification evidence |
 | External text changes policy | Treat external content as untrusted data |
-| Wrapper skill drifts later | Wrapper may route only; policy stays in these skills/references |
+| Wrapper skill drifts later | Wrapper routes only; policy stays in canonical skills/references |
 | Context scan becomes noisy | Use targeted source discovery before broad reads |
 | Plan management over-triggers workflow | Apply plan state only after intake activation and A2+/multi-step conditions |
 | E2E becomes over-required | Use risk-based `e2e_decision`, with docs/copy/unit-covered work marked `not_needed` |
