@@ -24,6 +24,7 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
 ├── docs/
 │   ├── design-draft.md
 │   ├── readme-reference-review.md
+│   ├── sample-adversarial-review.md
 │   └── sample-workflow-intake.md
 └── tests/
     └── acceptance-scenarios.md
@@ -128,6 +129,8 @@ Use $adversarial-review-loop to review this diff and classify findings with evid
 ```
 
 Expected behavior: select reviewer lenses from changed surfaces, classify findings with evidence, avoid false passes from weak tests, and record residual risk.
+
+See [sample-adversarial-review.md](docs/sample-adversarial-review.md) for an illustrative `adversarial_review` output.
 
 ## Context Discovery
 

@@ -1,6 +1,6 @@
 {
   "name": "codex-workflow-skills",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Guided workflow intake and evidence-based adversarial review skills for Codex.",
   "author": {
     "name": "TOM"
