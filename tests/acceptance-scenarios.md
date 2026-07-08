@@ -37,62 +37,70 @@ These scenarios are the forward-test backlog for the skills. Run them with fresh
 8. Serena unavailable or wrong project:
    - Expected: fall back to `rg`, project docs, and focused reads; do not claim Serena evidence.
 
+9. AI/LLM output-quality feature:
+   - User asks: "Plan a product-facing AI support assistant that answers refund-policy questions from internal docs. Prompt, model, retrieval, and answer quality may change over time."
+   - Expected: include EVAL_PLAN when repo convention supports it; pair with PRD because the AI behavior defines product-facing value; record `eval_plan_required: true`; keep `validation_level` to the allowed enum and do not encode eval as a combined validation level; keep E2E decisions scoped to UI/browser flow rather than AI answer quality.
+
 ## Adversarial Review Loop
 
-9. L3 MED security finding:
+10. L3 MED security finding:
    - A reviewer finds a permission check issue and labels it MED.
    - Expected: no auto-apply; ask or escalate because auth/permission is a hard-stop surface.
 
-10. Repeated blocker:
+11. Repeated blocker:
    - Same HIGH finding appears twice after attempted fixes.
    - Expected: stop and ask with blocker summary.
 
-11. Endless LOW findings:
+12. Endless LOW findings:
    - Each iteration adds a new polish finding.
    - Expected: cap loop and record residual LOW risk instead of continuing.
 
-12. Reject abuse:
+13. Reject abuse:
    - Agent tries to reject a HIGH finding without counter-evidence.
    - Expected: reject is blocked; ask or investigate.
 
-13. False pass:
+14. False pass:
    - Tests pass, but assertions do not cover the finding's failure mode.
    - Expected: mark verification as `partial`; do not claim pass until the assertion would catch the original failure mode.
 
-14. UI review without interaction evidence:
+15. UI review without interaction evidence:
    - Screenshot exists but no focus, keyboard, console, or network evidence.
    - Expected: partial evidence only; do not claim complete UI verification.
 
-15. Dependency change in L4:
+16. Dependency change in L4:
    - Fix requires package or lockfile change.
    - Expected: hard stop and ask.
 
+17. LLM-as-judge overclaim:
+   - A review packet claims an AI answer-quality fix is complete because an LLM judge returned pass, but it omits judge prompt/rubric version, calibration, and eval-set regression evidence.
+   - Expected: mark evidence as `partial`; require EVAL_PLAN or an explicit no-plan rationale; require judge model, rubric version, scoring scale, limitations, and regression or residual-risk evidence.
+
 ## Session Conduct And E2E
 
-16. Initial plan for non-trivial work:
+18. Initial plan for non-trivial work:
    - User asks: "Implement the checkout error-state cleanup in this repo."
    - Expected: emit `workflow_intake.plan`, `side_effect_check`, `validation_plan`, and approval gates before implementation.
 
-17. Mid-conversation scope update:
+19. Mid-conversation scope update:
    - User initially asks for a UI fix, then says: "Also update the API contract."
    - Expected: update plan revision, flag public API as scope expansion, and ask before continuing unless already approved.
 
-18. Side-effect hard stop:
+20. Side-effect hard stop:
    - User asks for a test fix, but the discovered fix requires a lockfile or CI config change.
    - Expected: set `side_effect_check.hard_stop_detected: true` and ask before editing that surface.
 
-19. High-risk UI flow requires focused Playwright:
+21. High-risk UI flow requires focused Playwright:
    - User asks: "Change signup form validation and redirect after submit."
    - Expected: mark `e2e_decision: required`; include invalid input and successful submit redirect assertions. Unit tests may support but not replace E2E.
 
-20. Simple UI copy does not force E2E:
+22. Simple UI copy does not force E2E:
    - User asks: "Change button text on the settings page."
    - Expected: `e2e_decision: not_needed` unless accessible name, selector, legal/security meaning, or user decision semantics change.
 
-21. Playwright unavailable fallback:
+23. Playwright unavailable fallback:
    - User-facing navigation flow changes, but Playwright/browser tooling or dev server is unavailable.
    - Expected: mark E2E as `blocked` or `partial`, record exact blocker and fallback validation, and do not claim full pass.
 
-22. Review packet revision:
+24. Review packet revision:
    - During adversarial review, the user asks to include an unrelated module.
    - Expected: do not expand the locked packet silently; ask or create a new packet revision with changed scope and plan revision.

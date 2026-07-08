@@ -56,6 +56,8 @@ validation_plan:
   risk_level: low | medium | high
   validation_level: static | unit | integration | manual_browser | playwright_e2e
   e2e_decision: required | recommended | not_needed | blocked
+  eval_plan_required:
+  eval_plan_reason:
   rationale:
   scenarios:
     - name:
@@ -78,6 +80,8 @@ Level guidance:
 - `integration`: API contracts, persistence, service boundaries, queues, cache, cross-module behavior.
 - `manual_browser`: small UI behavior, visual/accessibility spot checks, or no stable automated E2E path.
 - `playwright_e2e`: user flow, routing, form submit, auth/permission path, persistence, upload/download, checkout/order/payment, realtime behavior, critical regression, or cross-page state.
+
+Use `eval_plan_required: true` when AI/LLM output quality, prompt/model/tool/retrieval changes, acceptable answer ranges, or failure-case regression are part of acceptance. Keep E2E decisions about browser/user flows separate from EVAL_PLAN decisions about non-deterministic output quality. Do not put `eval`, `ai_eval`, or combined values such as `integration + eval` in `validation_level`; keep `validation_level` to one of the listed levels and record AI evaluation in `eval_plan_required`, `eval_plan_reason`, scenarios, and evidence threshold.
 
 E2E decision:
 

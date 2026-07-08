@@ -7,6 +7,7 @@ Select reviewer lenses from changed surfaces. Do not run every reviewer by defau
 | auth, authorization, roles, tenant boundary, secrets, file IO, shell, network | security |
 | data mutation, database schema, migration, seed, backfill, retention | security, QA, DBA if available |
 | public API, SDK, routing, integration contract | code, API |
+| AI/LLM output quality, prompt/model/tool/retrieval behavior, eval set, LLM-as-judge rubric | QA, test coverage, domain reviewer when available |
 | tests, fixtures, mocks, assertions, CI failures | QA, test coverage |
 | UI, forms, navigation, loading/error/empty states | UX, accessibility, QA |
 | user-facing flow, form submit, routing, auth/permission path, persistence, checkout/order/payment, upload/download, realtime, cross-page state | QA with Playwright or equivalent browser evidence when available |
