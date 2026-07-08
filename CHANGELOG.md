@@ -7,6 +7,7 @@ All notable changes to this repository are documented here.
 ### Changed
 
 - Expanded README quick start, skill selection guidance, recommended workflow, and artifact/eval decision documentation.
+- Refined README skill selection guidance for narrow-screen readability and aligned the workflow intake sample artifact terminology.
 
 ## [0.1.4] - 2026-07-08
 

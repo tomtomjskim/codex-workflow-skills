@@ -31,6 +31,7 @@ workflow_intake:
       proposed_docs:
         - "PRD or product brief: user problem, goals, success criteria"
         - "SPEC: screens, states, routing, data, permissions, save/cancel/error behavior"
+        - "TASK: implementation slices, dependencies, and ownership boundaries"
         - "TEST_PLAN: success, failure, permission, responsive, and regression scenarios"
       create_now: ask
       rationale: "A new multi-screen product workflow benefits from durable planning docs, but creation still needs approval unless repo rules require it."
@@ -87,7 +88,7 @@ workflow_intake:
       - name: "planning artifact review"
         level: static
         preconditions: "Repo conventions and existing docs are discovered"
-        command_or_steps: "Review proposed PRD/SPEC/TEST_PLAN and design docs against repo rules"
+        command_or_steps: "Review proposed PRD/SPEC/TASK/TEST_PLAN and design docs against repo rules"
         assertions: "Artifacts match requested scope, hard stops, and validation needs"
         cleanup: "none"
       - name: "future settings flow browser regression"
@@ -111,3 +112,4 @@ workflow_intake:
 - Use exact enum values from the skill references, such as `L0`-`L4`, `static`, `unit`, `integration`, `manual_browser`, `playwright_e2e`, and `required`, `recommended`, `not_needed`, or `blocked`.
 - Put qualifiers such as read-only, blocked path, future-only work, or partial evidence in rationale, blocker, or notes fields.
 - If the target path is missing or the run is intake-only/read-only, keep useful durable artifact proposals at `create_now: ask`; use `create_now: no` only when durable docs are not useful.
+- Treat PRD, SPEC, TASK, TEST_PLAN, EVAL_PLAN, UX_CONCEPT, IA, and UI_SPEC as selectable artifacts. Recommend the smallest useful set rather than emitting all of them by default.

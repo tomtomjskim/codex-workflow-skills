@@ -34,12 +34,10 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 
 ## Which Skill Should I Use?
 
-| Situation | Use | Expected outcome |
-| --- | --- | --- |
-| You have a broad, risky, ambiguous, or multi-step task | `$workflow` or `$workflow-intake` | Scoped session policy, artifact decision, validation plan, and approval gates |
-| You need PRD/SPEC/design/test-plan decisions before implementation | `$workflow-intake` | Explicit recommendation for planning docs, design docs, E2E, and AI eval needs |
-| You already have a plan, diff, PR, or implementation to inspect | `$adversarial-review-loop` | Evidence-based findings, reviewer lenses, disposition, re-checks, and residual risk |
-| You are unsure whether intake or review is the right next step | `$workflow` | Route to the narrower skill with a short briefing |
+- Use `$workflow-intake` for broad, risky, ambiguous, or multi-step tasks that need scoped autonomy, artifact decisions, validation planning, and approval gates.
+- Use `$workflow-intake` when PRD, SPEC, TASK, TEST_PLAN, design docs, E2E, or AI eval decisions should be made before implementation.
+- Use `$adversarial-review-loop` when a plan, diff, PR, or implementation already exists and needs evidence-based findings, reviewer lenses, disposition, re-checks, and residual-risk closure.
+- Use `$workflow` when you are unsure whether the task should start with intake or review.
 
 ## Recommended Workflow
 
@@ -54,7 +52,7 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 
 `workflow-intake` separates planning artifacts from design artifacts. It should ask before creating durable docs unless the user or repository rules already approve them.
 
-Common planning artifacts:
+Common planning artifacts. These are options, not a required bundle; intake should recommend the smallest useful set for the task.
 
 - PRD for product behavior, user goals, scope, success criteria, and release constraints.
 - SPEC for technical design, data flow, APIs, state, errors, migrations, and integration points.
