@@ -17,6 +17,7 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
 ```text
 .
 ├── .codex-plugin/plugin.json
+├── CHANGELOG.md
 ├── skills/
 │   ├── workflow/
 │   ├── workflow-intake/
@@ -162,6 +163,10 @@ python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
 If those scripts are unavailable, at minimum confirm each skill has valid YAML frontmatter with `name` and `description`, each skill folder contains `SKILL.md`, and `.codex-plugin/plugin.json` points `skills` at `./skills/`.
 
 Forward-test behavior with the scenarios in `tests/acceptance-scenarios.md` before relying on these skills for high-risk work.
+
+## Release History
+
+See [CHANGELOG.md](CHANGELOG.md) for public release notes.
 
 ## Public Repo Hygiene
 

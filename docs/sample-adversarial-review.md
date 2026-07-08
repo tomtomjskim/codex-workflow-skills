@@ -63,6 +63,26 @@ adversarial_review:
     fallback_plan: "If browser automation is blocked, record exact blocker and use static or component-level evidence with residual risk."
   findings:
     - id: "AR-001"
+      severity: HIGH
+      category: "correctness / persistence"
+      location: "src/settings/SettingsWorkflow.tsx: Save button inside form"
+      finding_evidence:
+        observed_problem: "The Save button is inside a form and the sample diff does not show type=\"button\" or submit preventDefault handling."
+        failure_mode: "The button can submit the form by default, causing navigation or reload before the async save completes."
+        source: "Static review of the form and button diff."
+      impact: "A user may click Save and lose the settings update or miss the failed-save state."
+      proposed_fix: "Set the Save button type to \"button\" or handle form onSubmit with preventDefault, await save, and block duplicate submits."
+      fix_risk_class: "local UI behavior with persistence impact"
+      disposition: ask
+      disposition_evidence: "Autonomy is L2, and HIGH findings are never auto-applied."
+      approval_required: true
+      auto_apply_blocked_reason: "L2 does not allow auto-applying review fixes; HIGH findings require user approval or strong counter-evidence."
+      verification_required: "Run focused browser evidence that changes a setting, saves, reloads, and verifies persistence."
+      verification_evidence:
+        command_or_artifact: "not_run"
+        assertion_strength: "Would be strong only after save/reload assertions execute against the original failure mode."
+        result: not_run
+    - id: "AR-002"
       severity: MED
       category: "test-coverage"
       location: "tests/settings-workflow.spec.ts:42"
@@ -82,7 +102,7 @@ adversarial_review:
         command_or_artifact: "not_run"
         assertion_strength: "Would be strong only after save/reload and error-path assertions are implemented and executed."
         result: not_run
-    - id: "AR-002"
+    - id: "AR-003"
       severity: LOW
       category: "accessibility"
       location: "src/settings/SettingsWorkflow.tsx:118"
@@ -111,6 +131,7 @@ adversarial_review:
     status: partial
     reason: "Required browser scenarios were reviewed as planned but not executed in this sample."
   residual_risk:
+    - "The form submit behavior may still interrupt settings persistence until browser evidence exercises the save path."
     - "Settings save and error-path behavior still needs focused browser evidence."
     - "Accessibility behavior is not verified until focus or live-region assertions run."
   completion_basis: "Review pass is closed with findings requiring approval and partial validation evidence; do not treat this as validation pass."
