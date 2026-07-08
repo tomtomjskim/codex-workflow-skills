@@ -18,6 +18,8 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
 .
 ├── .codex-plugin/plugin.json
 ├── CHANGELOG.md
+├── scripts/
+│   └── validate_repo.sh
 ├── skills/
 │   ├── workflow/
 │   ├── workflow-intake/
@@ -36,6 +38,7 @@ Most agent failures in larger tasks are not raw coding mistakes. They are scope 
 - Codex with local skill support.
 - Git for cloning this repository.
 - Python 3 only for optional validation scripts.
+- ripgrep (`rg`) for the one-command repository validation script.
 - Optional: access to Codex system `skill-creator` and `plugin-creator` scripts for structure validation.
 
 ## Install Locally
@@ -146,6 +149,14 @@ These sources are not broad-scanned by default. They are used only when they are
 
 ## Validation
 
+Run the repository validation script for the standard public-release checks:
+
+```bash
+./scripts/validate_repo.sh
+```
+
+The script checks required files, skill structure when Codex system validators are available, plugin structure, README links, manifest/changelog version alignment, `git diff --check`, and a basic public hygiene scan.
+
 Validate skill structure when the Codex system validation scripts are available:
 
 ```bash
@@ -163,6 +174,8 @@ python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
 If those scripts are unavailable, at minimum confirm each skill has valid YAML frontmatter with `name` and `description`, each skill folder contains `SKILL.md`, and `.codex-plugin/plugin.json` points `skills` at `./skills/`.
 
 Forward-test behavior with the scenarios in `tests/acceptance-scenarios.md` before relying on these skills for high-risk work.
+
+See [forward-test-report.md](docs/forward-test-report.md) for the latest recorded forward-test and smoke-test notes.
 
 ## Release History
 

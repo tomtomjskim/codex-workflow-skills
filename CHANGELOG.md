@@ -6,6 +6,18 @@ All notable changes to this repository are documented here.
 
 - No unreleased changes yet.
 
+## [0.1.4] - 2026-07-08
+
+### Added
+
+- Added `scripts/validate_repo.sh` for one-command repository validation before public releases.
+- Added `docs/forward-test-report.md` to record fresh-context forward-test and clean-install smoke-test evidence.
+
+### Changed
+
+- Documented the validation script in README.
+- Bumped the plugin manifest version to `0.1.4`.
+
 ## [0.1.3] - 2026-07-08
 
 ### Added
@@ -51,7 +63,8 @@ All notable changes to this repository are documented here.
 - Added acceptance scenarios for workflow routing, intake, review loop behavior, session conduct, and E2E decisions.
 - Added public repository hygiene guidance and validation commands.
 
-[Unreleased]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.4
 [0.1.3]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.3
 [0.1.2]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.2
 [0.1.1]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.1
