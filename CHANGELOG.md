@@ -4,10 +4,21 @@ All notable changes to this repository are documented here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-13
+
+### Added
+
+- Added `$resume-multi-review` for independent recruiter, hiring-manager, and future-teammate resume decisions.
+- Added source-authority and freshness rules so public sanitized drafts and generated notes do not override reviewed master resumes.
+- Added a strict review output contract with binary decisions, exactly three reasons, one-line fixes, conflict adjudication, evidence-safe rewriting, and bounded repeat loops.
+- Added a reusable Korean copy-paste prompt and a source-gap sample review.
+- Added acceptance scenarios for authoritative-source selection, reviewer independence, unsupported claim prevention, and loop termination.
+
 ### Changed
 
-- Expanded README quick start, skill selection guidance, recommended workflow, and artifact/eval decision documentation.
-- Refined README skill selection guidance for narrow-screen readability and aligned the workflow intake sample artifact terminology.
+- Expanded README installation, usage, context discovery, and validation guidance for resume review.
+- Expanded repository validation to include the new skill, reference files, and sample.
+- Bumped the plugin manifest version to `0.2.0`.
 
 ## [0.1.4] - 2026-07-08
 
@@ -66,7 +77,8 @@ All notable changes to this repository are documented here.
 - Added acceptance scenarios for workflow routing, intake, review loop behavior, session conduct, and E2E decisions.
 - Added public repository hygiene guidance and validation commands.
 
-[Unreleased]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.4
 [0.1.3]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.3
 [0.1.2]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.2
