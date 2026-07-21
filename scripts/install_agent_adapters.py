@@ -153,15 +153,17 @@ class LinkPlan:
 class ResultEntry:
     name: str
     source: str
-    target: str
+    target: Optional[str]
     reason: str
+    target_path_stable: bool = True
 
-    def to_manifest(self) -> Dict[str, str]:
+    def to_manifest(self) -> Dict[str, object]:
         return {
             "name": self.name,
             "reason": self.reason,
             "source": self.source,
             "target": self.target,
+            "target_path_stable": self.target_path_stable,
         }
 
 
@@ -373,6 +375,8 @@ def plan_links(source_root: Path, target_root: Path, suffix: str) -> LinkPlan:
             action, reason = "error", "source path is not a regular file"
         elif action_reason is not None:
             action, reason = action_reason
+        elif not target_present:
+            action, reason = "error", "target root must already exist"
         else:
             action, reason = _classify_target(candidate, target_path, target)
 
@@ -449,8 +453,13 @@ def _preflight(plan: LinkPlan) -> LinkPlan:
         )
     errors = [entry for entry in current.entries if entry.action == "error"]
     if errors:
+        message = (
+            "target root must already exist"
+            if any(entry.reason == "target root must already exist" for entry in errors)
+            else "plan contains error entries; no links were created"
+        )
         raise InstallError(
-            "plan contains error entries; no links were created",
+            message,
             InstallResult(
                 current.plan_hash,
                 "blocked",
@@ -476,18 +485,34 @@ def _result_entry(entry: LinkEntry, reason: Optional[str] = None) -> ResultEntry
     return ResultEntry(entry.name, entry.source, entry.target, reason or entry.reason)
 
 
-def _root_result_entry(plan: LinkPlan, reason: str) -> ResultEntry:
+def _root_result_entry(
+    plan: LinkPlan, reason: str, target_path_stable: bool = True
+) -> ResultEntry:
     return ResultEntry(
         plan.target_basename,
         _nfc(str(plan.source_root)),
         _nfc(str(plan.target_root)),
         reason,
+        target_path_stable,
+    )
+
+
+def _unstable_entries(entries: Sequence[ResultEntry]) -> Tuple[ResultEntry, ...]:
+    return tuple(
+        ResultEntry(
+            entry.name,
+            entry.source,
+            None,
+            "direct symlink created in pinned directory; target pathname is unstable",
+            False,
+        )
+        for entry in entries
     )
 
 
 def _failed_result(
     plan: LinkPlan,
-    created: List[ResultEntry],
+    created: Sequence[ResultEntry],
     kept: Tuple[ResultEntry, ...],
     failed: ResultEntry,
     target_directory_created: bool,
@@ -573,72 +598,33 @@ def apply_links(plan: LinkPlan) -> InstallResult:
             )
             raise InstallError(str(error), result) from None
 
-        if not current.target_root_present:
-            try:
-                os.mkdir(
-                    current.target_basename,
-                    0o700,
-                    dir_fd=parent_fd,
-                )
-                target_directory_created = True
-            except FileExistsError:
-                result = _failed_result(
-                    current, created, kept,
-                    _root_result_entry(current, "target directory appeared during apply"),
-                    target_directory_created,
-                )
-                raise InstallConflict(
-                    "target directory appeared during apply; nothing was removed", result
-                ) from None
-            except OSError:
-                result = _failed_result(
-                    current, created, kept,
-                    _root_result_entry(current, "target directory could not be created"),
-                    target_directory_created,
-                )
-                raise InstallError("target directory could not be created", result) from None
-            try:
-                root_fd = os.open(
-                    current.target_basename,
-                    _directory_flags(),
-                    dir_fd=parent_fd,
-                )
-                root_metadata = os.fstat(root_fd)
-                if not stat.S_ISDIR(root_metadata.st_mode):
-                    raise OSError("created target is not a directory")
-                if hasattr(os, "geteuid") and root_metadata.st_uid != os.geteuid():
-                    raise OSError("created target ownership changed")
-                root_token = _token(root_metadata)
-            except OSError:
-                result = _failed_result(
-                    current, created, kept,
-                    _root_result_entry(current, "created target directory identity changed"),
-                    target_directory_created,
-                )
-                raise InstallError("created target directory is not trusted", result) from None
-        else:
-            if current.target_root_token is None:
-                raise InstallError("target root identity is missing")
-            try:
-                root_fd = os.open(
-                    current.target_basename,
-                    _directory_flags(),
-                    dir_fd=parent_fd,
-                )
-                root_metadata = os.fstat(root_fd)
-                if (
-                    not stat.S_ISDIR(root_metadata.st_mode)
-                    or _token(root_metadata) != current.target_root_token
-                ):
-                    raise OSError("target root changed")
-                root_token = current.target_root_token
-            except OSError:
-                result = _failed_result(
-                    current, created, kept,
-                    _root_result_entry(current, "target root identity changed"),
-                    target_directory_created,
-                )
-                raise InstallError("target root identity changed", result) from None
+        if not current.target_root_present or current.target_root_token is None:
+            result = _failed_result(
+                current, created, kept,
+                _root_result_entry(current, "target root must already exist"),
+                False,
+            )
+            raise InstallError("target root must already exist", result) from None
+        try:
+            root_fd = os.open(
+                current.target_basename,
+                _directory_flags(),
+                dir_fd=parent_fd,
+            )
+            root_metadata = os.fstat(root_fd)
+            if (
+                not stat.S_ISDIR(root_metadata.st_mode)
+                or _token(root_metadata) != current.target_root_token
+            ):
+                raise OSError("target root changed")
+            root_token = current.target_root_token
+        except OSError:
+            result = _failed_result(
+                current, created, kept,
+                _root_result_entry(current, "target root identity changed"),
+                False,
+            )
+            raise InstallError("target root identity changed", result) from None
 
         for entry in current.entries:
             if entry.action != "create":
@@ -646,15 +632,31 @@ def apply_links(plan: LinkPlan) -> InstallResult:
             spec = specs[entry.name]
             try:
                 _verify_root_identity(current, parent_fd, root_fd, root_token)
-                if _fingerprint(spec.source) != spec.source_fingerprint:
-                    raise InstallError("source identity changed")
-            except (InstallError, OSError):
+            except InstallError:
                 result = _failed_result(
-                    current, created, kept,
-                    _result_entry(entry, "approved source or target identity changed"),
+                    current,
+                    _unstable_entries(created),
+                    _unstable_entries(kept),
+                    ResultEntry(
+                        entry.name,
+                        entry.source,
+                        None,
+                        "approved target pathname changed before link creation",
+                        False,
+                    ),
                     target_directory_created,
                 )
-                raise InstallError("approved source or target identity changed", result) from None
+                raise InstallError("approved target identity changed", result) from None
+            try:
+                if _fingerprint(spec.source) != spec.source_fingerprint:
+                    raise OSError("source identity changed")
+            except OSError:
+                result = _failed_result(
+                    current, created, kept,
+                    _result_entry(entry, "approved source identity changed"),
+                    target_directory_created,
+                )
+                raise InstallError("approved source identity changed", result) from None
             try:
                 os.symlink(str(spec.source), entry.name, dir_fd=root_fd)
             except FileExistsError:
@@ -678,8 +680,10 @@ def apply_links(plan: LinkPlan) -> InstallResult:
                 _verify_root_identity(current, parent_fd, root_fd, root_token)
             except InstallError:
                 result = _failed_result(
-                    current, created, kept,
-                    _root_result_entry(current, "target path changed during apply"),
+                    current, _unstable_entries(created), _unstable_entries(kept),
+                    _root_result_entry(
+                        current, "target path changed during apply", False
+                    ),
                     target_directory_created,
                 )
                 raise InstallError("target path changed during apply", result) from None
