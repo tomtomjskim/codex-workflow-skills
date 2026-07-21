@@ -1,3 +1,4 @@
+import hashlib
 import stat
 import tempfile
 import unittest
@@ -13,6 +14,10 @@ from scripts.live_eval.isolation import (
     preflight_auth,
     preflight_isolation,
     toml_string,
+)
+from scripts.workflow_coordination.canonical_json import (
+    CanonicalJSONError,
+    canonical_bytes,
 )
 
 
@@ -119,7 +124,7 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(invocation.run_dir.parent, self.temp_root)
         self.assertEqual(
             {item.name for item in invocation.run_dir.iterdir()},
-            {"codex-home", "cwd", "tmp"},
+            {"codex-home", "cwd", "tmp", "response.schema.json"},
         )
         for path in (
             invocation.run_dir,
@@ -130,7 +135,93 @@ class IsolationTests(unittest.TestCase):
             self.assertTrue(path.is_dir())
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
         self.assertEqual(invocation.output_schema.parent, invocation.run_dir)
-        self.assertFalse(invocation.output_schema.exists())
+        self.assertTrue(invocation.output_schema.is_file())
+        self.assertEqual(
+            stat.S_IMODE(invocation.output_schema.stat().st_mode), 0o600
+        )
+
+    def test_writes_canonical_schema_with_digest_and_identity(self):
+        schema = {
+            "type": "object",
+            "required": ["status"],
+            "properties": {"status": {"type": "string"}},
+        }
+        config = replace(self.config, output_schema=schema)
+        schema["required"].append("mutated-after-config")
+
+        invocation = build_invocation(config)
+        expected = canonical_bytes(
+            {
+                "type": "object",
+                "required": ["status"],
+                "properties": {"status": {"type": "string"}},
+            }
+        )
+
+        self.assertEqual(invocation.output_schema.read_bytes(), expected)
+        self.assertEqual(
+            invocation.schema_digest,
+            "sha256:" + hashlib.sha256(expected).hexdigest(),
+        )
+        metadata = invocation.output_schema.lstat()
+        self.assertEqual(
+            (invocation.schema_identity.device, invocation.schema_identity.inode),
+            (metadata.st_dev, metadata.st_ino),
+        )
+        with self.assertRaises(TypeError):
+            config.output_schema["type"] = "array"
+
+    def test_rejects_noncanonical_schema_before_creating_run_artifacts(self):
+        invalid_schemas = (
+            {"value": 1.5},
+            {"value": "e\u0301"},
+            {"value": object()},
+        )
+        for schema in invalid_schemas:
+            with self.subTest(schema=schema):
+                with self.assertRaises(CanonicalJSONError):
+                    replace(self.config, output_schema=schema)
+                self.assertEqual(tuple(self.temp_root.iterdir()), ())
+
+    def test_preflight_blocks_schema_mutation_replacement_symlink_and_extra_file(self):
+        mutations = ("content", "replacement", "symlink", "extra")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                invocation = build_invocation(self.config)
+                if mutation == "content":
+                    invocation.output_schema.write_bytes(b'{"type":"array"}')
+                elif mutation == "replacement":
+                    invocation.output_schema.unlink()
+                    invocation.output_schema.write_bytes(b'{"type":"object"}')
+                    invocation.output_schema.chmod(0o600)
+                elif mutation == "symlink":
+                    external = self.temp_root / "external-schema"
+                    external.write_bytes(b'{"type":"object"}')
+                    invocation.output_schema.unlink()
+                    invocation.output_schema.symlink_to(external)
+                else:
+                    (invocation.run_dir / "extra").write_text(
+                        "unexpected", encoding="utf-8"
+                    )
+                called = []
+
+                report = preflight_isolation(
+                    invocation, probe=lambda item: called.append(item)
+                )
+
+                self.assertEqual(report.classification, "blocked_isolation")
+                self.assertIn("path_integrity", report.missing_guarantees)
+                self.assertEqual(called, [])
+
+    def test_schema_write_failure_cleans_only_owned_fresh_run(self):
+        with patch(
+            "scripts.live_eval.isolation.os.write",
+            side_effect=OSError("simulated write failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated write failure"):
+                build_invocation(self.config)
+
+        self.assertEqual(tuple(self.temp_root.iterdir()), ())
 
     def test_transport_and_tool_environments_are_exact_and_immutable(self):
         invocation = build_invocation(self.config)

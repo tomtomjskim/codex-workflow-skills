@@ -1,6 +1,7 @@
 """Fail-closed command, authentication, and isolation models for live evals."""
 
 from dataclasses import dataclass, field
+from collections.abc import Mapping as ABCMapping
 import hashlib
 import json
 import os
@@ -11,6 +12,11 @@ import tempfile
 from types import MappingProxyType
 from typing import Callable, FrozenSet, Mapping, Optional, Tuple
 import uuid
+
+from scripts.workflow_coordination.canonical_json import (
+    canonical_bytes,
+    load_canonical_input,
+)
 
 
 _MINIMUM_CODEX_VERSION = (0, 142, 4)
@@ -36,6 +42,10 @@ _AUTH_URL_PATTERN = re.compile(
 )
 
 
+def _default_output_schema() -> Mapping[str, object]:
+    return {"additionalProperties": True, "type": "object"}
+
+
 @dataclass(frozen=True)
 class EvalConfig:
     codex_executable: Path
@@ -43,7 +53,9 @@ class EvalConfig:
     model_allowlist: Tuple[str, ...]
     temp_root: Path
     api_key: str = field(repr=False)
+    output_schema: Mapping[str, object] = field(default_factory=_default_output_schema)
     api_key_env_name: str = _API_KEY_ENV_NAME
+    _output_schema_bytes: bytes = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -51,6 +63,11 @@ class EvalConfig:
         )
         object.__setattr__(self, "temp_root", Path(self.temp_root).absolute())
         object.__setattr__(self, "model_allowlist", tuple(self.model_allowlist))
+        schema_copy = _copy_json_value(self.output_schema)
+        if not isinstance(schema_copy, dict):
+            raise TypeError("output_schema must be a JSON-compatible mapping")
+        object.__setattr__(self, "_output_schema_bytes", canonical_bytes(schema_copy))
+        object.__setattr__(self, "output_schema", _freeze_json_value(schema_copy))
 
 
 @dataclass(frozen=True)
@@ -75,6 +92,8 @@ class Invocation:
     cwd: Path
     tmpdir: Path
     output_schema: Path
+    schema_digest: str
+    schema_identity: PathIdentity
     path_identities: Mapping[str, PathIdentity] = field(repr=False)
     argv_digest: str
     child_env_policy_id: str
@@ -186,6 +205,24 @@ def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
+def _copy_json_value(value: object) -> object:
+    if isinstance(value, ABCMapping):
+        return {key: _copy_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_json_value(item) for item in value]
+    return value
+
+
+def _freeze_json_value(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json_value(item) for item in value)
+    return value
+
+
 def preflight_auth(api_key: Optional[str], oauth_files_present: bool) -> AuthReport:
     """Accept an explicit process-local API key; never inspect OAuth files."""
     del oauth_files_present
@@ -225,62 +262,73 @@ def build_invocation(config: EvalConfig) -> Invocation:
         path.mkdir(mode=0o700, exist_ok=False)
         path.chmod(0o700)
     output_schema = run_dir / "response.schema.json"
+    run_identity = _path_identity(run_dir)
+    try:
+        schema_identity = _write_schema_file(
+            output_schema, config._output_schema_bytes
+        )
+        schema_digest = _digest_bytes(config._output_schema_bytes)
 
-    tool_env = {
-        "PATH": _SAFE_PATH,
-        "HOME": str(codex_home),
-        "TMPDIR": str(tmpdir),
-    }
-    transport_env = {
-        **tool_env,
-        "CODEX_HOME": str(codex_home),
-        _API_KEY_ENV_NAME: config.api_key,
-    }
-    _validate_environment_values(
-        transport_env, tool_env, config.api_key, config.api_key_env_name
-    )
-    policy_config = _child_environment_config(tool_env)
-    argv = _canonical_argv(
-        executable=config.codex_executable,
-        model=config.model,
-        output_schema=output_schema,
-        policy_config=policy_config,
-    )
-    argv_digest = _digest(argv)
-    policy_digest = _digest(
-        {
-            "policy_id": _CHILD_ENV_POLICY_ID,
-            "config": policy_config,
-            "tool_env": tool_env,
+        tool_env = {
+            "PATH": _SAFE_PATH,
+            "HOME": str(codex_home),
+            "TMPDIR": str(tmpdir),
         }
-    )
-    path_identities = {
-        "temp_root": root_identity,
-        "run_dir": _path_identity(run_dir),
-        "codex_home": _path_identity(codex_home),
-        "cwd": _path_identity(cwd),
-        "tmpdir": _path_identity(tmpdir),
-    }
-    return Invocation(
-        argv=argv,
-        transport_env=transport_env,
-        tool_env=tool_env,
-        executable=config.codex_executable,
-        executable_identity=executable_identity,
-        model=config.model,
-        model_allowlist=config.model_allowlist,
-        temp_root=config.temp_root,
-        run_dir=run_dir,
-        codex_home=codex_home,
-        cwd=cwd,
-        tmpdir=tmpdir,
-        output_schema=output_schema,
-        path_identities=path_identities,
-        argv_digest=argv_digest,
-        child_env_policy_id=_CHILD_ENV_POLICY_ID,
-        child_env_policy_digest=policy_digest,
-        invocation_id=uuid.uuid4().hex,
-    )
+        transport_env = {
+            **tool_env,
+            "CODEX_HOME": str(codex_home),
+            _API_KEY_ENV_NAME: config.api_key,
+        }
+        _validate_environment_values(
+            transport_env, tool_env, config.api_key, config.api_key_env_name
+        )
+        policy_config = _child_environment_config(tool_env)
+        argv = _canonical_argv(
+            executable=config.codex_executable,
+            model=config.model,
+            output_schema=output_schema,
+            policy_config=policy_config,
+        )
+        argv_digest = _digest(argv)
+        policy_digest = _digest(
+            {
+                "policy_id": _CHILD_ENV_POLICY_ID,
+                "config": policy_config,
+                "tool_env": tool_env,
+            }
+        )
+        path_identities = {
+            "temp_root": root_identity,
+            "run_dir": run_identity,
+            "codex_home": _path_identity(codex_home),
+            "cwd": _path_identity(cwd),
+            "tmpdir": _path_identity(tmpdir),
+        }
+        return Invocation(
+            argv=argv,
+            transport_env=transport_env,
+            tool_env=tool_env,
+            executable=config.codex_executable,
+            executable_identity=executable_identity,
+            model=config.model,
+            model_allowlist=config.model_allowlist,
+            temp_root=config.temp_root,
+            run_dir=run_dir,
+            codex_home=codex_home,
+            cwd=cwd,
+            tmpdir=tmpdir,
+            output_schema=output_schema,
+            schema_digest=schema_digest,
+            schema_identity=schema_identity,
+            path_identities=path_identities,
+            argv_digest=argv_digest,
+            child_env_policy_id=_CHILD_ENV_POLICY_ID,
+            child_env_policy_digest=policy_digest,
+            invocation_id=uuid.uuid4().hex,
+        )
+    except Exception:
+        _cleanup_owned_run(run_dir, run_identity)
+        raise
 
 
 def preflight_isolation(
@@ -369,6 +417,114 @@ def _validate_plain_directory(path: Path, label: str) -> None:
         raise ValueError("{} directory is unavailable".format(label)) from error
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ValueError("{} directory must not be a symlink".format(label))
+
+
+def _write_schema_file(path: Path, content: bytes) -> PathIdentity:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(str(path), flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("schema write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("schema target is not a regular file")
+        identity = PathIdentity(
+            metadata.st_dev,
+            metadata.st_ino,
+            str(path.resolve(strict=True)),
+        )
+    finally:
+        os.close(descriptor)
+    return identity
+
+
+def _cleanup_owned_run(run_dir: Path, expected_identity: PathIdentity) -> None:
+    """Remove only known artifacts from the fresh run directory we created."""
+    try:
+        if _path_identity(run_dir) != expected_identity:
+            return
+        schema = run_dir / "response.schema.json"
+        try:
+            schema_metadata = schema.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISREG(schema_metadata.st_mode) or stat.S_ISLNK(
+                schema_metadata.st_mode
+            ):
+                schema.unlink()
+            else:
+                return
+        for name in ("codex-home", "cwd", "tmp"):
+            child = run_dir / name
+            try:
+                metadata = child.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                return
+            child.rmdir()
+        run_dir.rmdir()
+    except OSError:
+        return
+
+
+def _read_verified_schema(invocation: Invocation) -> bytes:
+    path = invocation.output_schema
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("output schema must be a regular non-symlink file")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ValueError("output schema must be mode 0600")
+    if _path_identity(path) != invocation.schema_identity:
+        raise ValueError("output schema identity changed")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(str(path), flags)
+    try:
+        opened_metadata = os.fstat(descriptor)
+        if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+            invocation.schema_identity.device,
+            invocation.schema_identity.inode,
+        ):
+            raise ValueError("output schema changed while opening")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        final_metadata = os.fstat(descriptor)
+        if (final_metadata.st_dev, final_metadata.st_ino) != (
+            invocation.schema_identity.device,
+            invocation.schema_identity.inode,
+        ):
+            raise ValueError("output schema changed while reading")
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    parsed = load_canonical_input(content)
+    if canonical_bytes(parsed) != content:
+        raise ValueError("output schema content is not canonical JSON")
+    if _digest_bytes(content) != invocation.schema_digest:
+        raise ValueError("output schema digest changed")
+    if _path_identity(path) != invocation.schema_identity:
+        raise ValueError("output schema identity changed after reading")
+    return content
 
 
 def _child_environment_config(tool_env: Mapping[str, str]) -> Tuple[str, ...]:
@@ -489,12 +645,12 @@ def _path_integrity_is_intact(invocation: Invocation) -> bool:
             return False
         if invocation.output_schema != invocation.run_dir / "response.schema.json":
             return False
-        if invocation.output_schema.exists() or invocation.output_schema.is_symlink():
-            return False
+        _read_verified_schema(invocation)
         if {item.name for item in invocation.run_dir.iterdir()} != {
             "codex-home",
             "cwd",
             "tmp",
+            "response.schema.json",
         }:
             return False
     except (KeyError, OSError, TypeError, ValueError):
@@ -633,3 +789,7 @@ def _digest(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _digest_bytes(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
