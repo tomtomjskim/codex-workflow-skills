@@ -48,8 +48,8 @@ class _LiteralRedactor:
 
     def _redact_string(self, value: str) -> str:
         for literal in self._literals:
-            value = value.replace(literal, "[REDACTED]")
-        return self._HOME_PATH.sub("[REDACTED_HOME]", value)
+            value = value.replace(literal, "")
+        return self._HOME_PATH.sub("", value)
 
     def redact(self, value: object) -> object:
         if isinstance(value, str):
@@ -65,6 +65,22 @@ class _LiteralRedactor:
                 redacted[redacted_key] = self.redact(item)
             return redacted
         return value
+
+    def require_clean(self, value: object) -> None:
+        if isinstance(value, str):
+            if any(literal in value for literal in self._literals):
+                raise ValueError("configured secret remains after redaction")
+            if self._HOME_PATH.search(value):
+                raise ValueError("home path remains after redaction")
+            return
+        if isinstance(value, list):
+            for item in value:
+                self.require_clean(item)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                self.require_clean(key)
+                self.require_clean(item)
 
 
 class RedactingWriter:
@@ -103,6 +119,7 @@ class RedactingWriter:
         self._decoder = codecs.getincrementaldecoder("utf-8")("strict")
         self._closed = False
         self._retained_path = None  # type: Optional[Path]
+        self._cleanup_warnings = []  # type: list
         self._directory_fd = None  # type: Optional[int]
         self._directory_token = None  # type: Optional[_PathToken]
         self._open_trusted_directory()
@@ -165,7 +182,9 @@ class RedactingWriter:
         self._discard_raw()
         self._closed = True
         self._close_directory()
-        raise RedactionError(message) from None
+        error = RedactionError(message)
+        error.cleanup_warnings = tuple(self._cleanup_warnings)
+        raise error from None
 
     def close(self) -> None:
         if not self._closed:
@@ -221,19 +240,18 @@ class RedactingWriter:
         raise AssertionError("unreachable")
 
     def _redact_record(self, value: object) -> object:
-        if self._custom_redactor is None:
-            try:
-                return self._literal_redactor.redact(value)
-            except Exception:
-                self._fail("artifact redaction failed")
-
         try:
-            text = _compact_json(value)
-            method = getattr(self._custom_redactor, "redact", None)
-            retained = method(text) if callable(method) else self._custom_redactor(text)
-            if not isinstance(retained, str):
-                raise TypeError("custom redactor must return JSON text")
-            return json.loads(retained, parse_constant=_reject_json_constant)
+            candidate = value
+            if self._custom_redactor is not None:
+                text = _compact_json(value)
+                method = getattr(self._custom_redactor, "redact", None)
+                retained = method(text) if callable(method) else self._custom_redactor(text)
+                if not isinstance(retained, str):
+                    raise TypeError("custom redactor must return JSON text")
+                candidate = json.loads(retained, parse_constant=_reject_json_constant)
+            redacted = self._literal_redactor.redact(candidate)
+            self._literal_redactor.require_clean(redacted)
+            return redacted
         except Exception:
             self._fail("artifact redaction failed")
         raise AssertionError("unreachable")
@@ -290,7 +308,7 @@ class RedactingWriter:
             if self._token_for_name(name) == token:
                 os.unlink(name, dir_fd=self._directory_fd)
         except OSError:
-            pass
+            self._cleanup_warnings.append("could not remove owned artifact path")
 
     def _unlink_owned_required(self, name: str, token: Optional[_PathToken]) -> None:
         if token is not None and self._token_for_name(name) == token:
@@ -300,12 +318,15 @@ class RedactingWriter:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         for _attempt in range(16):
             name = self._STAGING_PREFIX + secrets.token_hex(16)
+            fd = None
+            created = False
+            token = None  # type: Optional[_PathToken]
             try:
                 fd = os.open(name, flags, 0o600, dir_fd=self._directory_fd)
+                created = True
             except FileExistsError:
                 continue
             try:
-                token = None  # type: Optional[_PathToken]
                 info = os.fstat(fd)
                 token = (info.st_dev, info.st_ino)
                 if not stat.S_ISREG(info.st_mode):
@@ -313,11 +334,20 @@ class RedactingWriter:
                 os.fchmod(fd, 0o600)
                 return fd, name, token
             except Exception:
+                if created:
+                    if token is None:
+                        try:
+                            os.unlink(name, dir_fd=self._directory_fd)
+                        except OSError:
+                            self._cleanup_warnings.append(
+                                "could not remove created staging artifact"
+                            )
+                    else:
+                        self._unlink_if_token(name, token)
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-                self._unlink_if_token(name, token)
                 raise
         raise OSError("could not allocate staging artifact")
 

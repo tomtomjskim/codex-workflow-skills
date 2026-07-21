@@ -221,6 +221,50 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             budget.release()
 
+    def test_legacy_release_cannot_steal_lease_owned_slot(self):
+        budget = Budget(BudgetPolicy(3, 10.0, 1, 1024), clock=FakeClock())
+        lease = budget.acquire_call()
+
+        with self.assertRaises(RuntimeError):
+            budget.release()
+        with self.assertRaises(BudgetExceeded):
+            budget.acquire_call()
+
+        lease.release()
+        replacement = budget.acquire_call()
+        replacement.release()
+
+    def test_mixed_api_barrier_preserves_lease_ownership(self):
+        concurrency = 3
+        budget = Budget(BudgetPolicy(10, 10.0, concurrency, 1024), clock=FakeClock())
+        leases = [budget.acquire_call() for _ in range(concurrency)]
+        start = threading.Barrier(concurrency + 1)
+        errors = []
+        errors_lock = threading.Lock()
+
+        def release_legacy():
+            start.wait()
+            try:
+                budget.release()
+            except RuntimeError as error:
+                with errors_lock:
+                    errors.append(error)
+
+        threads = [threading.Thread(target=release_legacy) for _ in range(concurrency)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(errors), concurrency)
+        self.assertEqual(budget.snapshot().active, concurrency)
+        with self.assertRaises(BudgetExceeded):
+            budget.acquire_call()
+        for lease in leases:
+            lease.release()
+        self.assertEqual(budget.snapshot().active, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

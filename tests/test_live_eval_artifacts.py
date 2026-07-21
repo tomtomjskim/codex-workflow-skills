@@ -26,6 +26,21 @@ class LeakingFailureRedactor:
         raise RuntimeError("SECRET_NAME secret-value /home/private-user")
 
 
+class PassThroughRedactor:
+    def redact(self, text):
+        return text
+
+
+class ReintroducingRedactor:
+    def redact(self, text):
+        return '{"value":"secret-value /home/private-user"}'
+
+
+class EscapedSecretRedactor:
+    def redact(self, text):
+        return '{"value":"secret\\u002dvalue"}'
+
+
 class ArtifactTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -116,6 +131,77 @@ class ArtifactTests(unittest.TestCase):
 
         self.assertFalse(invalid.path.exists())
         self.assertFalse(custom.path.exists())
+
+    def test_builtin_redaction_is_final_safety_after_pass_through_custom(self):
+        writer = RedactingWriter(
+            self.directory,
+            {"SECRET_NAME": "secret-value"},
+            artifact_name="pass-through",
+            redactor=PassThroughRedactor(),
+        )
+        writer.write(b'{"SECRET_NAME":"secret-value /home/private-user"}\n')
+
+        content = writer.finalize().read_text(encoding="utf-8")
+
+        self.assertNotIn("SECRET_NAME", content)
+        self.assertNotIn("secret-value", content)
+        self.assertNotIn("/home/private-user", content)
+
+    def test_builtin_redaction_removes_secret_reintroduced_by_custom(self):
+        writer = RedactingWriter(
+            self.directory,
+            {"SECRET_NAME": "secret-value"},
+            artifact_name="reintroduced",
+            redactor=ReintroducingRedactor(),
+        )
+        writer.write(b'{"value":"safe"}\n')
+
+        content = writer.finalize().read_text(encoding="utf-8")
+
+        self.assertNotIn("secret-value", content)
+        self.assertNotIn("/home/private-user", content)
+
+    def test_builtin_redaction_removes_escaped_custom_secret(self):
+        writer = RedactingWriter(
+            self.directory,
+            {"SECRET_NAME": "secret-value"},
+            artifact_name="escaped-custom",
+            redactor=EscapedSecretRedactor(),
+        )
+        writer.write(b'{"value":"safe"}\n')
+
+        content = writer.finalize().read_text(encoding="utf-8")
+
+        self.assertNotIn("secret-value", content)
+        self.assertNotIn("secret\\u002dvalue", content)
+
+    def test_replacement_never_overlaps_configured_secret(self):
+        writer = RedactingWriter(
+            self.directory,
+            {"REDACTED": "[REDACTED]"},
+            artifact_name="marker-overlap",
+            redactor=PassThroughRedactor(),
+        )
+        writer.write(b'{"first":"REDACTED","second":"[REDACTED]"}\n')
+
+        content = writer.finalize().read_text(encoding="utf-8")
+
+        self.assertNotIn("REDACTED", content)
+        self.assertNotIn("[REDACTED]", content)
+
+    def test_redacted_mapping_key_collision_fails_closed(self):
+        writer = RedactingWriter(
+            self.directory,
+            {"SECRET_NAME": "secret"},
+            artifact_name="key-collision",
+            redactor=PassThroughRedactor(),
+        )
+        writer.write(b'{"secret":"first","":"second"}\n')
+
+        with self.assertRaises(RedactionError):
+            writer.finalize()
+
+        self.assertFalse(writer.path.exists())
 
     def test_redaction_errors_hide_raw_values_from_traceback(self):
         cases = (
@@ -213,6 +299,50 @@ class ArtifactTests(unittest.TestCase):
                         writer.finalize()
                 self.assertFalse((self.directory / name).exists())
                 self.assertEqual(writer.buffered_bytes, 0)
+
+    def test_staging_fstat_failure_immediately_unlinks_created_leaf(self):
+        writer = RedactingWriter(self.directory, {}, artifact_name="fstat-only.jsonl")
+        writer.write(b'{"value":"retained"}\n')
+        original_fstat = artifacts_module.os.fstat
+        failed = []
+
+        def fail_staging_fstat(fd):
+            info = original_fstat(fd)
+            if stat.S_ISREG(info.st_mode) and not failed:
+                failed.append(True)
+                raise OSError("staging fstat")
+            return info
+
+        with mock.patch("scripts.live_eval.artifacts.os.fstat", side_effect=fail_staging_fstat):
+            with self.assertRaises(RedactionError):
+                writer.finalize()
+
+        self.assertEqual(list(self.directory.glob(".live-eval-stage-*")), [])
+        self.assertFalse(writer.path.exists())
+
+    def test_staging_fstat_cleanup_failure_reports_warning_without_overclaim(self):
+        writer = RedactingWriter(self.directory, {}, artifact_name="fstat-warning.jsonl")
+        writer.write(b'{"value":"retained"}\n')
+        original_fstat = artifacts_module.os.fstat
+        failed = []
+
+        def fail_staging_fstat(fd):
+            info = original_fstat(fd)
+            if stat.S_ISREG(info.st_mode) and not failed:
+                failed.append(True)
+                raise OSError("staging fstat")
+            return info
+
+        with mock.patch("scripts.live_eval.artifacts.os.fstat", side_effect=fail_staging_fstat), mock.patch(
+            "scripts.live_eval.artifacts.os.unlink", side_effect=OSError("cleanup unlink")
+        ):
+            with self.assertRaises(RedactionError) as raised:
+                writer.finalize()
+
+        self.assertTrue(hasattr(raised.exception, "cleanup_warnings"))
+        self.assertTrue(raised.exception.cleanup_warnings)
+        self.assertEqual(len(list(self.directory.glob(".live-eval-stage-*"))), 1)
+        self.assertFalse(writer.path.exists())
 
     def test_competing_final_file_created_during_link_is_preserved(self):
         writer = RedactingWriter(self.directory, {}, artifact_name="race.jsonl")

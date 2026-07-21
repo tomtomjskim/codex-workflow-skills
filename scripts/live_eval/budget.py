@@ -101,7 +101,9 @@ class Budget:
         self._last_clock = None  # type: Optional[float]
         self._started_at = self._clock_value_locked()
         self._calls_used = 0
-        self._active = 0
+        self._legacy_active = 0
+        self._lease_active = 0
+        self._lease_tokens = set()
 
     @classmethod
     def targeted(cls, *, clock: Callable[[], float] = time.monotonic) -> "Budget":
@@ -157,7 +159,7 @@ class Budget:
             return BudgetDecision.BLOCKED_TIMEOUT
         if self._calls_used >= self._policy.max_calls:
             return BudgetDecision.BLOCKED_BUDGET
-        if self._active >= self._policy.concurrency:
+        if self._legacy_active + self._lease_active >= self._policy.concurrency:
             return BudgetDecision.BLOCKED_CONCURRENCY
         return BudgetDecision.ALLOWED
 
@@ -177,7 +179,7 @@ class Budget:
             decision = self._decision_locked(self._elapsed_locked())
             if decision is not BudgetDecision.ALLOWED:
                 raise BudgetExceeded(decision)
-            self._active += 1
+            self._legacy_active += 1
 
     def acquire_call(self) -> "_BudgetLease":
         """Atomically reserve one call and one active slot."""
@@ -185,15 +187,17 @@ class Budget:
             decision = self._decision_locked(self._elapsed_locked())
             if decision is not BudgetDecision.ALLOWED:
                 raise BudgetExceeded(decision)
+            token = object()
             self._calls_used += 1
-            self._active += 1
-            return _BudgetLease(self)
+            self._lease_active += 1
+            self._lease_tokens.add(token)
+            return _BudgetLease(self, token)
 
     def release(self) -> None:
         with self._lock:
-            if self._active == 0:
+            if self._legacy_active == 0:
                 raise RuntimeError("no active slot to release")
-            self._active -= 1
+            self._legacy_active -= 1
 
     def _release_lease(self, lease: "_BudgetLease", allow_released: bool) -> None:
         with self._lock:
@@ -201,9 +205,10 @@ class Budget:
                 if allow_released:
                     return
                 raise RuntimeError("budget lease already released")
-            if self._active == 0:
-                raise RuntimeError("no active slot to release")
-            self._active -= 1
+            if lease._token not in self._lease_tokens:
+                raise RuntimeError("budget lease is not active")
+            self._lease_tokens.remove(lease._token)
+            self._lease_active -= 1
             lease._released = True
 
     def snapshot(self) -> BudgetSnapshot:
@@ -216,7 +221,7 @@ class Budget:
                 concurrency=self._policy.concurrency,
                 max_raw_bytes=self._policy.max_raw_bytes,
                 calls_used=self._calls_used,
-                active=self._active,
+                active=self._legacy_active + self._lease_active,
                 elapsed_seconds=elapsed,
                 decision=decision,
             )
@@ -225,8 +230,9 @@ class Budget:
 class _BudgetLease:
     """Single-use release handle returned by ``Budget.acquire_call``."""
 
-    def __init__(self, budget: Budget) -> None:
+    def __init__(self, budget: Budget, token: object) -> None:
         self._budget = budget
+        self._token = token
         self._released = False
 
     def release(self) -> None:
