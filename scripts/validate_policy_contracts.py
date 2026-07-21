@@ -45,6 +45,7 @@ _REPOSITORY_CONTRACT_SNIPPETS = {
         "CLI version 1",
         "output directory must not exist",
         "authoritative `--manifest`",
+        "atomic no-replace publish is unavailable",
     ),
     "skills/workflow-intake/SKILL.md": (
         "references/parallel-coordination.md",
@@ -83,6 +84,7 @@ _REPOSITORY_CONTRACT_SNIPPETS = {
         "sequential fallback",
         "output directory must not exist",
         "authoritative `--manifest`",
+        "atomic no-replace publish is unavailable",
     ),
 }
 

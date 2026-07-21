@@ -169,7 +169,7 @@ For covered concurrent work, prepare a manifest and inventory together from one 
   --json
 ```
 
-The output directory must not exist before this command. Preparation builds and synchronizes both files in a private sibling staging directory, then publishes the directory as one unit. Existing output is never reused or mutated.
+The output directory must not exist before this command. Preparation builds and synchronizes both files in a private sibling staging directory, then publishes the directory as one unit with the platform's atomic no-replace rename primitive. Existing empty/nonempty directories, files, symlinks, and concurrently created targets are never replaced or removed. If atomic no-replace publish is unavailable, preparation returns a structured blocked error; there is no unsafe fallback, so use sequential execution.
 
 Validate the generated artifacts before every concurrent dispatch. A contracted route also requires the current frozen contract:
 

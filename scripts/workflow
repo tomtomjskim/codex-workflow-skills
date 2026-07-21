@@ -2,6 +2,8 @@
 """Prepare and validate coordination artifacts as canonical JSON."""
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 import shutil
@@ -11,7 +13,7 @@ import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -96,20 +98,77 @@ def _write_staged_file(path: Path, data: bytes) -> None:
         os.fsync(stream.fileno())
 
 
+def _rename_directory_noreplace(staged: Path, target: Path) -> None:
+    """Atomically rename a directory only when target does not exist."""
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(str(staged))
+    target_bytes = os.fsencode(str(target))
+
+    if sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise ValidationError(
+                "atomic no-replace publish is unavailable"
+            ) from error
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, target_bytes, 1)
+    elif sys.platform == "darwin":
+        try:
+            rename = library.renamex_np
+        except AttributeError as error:
+            raise ValidationError(
+                "atomic no-replace publish is unavailable"
+            ) from error
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, target_bytes, 0x00000004)
+    else:
+        raise ValidationError("atomic no-replace publish is unavailable")
+
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(error_number, os.strerror(error_number), str(target))
+    if error_number in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+        raise ValidationError("atomic no-replace publish is unavailable")
+    raise OSError(error_number, os.strerror(error_number), str(target))
+
+
+def _atomic_publish_directory(
+    staged: Path,
+    target: Path,
+    publish: Optional[Callable[[Path, Path], None]] = None,
+) -> None:
+    publisher = publish or _rename_directory_noreplace
+    try:
+        publisher(staged, target)
+    except FileExistsError as error:
+        raise ValidationError("output directory must not already exist") from error
+
+
 def _publish_prepared_output(
-    out_dir: Path, manifest_bytes: bytes, inventory_bytes: bytes
+    out_dir: Path,
+    manifest_bytes: bytes,
+    inventory_bytes: bytes,
+    publish: Optional[Callable[[Path, Path], None]] = None,
 ) -> None:
     target = out_dir.absolute()
     parent = target.parent
-    if target.exists() or target.is_symlink():
-        raise ValidationError("output directory must not already exist")
     if not parent.is_dir():
         raise ValidationError("output directory parent must exist")
     staged = Path(
         tempfile.mkdtemp(prefix=".{}.".format(target.name), dir=str(parent))
     )
     os.chmod(str(staged), 0o700)
-    published = False
     try:
         _write_staged_file(staged / "manifest.json", manifest_bytes)
         _write_staged_file(staged / "inventory.json", inventory_bytes)
@@ -118,20 +177,10 @@ def _publish_prepared_output(
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-        if target.exists() or target.is_symlink():
-            raise ValidationError("output directory must not already exist")
-        os.replace(str(staged), str(target))
-        published = True
-        parent_fd = os.open(str(parent), os.O_RDONLY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        _atomic_publish_directory(staged, target, publish)
     except Exception:
         if staged.exists():
             shutil.rmtree(str(staged))
-        if published and target.exists():
-            shutil.rmtree(str(target))
         raise
 
 

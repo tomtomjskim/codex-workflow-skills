@@ -1,5 +1,6 @@
 import json
 import importlib.machinery
+import errno
 import subprocess
 import tempfile
 import unittest
@@ -251,23 +252,94 @@ class WorkflowCLITests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(list(target.parent.glob(".atomic-output.*")), [])
 
-        published_target = Path(self.temporary_directory.name) / "publish-fsync"
-        real_fsync = WORKFLOW_MODULE.os.fsync
-        fsync_calls = []
+    def test_atomic_publish_rejects_concurrent_creator_without_clobber(self):
+        parent = Path(self.temporary_directory.name)
+        target = parent / "concurrent-output"
+        marker = target / "external-marker"
 
-        def fail_parent_fsync(file_descriptor):
-            fsync_calls.append(file_descriptor)
-            if len(fsync_calls) == 4:
-                raise OSError("injected parent fsync failure")
-            return real_fsync(file_descriptor)
+        def concurrent_creator(staged, destination):
+            destination.mkdir()
+            marker.write_text("external", encoding="utf-8")
+            raise FileExistsError(errno.EEXIST, "target exists", str(destination))
 
-        with mock.patch.object(WORKFLOW_MODULE.os, "fsync", side_effect=fail_parent_fsync):
-            with self.assertRaises(OSError):
-                WORKFLOW_MODULE._publish_prepared_output(
-                    published_target, manifest, inventory
-                )
-        self.assertFalse(published_target.exists())
-        self.assertEqual(list(target.parent.glob(".publish-fsync.*")), [])
+        with self.assertRaisesRegex(
+            WORKFLOW_MODULE.ValidationError, "must not already exist"
+        ):
+            WORKFLOW_MODULE._publish_prepared_output(
+                target, b"{}\n", b"{}\n", publish=concurrent_creator
+            )
+
+        self.assertEqual(marker.read_text(encoding="utf-8"), "external")
+        self.assertEqual(list(parent.glob(".concurrent-output.*")), [])
+
+    def test_atomic_publish_never_clobbers_existing_target_types(self):
+        parent = Path(self.temporary_directory.name)
+        external = parent / "external"
+        external.mkdir()
+        cases = []
+
+        empty_dir = parent / "existing-empty"
+        empty_dir.mkdir()
+        cases.append((empty_dir, lambda: self.assertEqual(list(empty_dir.iterdir()), [])))
+
+        nonempty_dir = parent / "existing-nonempty"
+        nonempty_dir.mkdir()
+        marker = nonempty_dir / "marker"
+        marker.write_text("keep", encoding="utf-8")
+        cases.append((nonempty_dir, lambda: self.assertEqual(marker.read_text(), "keep")))
+
+        existing_file = parent / "existing-file"
+        existing_file.write_text("keep", encoding="utf-8")
+        cases.append((existing_file, lambda: self.assertEqual(existing_file.read_text(), "keep")))
+
+        existing_link = parent / "existing-link"
+        existing_link.symlink_to(external, target_is_directory=True)
+        cases.append((existing_link, lambda: self.assertTrue(existing_link.is_symlink())))
+
+        for target, assert_preserved in cases:
+            with self.subTest(target=target.name):
+                with self.assertRaisesRegex(
+                    WORKFLOW_MODULE.ValidationError, "must not already exist"
+                ):
+                    WORKFLOW_MODULE._publish_prepared_output(
+                        target, b"{}\n", b"{}\n"
+                    )
+                assert_preserved()
+                self.assertEqual(list(parent.glob(".{}.*".format(target.name))), [])
+
+    def test_atomic_publish_success_contains_both_files(self):
+        target = Path(self.temporary_directory.name) / "successful-output"
+
+        WORKFLOW_MODULE._publish_prepared_output(
+            target, b'{"manifest":1}\n', b'{"inventory":1}\n'
+        )
+
+        self.assertTrue(target.is_dir())
+        self.assertEqual(
+            (target / "manifest.json").read_bytes(), b'{"manifest":1}\n'
+        )
+        self.assertEqual(
+            (target / "inventory.json").read_bytes(), b'{"inventory":1}\n'
+        )
+
+    def test_atomic_publish_unavailable_blocks_without_fallback(self):
+        parent = Path(self.temporary_directory.name)
+        target = parent / "unsupported-output"
+
+        def unavailable(_staged, _target):
+            raise WORKFLOW_MODULE.ValidationError(
+                "atomic no-replace publish is unavailable"
+            )
+
+        with self.assertRaisesRegex(
+            WORKFLOW_MODULE.ValidationError, "no-replace publish is unavailable"
+        ):
+            WORKFLOW_MODULE._publish_prepared_output(
+                target, b"{}\n", b"{}\n", publish=unavailable
+            )
+
+        self.assertFalse(target.exists())
+        self.assertEqual(list(parent.glob(".unsupported-output.*")), [])
 
     def test_repo_root_must_be_canonical_git_toplevel(self):
         plan = PLAN_FIXTURE

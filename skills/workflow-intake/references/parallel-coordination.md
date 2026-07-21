@@ -24,7 +24,7 @@ Prepare artifacts together from one approved canonical JSON plan:
 workflow prepare-coordination --repo-root <approved-root> --plan <plan.json> --out-dir <temporary-dir> --json
 ```
 
-The output directory must not exist before preparation. The CLI encodes both canonical payloads first, writes and synchronizes them in one private sibling staging directory, then publishes that directory as a unit. An existing target or any staging failure blocks preparation without mutating the target.
+The output directory must not exist before preparation. The CLI encodes both canonical payloads first, writes and synchronizes them in one private sibling staging directory, then publishes that directory as a unit with an atomic no-replace rename. Existing empty/nonempty directories, files, symlinks, and concurrently created targets are never deleted or replaced; only the CLI-created staging path is cleaned after failure. If atomic no-replace publish is unavailable, preparation is blocked with a structured error. Do not use an unsafe rename fallback; record blocked parallel validation and use single-owner sequential execution.
 
 Validate the prepared artifacts and receive the dispatch receipt:
 
