@@ -41,6 +41,11 @@ class EscapedSecretRedactor:
         return '{"value":"secret\\u002dvalue"}'
 
 
+class SecretStringToNumberRedactor:
+    def redact(self, text):
+        return '{"value":123456}'
+
+
 class ArtifactTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -202,6 +207,56 @@ class ArtifactTests(unittest.TestCase):
             writer.finalize()
 
         self.assertFalse(writer.path.exists())
+
+    def test_serialized_scalar_secret_literals_fail_before_staging(self):
+        cases = (
+            ("number", "123456", b'{"value":123456}\n', None),
+            ("boolean", "true", b'{"value":true}\n', None),
+            ("null", "null", b'{"value":null}\n', None),
+            (
+                "custom-number",
+                "123456",
+                b'{"value":"123456"}\n',
+                SecretStringToNumberRedactor(),
+            ),
+        )
+        for name, secret, raw, redactor in cases:
+            with self.subTest(name=name):
+                writer = RedactingWriter(
+                    self.directory,
+                    {"SECRET_NAME": secret},
+                    artifact_name=name,
+                    redactor=redactor,
+                )
+                writer.write(raw)
+                with mock.patch.object(
+                    writer, "_open_staging", wraps=writer._open_staging
+                ) as open_staging:
+                    try:
+                        writer.finalize()
+                    except RedactionError:
+                        rendered = traceback.format_exc()
+                    else:
+                        self.fail("serialized secret literal was retained")
+                open_staging.assert_not_called()
+                self.assertNotIn(secret, rendered)
+                self.assertEqual(writer.buffered_bytes, 0)
+                self.assertFalse(writer.path.exists())
+
+    def test_unrelated_serialized_scalars_are_retained(self):
+        writer = RedactingWriter(
+            self.directory,
+            {"SECRET_NAME": "123456"},
+            artifact_name="safe-scalars",
+        )
+        writer.write(b'{"number":654321,"boolean":true,"missing":null}\n')
+
+        content = writer.finalize().read_text(encoding="utf-8")
+
+        self.assertEqual(
+            content,
+            '{"number":654321,"boolean":true,"missing":null}\n',
+        )
 
     def test_redaction_errors_hide_raw_values_from_traceback(self):
         cases = (

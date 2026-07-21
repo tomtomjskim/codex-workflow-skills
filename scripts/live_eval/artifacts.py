@@ -82,6 +82,11 @@ class _LiteralRedactor:
                 self.require_clean(key)
                 self.require_clean(item)
 
+    def require_serialized_clean(self, content: bytes) -> None:
+        for literal in self._literals:
+            if literal.encode("utf-8") in content:
+                raise ValueError("configured secret remains in serialized artifact")
+
 
 class RedactingWriter:
     """Buffers bounded raw JSONL and atomically retains only redacted bytes."""
@@ -260,7 +265,9 @@ class RedactingWriter:
         records = self._parse_jsonl()
         try:
             lines = [_compact_json(self._redact_record(record)) for record in records]
-            return (("\n".join(lines) + "\n") if lines else "").encode("utf-8")
+            retained = (("\n".join(lines) + "\n") if lines else "").encode("utf-8")
+            self._literal_redactor.require_serialized_clean(retained)
+            return retained
         except (TypeError, ValueError, UnicodeEncodeError):
             self._fail("artifact redaction returned invalid data")
         raise AssertionError("unreachable")
