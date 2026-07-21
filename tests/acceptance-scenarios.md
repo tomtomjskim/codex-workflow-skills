@@ -2,6 +2,12 @@
 
 These scenarios are the forward-test backlog for the skills. Run them with fresh context before treating the skills as stable.
 
+The canonical machine-readable corpus is `live-eval-scenarios.json`. Assertion
+paths use dot-separated identifier segments; a terminal `[]` expands one list
+and succeeds when one or more matching elements satisfy the exact value. Each
+scenario's `expected_status` is runner-facing outcome metadata and is separate
+from its structured `required_values` response assertions.
+
 ## Workflow Router
 
 1. [WR-EXPLICIT-INTAKE] Explicit route to intake:
