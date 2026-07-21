@@ -300,6 +300,100 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((outside / "a.md").exists())
         self.assertFalse((outside / "b.md").exists())
 
+    def test_root_swap_during_eexist_marks_cli_result_paths_unstable(self):
+        self.write_source("a.md")
+        self.write_source("b.md")
+        moved = self.root / "moved-target"
+        outside = self.root / "outside"
+        outside.mkdir()
+        real_symlink = os.symlink
+
+        def swap_then_conflict(source, target, *args, **kwargs):
+            if target == "b.md":
+                self.target.rename(moved)
+                real_symlink(str(outside), str(self.target), target_is_directory=True)
+                raise FileExistsError(target)
+            return real_symlink(source, target, *args, **kwargs)
+
+        output = io.StringIO()
+        with mock.patch(
+            "scripts.install_agent_adapters.os.symlink", side_effect=swap_then_conflict
+        ):
+            with contextlib.redirect_stdout(output):
+                exit_code = main([
+                    "--source-root", str(self.source),
+                    "--target-root", str(self.target),
+                    "--suffix", ".md",
+                    "--json",
+                ])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(payload["status"], "partial")
+        for section in ("created", "failed"):
+            self.assertIsNone(payload[section][0]["target"])
+            self.assertFalse(payload[section][0]["target_path_stable"])
+        self.assertFalse((outside / "a.md").exists())
+        self.assertFalse((outside / "b.md").exists())
+
+    def test_root_swap_during_generic_symlink_error_marks_result_paths_unstable(self):
+        self.write_source("a.md")
+        self.write_source("b.md")
+        plan = plan_links(self.source, self.target, suffix=".md")
+        moved = self.root / "moved-target"
+        outside = self.root / "outside"
+        outside.mkdir()
+        real_symlink = os.symlink
+
+        def swap_then_fail(source, target, *args, **kwargs):
+            if target == "b.md":
+                self.target.rename(moved)
+                real_symlink(str(outside), str(self.target), target_is_directory=True)
+                raise OSError("simulated link failure")
+            return real_symlink(source, target, *args, **kwargs)
+
+        with mock.patch(
+            "scripts.install_agent_adapters.os.symlink", side_effect=swap_then_fail
+        ):
+            with self.assertRaises(InstallError) as raised:
+                apply_links(plan)
+
+        for section in (raised.exception.result.created, raised.exception.result.failed):
+            self.assertIsNone(section[0].target)
+            self.assertFalse(section[0].target_path_stable)
+
+    def test_root_swap_during_source_failure_marks_result_paths_unstable(self):
+        self.write_source("a.md")
+        self.write_source("b.md")
+        plan = plan_links(self.source, self.target, suffix=".md")
+        moved = self.root / "moved-target"
+        outside = self.root / "outside"
+        outside.mkdir()
+        real_fingerprint = installer._fingerprint
+        real_symlink = os.symlink
+        source_b_calls = []
+
+        def swap_then_fail(path):
+            if path.parent == plan.source_root and path.name == "b.md":
+                source_b_calls.append(True)
+                if len(source_b_calls) == 2:
+                    self.target.rename(moved)
+                    real_symlink(
+                        str(outside), str(self.target), target_is_directory=True
+                    )
+                    raise FileNotFoundError("simulated source failure")
+            return real_fingerprint(path)
+
+        with mock.patch(
+            "scripts.install_agent_adapters._fingerprint", side_effect=swap_then_fail
+        ):
+            with self.assertRaises(InstallError) as raised:
+                apply_links(plan)
+
+        for section in (raised.exception.result.created, raised.exception.result.failed):
+            self.assertIsNone(section[0].target)
+            self.assertFalse(section[0].target_path_stable)
+
     def test_missing_target_directory_is_blocked_without_creation(self):
         self.write_source()
         self.target.rmdir()

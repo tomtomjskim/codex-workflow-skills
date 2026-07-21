@@ -503,7 +503,7 @@ def _unstable_entries(entries: Sequence[ResultEntry]) -> Tuple[ResultEntry, ...]
             entry.name,
             entry.source,
             None,
-            "direct symlink created in pinned directory; target pathname is unstable",
+            "{}; target pathname is unstable".format(entry.reason),
             False,
         )
         for entry in entries
@@ -572,6 +572,25 @@ def _verify_root_identity(
                 os.close(current_parent_fd)
             except OSError:
                 pass
+
+
+def _failure_result_after_root_recheck(
+    plan: LinkPlan,
+    created: Sequence[ResultEntry],
+    kept: Sequence[ResultEntry],
+    failed: ResultEntry,
+    parent_fd: int,
+    root_fd: int,
+    root_token: _PathToken,
+) -> InstallResult:
+    """Return a failure result without claiming paths after identity loss."""
+    try:
+        _verify_root_identity(plan, parent_fd, root_fd, root_token)
+    except InstallError:
+        created = _unstable_entries(created)
+        kept = _unstable_entries(kept)
+        failed = _unstable_entries((failed,))[0]
+    return _failed_result(plan, created, tuple(kept), failed, False)
 
 
 def apply_links(plan: LinkPlan) -> InstallResult:
@@ -651,28 +670,40 @@ def apply_links(plan: LinkPlan) -> InstallResult:
                 if _fingerprint(spec.source) != spec.source_fingerprint:
                     raise OSError("source identity changed")
             except OSError:
-                result = _failed_result(
-                    current, created, kept,
+                result = _failure_result_after_root_recheck(
+                    current,
+                    created,
+                    kept,
                     _result_entry(entry, "approved source identity changed"),
-                    target_directory_created,
+                    parent_fd,
+                    root_fd,
+                    root_token,
                 )
                 raise InstallError("approved source identity changed", result) from None
             try:
                 os.symlink(str(spec.source), entry.name, dir_fd=root_fd)
             except FileExistsError:
-                result = _failed_result(
-                    current, created, kept,
+                result = _failure_result_after_root_recheck(
+                    current,
+                    created,
+                    kept,
                     _result_entry(entry, "target appeared during apply and was preserved"),
-                    target_directory_created,
+                    parent_fd,
+                    root_fd,
+                    root_token,
                 )
                 raise InstallConflict(
                     "target appeared during apply; existing path was preserved", result
                 ) from None
             except OSError:
-                result = _failed_result(
-                    current, created, kept,
+                result = _failure_result_after_root_recheck(
+                    current,
+                    created,
+                    kept,
                     _result_entry(entry, "direct symlink creation failed"),
-                    target_directory_created,
+                    parent_fd,
+                    root_fd,
+                    root_token,
                 )
                 raise InstallError("link creation failed", result) from None
             created.append(_result_entry(entry, "direct symlink created"))
