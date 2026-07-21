@@ -279,6 +279,18 @@ Forward-test behavior with the scenarios in `tests/acceptance-scenarios.md` befo
 
 See [forward-test-report.md](docs/forward-test-report.md) for the latest recorded forward-test and smoke-test notes.
 
+### Live evaluation runner
+
+The deterministic dry-run validates the scenario corpus and selection plan only. It does not require an API key, Codex executable, temporary runtime directory, capability probe, checkout installation, subprocess, or network access:
+
+```bash
+python3 scripts/run_live_eval.py --tags workflow-intake --model gpt-5.6-sol --dry-run
+```
+
+Successful dry-run output reports `status=preflight_only` and `model_calls=0`. This is planning evidence, not model-quality evidence.
+
+Without `--dry-run`, the runner is an explicit live operation. It refuses execution unless `OPENAI_API_KEY` is present and a `codex` executable is available. Live execution creates a private isolated runtime, installs and seals the exact clean-HEAD skill checkout, performs the final isolation preflight, and retains only redacted mode-0600 JSONL artifacts. Repository tests and `scripts/validate_repo.sh` never perform a live model call.
+
 ## Release History
 
 See [CHANGELOG.md](CHANGELOG.md) for public release notes.

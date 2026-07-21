@@ -7,12 +7,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.live_eval.isolation import (
+    CodexHomeSeal,
     CliCapabilities,
     EvalConfig,
     build_invocation,
     is_credential_like_name,
     preflight_auth,
     preflight_isolation,
+    seal_codex_home,
+    verify_codex_home_seal,
     toml_string,
 )
 from scripts.workflow_coordination.canonical_json import (
@@ -28,6 +31,7 @@ REQUIRED_FLAGS = frozenset(
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
+        "--json",
         "--output-schema",
         "--sandbox",
         "--strict-config",
@@ -97,6 +101,7 @@ class IsolationTests(unittest.TestCase):
                 "-a",
                 "never",
                 "exec",
+                "--json",
                 "--strict-config",
                 "--ephemeral",
                 "--ignore-user-config",
@@ -434,6 +439,48 @@ class IsolationTests(unittest.TestCase):
 
     def test_toml_string_escapes_untrusted_path_text(self):
         self.assertEqual(toml_string('a"b\\c\n'), '"a\\"b\\\\c\\n"')
+
+    def test_sealed_codex_home_is_accepted_without_weakening_empty_default(self):
+        invocation = build_invocation(self.config)
+        skills = invocation.codex_home / "skills"
+        skills.mkdir(mode=0o700)
+        (skills / "SKILL.md").write_text("sealed\n", encoding="utf-8")
+        seal = seal_codex_home(invocation.codex_home, ("skills",))
+
+        self.assertIsInstance(seal, CodexHomeSeal)
+        report = preflight_isolation(
+            invocation,
+            probe=lambda item: self.capabilities(item),
+            expected_codex_home_seal=seal,
+        )
+
+        self.assertEqual(report.classification, "ready")
+        self.assertTrue(verify_codex_home_seal(invocation, seal))
+
+        unsealed = build_invocation(self.config)
+        (unsealed.codex_home / "unexpected").write_text("x", encoding="utf-8")
+        blocked = preflight_isolation(
+            unsealed, probe=lambda item: self.capabilities(item)
+        )
+        self.assertEqual(blocked.classification, "blocked_isolation")
+
+    def test_sealed_codex_home_mutation_is_blocked_before_consumption(self):
+        invocation = build_invocation(self.config)
+        installed = invocation.codex_home / "skills"
+        installed.mkdir(mode=0o700)
+        policy = installed / "SKILL.md"
+        policy.write_text("original\n", encoding="utf-8")
+        seal = seal_codex_home(invocation.codex_home, ("skills",))
+
+        policy.write_text("tampered\n", encoding="utf-8")
+
+        report = preflight_isolation(
+            invocation,
+            probe=lambda item: self.capabilities(item),
+            expected_codex_home_seal=seal,
+        )
+        self.assertEqual(report.classification, "blocked_isolation")
+        self.assertFalse(verify_codex_home_seal(invocation, seal))
 
 
 if __name__ == "__main__":

@@ -51,6 +51,9 @@ require_file tests/test_canonical_json.py
 require_file tests/test_policy_contracts.py
 require_file tests/test_workflow_cli.py
 require_file skills/workflow-intake/references/parallel-coordination.md
+require_file scripts/run_live_eval.py
+require_file tests/live-eval-scenarios.json
+require_file tests/test_live_eval_runner.py
 
 if [ ! -x scripts/workflow ]; then
   printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2
@@ -76,6 +79,7 @@ run python3 scripts/validate_policy_contracts.py --repo-root .
 run python3 -m unittest tests.test_policy_contracts -v
 run python3 -m unittest discover -s tests -p 'test_*coordination*.py' -v
 run python3 -m unittest tests.test_workflow_cli -v
+run python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
 
 require_match '\[sample-workflow-intake\.md\]\(docs/sample-workflow-intake\.md\)' README.md 'workflow intake sample link'
 require_match '\[sample-adversarial-review\.md\]\(docs/sample-adversarial-review\.md\)' README.md 'adversarial review sample link'

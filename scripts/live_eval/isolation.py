@@ -30,6 +30,7 @@ _REQUIRED_FLAGS = frozenset(
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
+        "--json",
         "--output-schema",
         "--sandbox",
         "--strict-config",
@@ -75,6 +76,12 @@ class PathIdentity:
     device: int
     inode: int
     resolved: str
+
+
+@dataclass(frozen=True)
+class CodexHomeSeal:
+    allowed_entries: Tuple[str, ...]
+    content_digest: str
 
 
 @dataclass(frozen=True)
@@ -332,7 +339,10 @@ def build_invocation(config: EvalConfig) -> Invocation:
 
 
 def preflight_isolation(
-    invocation: Invocation, probe: Optional[FeatureProbe] = None
+    invocation: Invocation,
+    probe: Optional[FeatureProbe] = None,
+    *,
+    expected_codex_home_seal: Optional[CodexHomeSeal] = None,
 ) -> IsolationReport:
     """Prove path, command, and capability contracts before model execution."""
     report_values = {
@@ -341,7 +351,7 @@ def preflight_isolation(
         "consumer_contract": invocation.consumer_contract,
     }
     missing = []
-    if not _path_integrity_is_intact(invocation):
+    if not _path_integrity_is_intact(invocation, expected_codex_home_seal):
         missing.append("path_integrity")
     if not _invocation_policy_is_intact(invocation):
         missing.append("invocation_policy")
@@ -553,6 +563,7 @@ def _canonical_argv(
         "-a",
         "never",
         "exec",
+        "--json",
         "--strict-config",
         "--ephemeral",
         "--ignore-user-config",
@@ -610,7 +621,71 @@ def _path_identity(path: Path) -> PathIdentity:
     return PathIdentity(metadata.st_dev, metadata.st_ino, str(path.resolve(strict=True)))
 
 
-def _path_integrity_is_intact(invocation: Invocation) -> bool:
+def seal_codex_home(
+    codex_home: Path, allowed_entries: Tuple[str, ...]
+) -> CodexHomeSeal:
+    """Capture an immutable digest of an exact private CODEX_HOME tree."""
+    home = Path(codex_home).absolute()
+    _validate_plain_directory(home, "CODEX_HOME")
+    entries = tuple(allowed_entries)
+    if (
+        not entries
+        or tuple(sorted(entries)) != entries
+        or len(set(entries)) != len(entries)
+        or any(
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or name in (".", "..")
+            for name in entries
+        )
+    ):
+        raise ValueError("allowed CODEX_HOME entries must be unique sorted file names")
+    if tuple(sorted(item.name for item in home.iterdir())) != entries:
+        raise ValueError("CODEX_HOME entries do not match the seal inventory")
+    return CodexHomeSeal(entries, _directory_content_digest(home))
+
+
+def verify_codex_home_seal(invocation: Invocation, seal: CodexHomeSeal) -> bool:
+    """Recheck the exact sealed CODEX_HOME immediately before consumption."""
+    if not isinstance(invocation, Invocation) or not isinstance(seal, CodexHomeSeal):
+        return False
+    try:
+        if _path_identity(invocation.codex_home) != invocation.path_identities["codex_home"]:
+            return False
+        return seal_codex_home(invocation.codex_home, seal.allowed_entries) == seal
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _directory_content_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("CODEX_HOME seal rejects symlinks")
+        if stat.S_ISDIR(metadata.st_mode):
+            kind = b"directory"
+            content = b""
+        elif stat.S_ISREG(metadata.st_mode):
+            kind = b"file"
+            content = path.read_bytes()
+            if path.lstat() != metadata:
+                raise ValueError("CODEX_HOME changed while sealing")
+        else:
+            raise ValueError("CODEX_HOME seal accepts only files and directories")
+        digest.update(kind + b"\0")
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(oct(stat.S_IMODE(metadata.st_mode)).encode("ascii") + b"\0")
+        digest.update(len(content).to_bytes(8, "big") + content)
+    return "sha256:" + digest.hexdigest()
+
+
+def _path_integrity_is_intact(
+    invocation: Invocation,
+    expected_codex_home_seal: Optional[CodexHomeSeal] = None,
+) -> bool:
     try:
         if (
             _validate_trusted_temp_root(invocation.temp_root)
@@ -639,7 +714,12 @@ def _path_integrity_is_intact(invocation: Invocation) -> bool:
             return False
         if invocation.tmpdir.parent != invocation.run_dir:
             return False
-        if any(invocation.codex_home.iterdir()) or any(invocation.cwd.iterdir()):
+        if expected_codex_home_seal is None:
+            if any(invocation.codex_home.iterdir()):
+                return False
+        elif not verify_codex_home_seal(invocation, expected_codex_home_seal):
+            return False
+        if any(invocation.cwd.iterdir()):
             return False
         if any(invocation.tmpdir.iterdir()):
             return False

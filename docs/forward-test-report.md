@@ -64,6 +64,13 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
 
 ## Release Gate
 
+### Deterministic live-eval runner validation
+
+- Deterministic scenario, isolation, checkout, budget, artifact, and runner tests are part of the non-network repository release gate.
+- The runner dry-run verifies planning preflight only and reports `preflight_only` with zero model calls.
+- live model execution: not_run
+- No model-quality or production-network conclusion is inferred from deterministic tests or dry-run output.
+
 Before public release, run:
 
 ```bash
