@@ -32,7 +32,7 @@ Validate the prepared artifacts and receive the dispatch receipt:
 workflow validate-coordination --repo-root <approved-root> --manifest <manifest.json> --inventory <inventory.json> --contract <contract.json> --json
 ```
 
-`--contract` is required when the validator derives a contracted route. The command obtains the checkout tree hash from Git unless an explicit hash is supplied for controlled testing.
+`--contract` is required when the validator derives a contracted route. The command obtains the checkout tree hash from Git and requires a clean base worktree. An explicit hash supplied for controlled testing must exactly match the actual `HEAD^{tree}`.
 
 Before accepting a workstream handoff, validate its changed paths against the same current receipt:
 
@@ -40,7 +40,7 @@ Before accepting a workstream handoff, validate its changed paths against the sa
 workflow validate-handoff --repo-root <approved-root> --manifest <manifest.json> --inventory <inventory.json> --contract <contract.json> --receipt <receipt.json> --workstream-id <id> --changed-path <path> --json
 ```
 
-For handoff validation, pass the authoritative `--manifest`, `--inventory`, and current optional `--contract` again. The CLI reruns coordination validation with the canonical trigger matrix and compares the complete regenerated receipt with the submitted receipt before checking owned paths. A CLI receipt expires after five minutes; rerun coordination validation instead of handing off with stale evidence.
+For handoff validation, pass the authoritative `--manifest`, `--inventory`, and current optional `--contract` again. The CLI reruns coordination validation with the canonical trigger matrix and compares the complete regenerated receipt with the submitted receipt before checking owned paths. It authoritatively collects tracked and non-ignored untracked Git changes with a NUL-delimited status command. `--changed-path` values are additive declarations: the CLI validates their union with the Git paths, so omission or a declared subset cannot hide an actual change. A CLI receipt expires after five minutes; rerun coordination validation instead of handing off with stale evidence.
 
 Each command accepts only UTF-8 JSON and emits JSON. A structured error and nonzero exit blocks parallel validation.
 
@@ -52,6 +52,15 @@ Each command accepts only UTF-8 JSON and emits JSON. A structured error and nonz
 - Do not copy a submitted route or required reviewer set into authority-bearing artifacts; the validator derives them.
 - For a contracted route, freeze the current contract before dispatch and repeat validation after any contract revision.
 - Use isolated worktrees or isolated patch artifacts when parallel writers are active. If changed files cannot be attributed to one workstream, use the sequential fallback.
+- Stop all writers before collecting a handoff. Git status is not a runtime write barrier, standard ignored files are outside the collection, and symlink targets outside the repository are not observable through repository status.
+
+## Contract Schema And Evidence
+
+Contracted routes use the complete schema-version-1 contract; the earlier minimal four-field core and empty frozen ledger are invalid. `contract_core` has exactly the manifest and inventory hashes, positive revision, parent core hash, contract and integration owners, all three derived profile booleans (`shared_interface`, `path_overlap`, and `integration_dependency`), and the three extension objects (`interface_contract`, `path_ownership`, and `integration`). Revision 1 has a null parent; later revisions require a SHA-256 parent core hash. An active profile requires its corresponding extension object to be non-empty. Extension contents remain domain-specific canonical JSON and are not interpreted beyond that condition.
+
+Every required dependency or interface edge has a completed current-core `handoff` and `checkpoint` ledger record, and every derived affected consumer has a completed `acknowledgement`. Ledger records add `record_type`, `subject_id`, and `status` to the hash-bound evidence fields. They bind to the current contract core and checkout tree, form the ordered hash chain, and must exactly cover the derived required record set. The reviewer registry must exactly cover derived required reviewers with current-core completed entries and non-empty dispatch and completion evidence. A frozen contracted route with missing, failed, stale, duplicate, or unexpected required evidence is blocked.
+
+`integration_gate.status` remains `open` during dispatch validation. The current CLI does not define an integration-closure command or closure-receipt schema, so a submitted `closed` gate is rejected rather than trusted. Closure is a separate additive API/schema design, not an inferred operation of `validate-coordination` or `validate-handoff`.
 
 ## Receipt Lifecycle
 

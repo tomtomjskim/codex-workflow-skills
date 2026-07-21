@@ -184,6 +184,113 @@ class WorkflowCLITests(unittest.TestCase):
         self.assertEqual(error["error"]["type"], "ValidationError")
         self.assertEqual(error["fallback"]["execution"], "sequential")
 
+    def test_handoff_omitted_changed_path_rejects_authoritative_untracked_outside(self):
+        prepared = json.loads(self._prepare().stdout)
+        contract_path = self._write_contract(prepared)
+        receipt_path = self.out_dir / "receipt.json"
+        receipt_path.write_text(self._validate(contract_path).stdout, encoding="utf-8")
+        (self.repo_root / "src" / "api" / "outside.py").write_text(
+            "outside\n", encoding="utf-8"
+        )
+
+        result = run_cli(
+            "validate-handoff",
+            "--repo-root",
+            self.repo_root,
+            "--manifest",
+            self.out_dir / "manifest.json",
+            "--inventory",
+            self.out_dir / "inventory.json",
+            "--contract",
+            contract_path,
+            "--receipt",
+            receipt_path,
+            "--workstream-id",
+            "frontend",
+            "--json",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("src/api/outside.py", json.loads(result.stderr)["error"]["message"])
+
+    def test_handoff_declared_subset_cannot_hide_authoritative_outside(self):
+        prepared = json.loads(self._prepare().stdout)
+        contract_path = self._write_contract(prepared)
+        receipt_path = self.out_dir / "receipt.json"
+        receipt_path.write_text(self._validate(contract_path).stdout, encoding="utf-8")
+        (self.repo_root / "src" / "ui" / "settings.py").write_text(
+            "owned\n", encoding="utf-8"
+        )
+        (self.repo_root / "src" / "api" / "outside.py").write_text(
+            "outside\n", encoding="utf-8"
+        )
+
+        result = self._handoff(receipt_path)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("src/api/outside.py", json.loads(result.stderr)["error"]["message"])
+
+    def test_handoff_without_declaration_accepts_owned_git_changes(self):
+        prepared = json.loads(self._prepare().stdout)
+        contract_path = self._write_contract(prepared)
+        receipt_path = self.out_dir / "receipt.json"
+        receipt_path.write_text(self._validate(contract_path).stdout, encoding="utf-8")
+        (self.repo_root / "src" / "ui" / "settings.py").write_text(
+            "owned\n", encoding="utf-8"
+        )
+
+        result = run_cli(
+            "validate-handoff",
+            "--repo-root",
+            self.repo_root,
+            "--manifest",
+            self.out_dir / "manifest.json",
+            "--inventory",
+            self.out_dir / "inventory.json",
+            "--contract",
+            contract_path,
+            "--receipt",
+            receipt_path,
+            "--workstream-id",
+            "frontend",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["changed_paths"], ["src/ui/settings.py"])
+        self.assertEqual(payload["declared_changed_paths"], [])
+        self.assertEqual(payload["validated_paths"], ["src/ui/settings.py"])
+        self.assertEqual(payload["changed_path_source"], "git_status_plus_declarations")
+
+    def test_validate_coordination_rejects_dirty_base_and_mismatched_override(self):
+        prepared = json.loads(self._prepare().stdout)
+        contract_path = self._write_contract(prepared)
+        (self.repo_root / "src" / "ui" / "dirty.py").write_text(
+            "dirty\n", encoding="utf-8"
+        )
+
+        dirty = self._validate(contract_path)
+        mismatch = run_cli(
+            "validate-coordination",
+            "--repo-root",
+            self.repo_root,
+            "--manifest",
+            self.out_dir / "manifest.json",
+            "--inventory",
+            self.out_dir / "inventory.json",
+            "--contract",
+            contract_path,
+            "--checkout-tree-hash",
+            "0" * 40,
+            "--json",
+        )
+
+        self.assertNotEqual(dirty.returncode, 0)
+        self.assertIn("base worktree must be clean", json.loads(dirty.stderr)["error"]["message"])
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("does not match", json.loads(mismatch.stderr)["error"]["message"])
+
     def test_handoff_rejects_tampered_receipt_fields_and_stale_artifact(self):
         prepared = json.loads(self._prepare().stdout)
         contract_path = self._write_contract(prepared)

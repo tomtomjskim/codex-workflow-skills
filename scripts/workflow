@@ -26,6 +26,10 @@ from scripts.workflow_coordination.canonical_json import (  # noqa: E402
     canonical_bytes,
     load_canonical_input,
 )
+from scripts.workflow_coordination.git_changes import (  # noqa: E402
+    collect_changed_paths,
+    require_clean_base,
+)
 from scripts.workflow_coordination.prepare import (  # noqa: E402
     PreparationError,
     prepare_coordination,
@@ -226,7 +230,16 @@ def handle_validate_coordination(args: argparse.Namespace) -> int:
     manifest = _read_json(args.manifest)
     inventory = _read_json(args.inventory)
     contract = _read_json(args.contract)
-    tree_hash = args.checkout_tree_hash or _checkout_tree_hash(repo_root)
+    actual_tree_hash = _checkout_tree_hash(repo_root)
+    if (
+        args.checkout_tree_hash is not None
+        and args.checkout_tree_hash != actual_tree_hash
+    ):
+        raise ValidationError(
+            "provided checkout tree hash does not match the actual HEAD tree"
+        )
+    tree_hash = actual_tree_hash
+    require_clean_base(repo_root, tree_hash)
     receipt = validate_coordination(
         repo_root,
         manifest,
@@ -334,8 +347,15 @@ def handle_validate_handoff(args: argparse.Namespace) -> int:
     authoritative_payload["cli_version"] = CLI_VERSION
     if canonical_bytes(authoritative_payload) != canonical_bytes(submitted_payload):
         raise ValidationError("receipt does not match authoritative validation")
+    authoritative_changed_paths = list(
+        collect_changed_paths(repo_root, receipt.checkout_tree_hash)
+    )
+    declared_changed_paths = sorted(set(args.changed_path))
+    validated_paths = sorted(
+        set(authoritative_changed_paths).union(declared_changed_paths)
+    )
     validate_handoff(
-        repo_root, authoritative, args.workstream_id, args.changed_path
+        repo_root, authoritative, args.workstream_id, validated_paths
     )
     _emit(
         {
@@ -344,7 +364,10 @@ def handle_validate_handoff(args: argparse.Namespace) -> int:
             "status": "valid",
             "run_id": receipt.run_id,
             "workstream_id": args.workstream_id,
-            "changed_paths": args.changed_path,
+            "changed_paths": authoritative_changed_paths,
+            "declared_changed_paths": declared_changed_paths,
+            "validated_paths": validated_paths,
+            "changed_path_source": "git_status_plus_declarations",
         }
     )
     return 0
