@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 import math
+import threading
 import time
 from typing import Callable, Optional, Union
 
@@ -20,6 +21,10 @@ class BudgetExceeded(RuntimeError):
     def __init__(self, decision: BudgetDecision):
         super().__init__(decision.value)
         self.decision = decision
+
+
+class BudgetClockError(RuntimeError):
+    """Raised after an invalid or regressing budget clock sample."""
 
 
 @dataclass(frozen=True)
@@ -91,7 +96,10 @@ class Budget:
 
         self._policy = resolved
         self._clock = clock
-        self._started_at = clock()
+        self._lock = threading.RLock()
+        self._clock_poisoned = False
+        self._last_clock = None  # type: Optional[float]
+        self._started_at = self._clock_value_locked()
         self._calls_used = 0
         self._active = 0
 
@@ -113,13 +121,39 @@ class Budget:
 
     @property
     def calls_used(self) -> int:
-        return self._calls_used
+        with self._lock:
+            return self._calls_used
 
-    def _elapsed(self) -> float:
-        return max(0.0, self._clock() - self._started_at)
+    def _clock_value_locked(self) -> float:
+        if self._clock_poisoned:
+            raise BudgetClockError("budget clock is invalid") from None
+        try:
+            sample = self._clock()
+        except Exception:
+            self._clock_poisoned = True
+            raise BudgetClockError("budget clock is invalid") from None
+        if isinstance(sample, bool) or not isinstance(sample, (int, float)):
+            self._clock_poisoned = True
+            raise BudgetClockError("budget clock is invalid") from None
+        try:
+            resolved = float(sample)
+        except (OverflowError, TypeError, ValueError):
+            self._clock_poisoned = True
+            raise BudgetClockError("budget clock is invalid") from None
+        if (
+            not math.isfinite(resolved)
+            or (self._last_clock is not None and resolved < self._last_clock)
+        ):
+            self._clock_poisoned = True
+            raise BudgetClockError("budget clock is invalid") from None
+        self._last_clock = resolved
+        return resolved
 
-    def next_decision(self) -> BudgetDecision:
-        if self._elapsed() >= self._policy.max_seconds:
+    def _elapsed_locked(self) -> float:
+        return self._clock_value_locked() - self._started_at
+
+    def _decision_locked(self, elapsed: float) -> BudgetDecision:
+        if elapsed >= self._policy.max_seconds:
             return BudgetDecision.BLOCKED_TIMEOUT
         if self._calls_used >= self._policy.max_calls:
             return BudgetDecision.BLOCKED_BUDGET
@@ -127,40 +161,79 @@ class Budget:
             return BudgetDecision.BLOCKED_CONCURRENCY
         return BudgetDecision.ALLOWED
 
+    def next_decision(self) -> BudgetDecision:
+        with self._lock:
+            return self._decision_locked(self._elapsed_locked())
+
     def consume_call(self) -> None:
-        decision = self.next_decision()
-        if decision is not BudgetDecision.ALLOWED:
-            raise BudgetExceeded(decision)
-        self._calls_used += 1
+        with self._lock:
+            decision = self._decision_locked(self._elapsed_locked())
+            if decision is not BudgetDecision.ALLOWED:
+                raise BudgetExceeded(decision)
+            self._calls_used += 1
 
     def acquire(self) -> None:
-        decision = self.next_decision()
-        if decision is not BudgetDecision.ALLOWED:
-            raise BudgetExceeded(decision)
-        self._active += 1
+        with self._lock:
+            decision = self._decision_locked(self._elapsed_locked())
+            if decision is not BudgetDecision.ALLOWED:
+                raise BudgetExceeded(decision)
+            self._active += 1
+
+    def acquire_call(self) -> "_BudgetLease":
+        """Atomically reserve one call and one active slot."""
+        with self._lock:
+            decision = self._decision_locked(self._elapsed_locked())
+            if decision is not BudgetDecision.ALLOWED:
+                raise BudgetExceeded(decision)
+            self._calls_used += 1
+            self._active += 1
+            return _BudgetLease(self)
 
     def release(self) -> None:
-        if self._active == 0:
-            raise RuntimeError("no active slot to release")
-        self._active -= 1
+        with self._lock:
+            if self._active == 0:
+                raise RuntimeError("no active slot to release")
+            self._active -= 1
+
+    def _release_lease(self, lease: "_BudgetLease", allow_released: bool) -> None:
+        with self._lock:
+            if lease._released:
+                if allow_released:
+                    return
+                raise RuntimeError("budget lease already released")
+            if self._active == 0:
+                raise RuntimeError("no active slot to release")
+            self._active -= 1
+            lease._released = True
 
     def snapshot(self) -> BudgetSnapshot:
-        elapsed = self._elapsed()
-        if elapsed >= self._policy.max_seconds:
-            decision = BudgetDecision.BLOCKED_TIMEOUT
-        elif self._calls_used >= self._policy.max_calls:
-            decision = BudgetDecision.BLOCKED_BUDGET
-        elif self._active >= self._policy.concurrency:
-            decision = BudgetDecision.BLOCKED_CONCURRENCY
-        else:
-            decision = BudgetDecision.ALLOWED
-        return BudgetSnapshot(
-            max_calls=self._policy.max_calls,
-            max_seconds=self._policy.max_seconds,
-            concurrency=self._policy.concurrency,
-            max_raw_bytes=self._policy.max_raw_bytes,
-            calls_used=self._calls_used,
-            active=self._active,
-            elapsed_seconds=elapsed,
-            decision=decision,
-        )
+        with self._lock:
+            elapsed = self._elapsed_locked()
+            decision = self._decision_locked(elapsed)
+            return BudgetSnapshot(
+                max_calls=self._policy.max_calls,
+                max_seconds=self._policy.max_seconds,
+                concurrency=self._policy.concurrency,
+                max_raw_bytes=self._policy.max_raw_bytes,
+                calls_used=self._calls_used,
+                active=self._active,
+                elapsed_seconds=elapsed,
+                decision=decision,
+            )
+
+
+class _BudgetLease:
+    """Single-use release handle returned by ``Budget.acquire_call``."""
+
+    def __init__(self, budget: Budget) -> None:
+        self._budget = budget
+        self._released = False
+
+    def release(self) -> None:
+        self._budget._release_lease(self, allow_released=False)
+
+    def __enter__(self) -> "_BudgetLease":
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self._budget._release_lease(self, allow_released=True)

@@ -1,16 +1,29 @@
 import os
 from pathlib import Path
+import shutil
 import stat
 import tempfile
+import traceback
 import unittest
 from unittest import mock
 
+import scripts.live_eval.artifacts as artifacts_module
 from scripts.live_eval.artifacts import RedactingWriter, RedactionError
 
 
 class FailingRedactor:
     def redact(self, text):
         raise RuntimeError("redaction failed")
+
+
+class InvalidJSONRedactor:
+    def redact(self, text):
+        return '{"value":NaN}'
+
+
+class LeakingFailureRedactor:
+    def redact(self, text):
+        raise RuntimeError("SECRET_NAME secret-value /home/private-user")
 
 
 class ArtifactTests(unittest.TestCase):
@@ -46,6 +59,93 @@ class ArtifactTests(unittest.TestCase):
         self.assertNotIn("/home/example", content)
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_structurally_redacts_decoded_keys_values_lists_and_escapes(self):
+        writer = RedactingWriter(
+            self.directory,
+            {
+                "SECRET_NAME": "secret-value",
+                "SLASH": "a/b",
+                "UNICODE": "café",
+                "QUOTE": 'say"hi',
+                "BACKSLASH": "a\\b",
+                "SHORT": "secret",
+                "LONG": "secret-value",
+            },
+            artifact_name="structured.jsonl",
+        )
+        raw = (
+            b'{"SECRET_NAME":{"items":["secret-value","a\\/b",'
+            b'"caf\\u00e9","say\\\"hi","a\\\\b",'
+            b'"/home/private-user"],"plain":"keep"}}\n'
+        )
+        for index in range(0, len(raw), 3):
+            writer.write(raw[index : index + 3])
+
+        content = writer.finalize().read_text(encoding="utf-8")
+
+        self.assertEqual(content.count("\n"), 1)
+        self.assertNotIn(": ", content)
+        for literal in (
+            "SECRET_NAME",
+            "secret-value",
+            "a/b",
+            "café",
+            'say"hi',
+            "a\\b",
+            "/home/private-user",
+            "[REDACTED]-value",
+        ):
+            self.assertNotIn(literal, content)
+        self.assertIn('"plain":"keep"', content)
+
+    def test_rejects_invalid_jsonl_and_custom_redactor_output(self):
+        invalid = RedactingWriter(self.directory, {}, artifact_name="invalid")
+        invalid.write(b'{"value":}\n')
+        with self.assertRaises(RedactionError):
+            invalid.finalize()
+
+        custom = RedactingWriter(
+            self.directory,
+            {},
+            artifact_name="custom",
+            redactor=InvalidJSONRedactor(),
+        )
+        custom.write(b'{"value":"ok"}\n')
+        with self.assertRaises(RedactionError):
+            custom.finalize()
+
+        self.assertFalse(invalid.path.exists())
+        self.assertFalse(custom.path.exists())
+
+    def test_redaction_errors_hide_raw_values_from_traceback(self):
+        cases = (
+            ("decode", None, b'{"SECRET_NAME":"secret-value /home/private-user"}\xff'),
+            ("parse", None, b'{"SECRET_NAME":"secret-value /home/private-user",}\n'),
+            (
+                "custom",
+                LeakingFailureRedactor(),
+                b'{"SECRET_NAME":"secret-value /home/private-user"}\n',
+            ),
+        )
+        for name, redactor, raw in cases:
+            with self.subTest(name=name):
+                writer = RedactingWriter(
+                    self.directory,
+                    {"SECRET_NAME": "secret-value"},
+                    artifact_name=name,
+                    redactor=redactor,
+                )
+                try:
+                    writer.write(raw)
+                    writer.finalize()
+                except RedactionError:
+                    rendered = traceback.format_exc()
+                else:
+                    self.fail("expected redaction failure")
+                self.assertNotIn("SECRET_NAME", rendered)
+                self.assertNotIn("secret-value", rendered)
+                self.assertNotIn("/home/private-user", rendered)
+
     def test_raw_byte_limit_fails_closed_and_clears_buffer(self):
         writer = RedactingWriter(self.directory, {}, max_raw_bytes=3)
         writer.write(b"abc")
@@ -59,7 +159,7 @@ class ArtifactTests(unittest.TestCase):
 
     def test_redaction_failure_retains_nothing(self):
         writer = RedactingWriter(self.directory, {}, redactor=FailingRedactor())
-        writer.write(b"raw")
+        writer.write(b'{"value":"raw"}\n')
 
         with self.assertRaises(RedactionError):
             writer.finalize()
@@ -81,7 +181,7 @@ class ArtifactTests(unittest.TestCase):
         existing = self.directory / "result.jsonl"
         existing.write_bytes(b"owned")
         writer = RedactingWriter(self.directory, {}, artifact_name=existing.name)
-        writer.write(b"new")
+        writer.write(b'{"value":"new"}\n')
 
         with self.assertRaises(RedactionError):
             writer.finalize()
@@ -93,13 +193,151 @@ class ArtifactTests(unittest.TestCase):
             with self.subTest(failure=failure):
                 name = failure + ".jsonl"
                 writer = RedactingWriter(self.directory, {}, artifact_name=name)
-                writer.write(b"retained")
+                writer.write(b'{"value":"retained"}\n')
                 target = "scripts.live_eval.artifacts.os." + failure
                 with mock.patch(target, side_effect=OSError(failure)):
                     with self.assertRaises(RedactionError):
                         writer.finalize()
                 self.assertFalse((self.directory / name).exists())
                 self.assertIsNone(writer.retained_path)
+
+    def test_fstat_and_link_failures_leave_no_owned_artifact(self):
+        for failure in ("fstat", "link"):
+            with self.subTest(failure=failure):
+                name = failure + ".jsonl"
+                writer = RedactingWriter(self.directory, {}, artifact_name=name)
+                writer.write(b'{"value":"retained"}\n')
+                target = "scripts.live_eval.artifacts.os." + failure
+                with mock.patch(target, side_effect=OSError(failure)):
+                    with self.assertRaises(RedactionError):
+                        writer.finalize()
+                self.assertFalse((self.directory / name).exists())
+                self.assertEqual(writer.buffered_bytes, 0)
+
+    def test_competing_final_file_created_during_link_is_preserved(self):
+        writer = RedactingWriter(self.directory, {}, artifact_name="race.jsonl")
+        writer.write(b'{"value":"owned"}\n')
+
+        def competing_link(source, target, **kwargs):
+            fd = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=kwargs["dst_dir_fd"],
+            )
+            os.write(fd, b"competitor")
+            os.close(fd)
+            raise FileExistsError("competitor won")
+
+        with mock.patch("scripts.live_eval.artifacts.os.link", side_effect=competing_link):
+            with self.assertRaises(RedactionError):
+                writer.finalize()
+
+        self.assertEqual((self.directory / "race.jsonl").read_bytes(), b"competitor")
+
+    def test_recreated_staging_file_is_preserved_on_cleanup(self):
+        writer = RedactingWriter(self.directory, {}, artifact_name="result.jsonl")
+        writer.write(b'{"value":"owned"}\n')
+        original_write = artifacts_module.os.write
+        replacements = []
+
+        def swap_staging_then_fail(fd, data):
+            names = [name for name in os.listdir(self.directory) if name.startswith(".live-eval-stage-")]
+            if names:
+                name = names[0]
+                moved = name + ".owned"
+                os.rename(name, moved, src_dir_fd=writer._directory_fd, dst_dir_fd=writer._directory_fd)
+                replacement = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=writer._directory_fd,
+                )
+                original_write(replacement, b"competitor")
+                os.close(replacement)
+                replacements.append(name)
+                raise OSError("simulated write failure")
+            return original_write(fd, data)
+
+        with mock.patch("scripts.live_eval.artifacts.os.write", side_effect=swap_staging_then_fail):
+            with self.assertRaises(RedactionError):
+                writer.finalize()
+
+        self.assertEqual(len(replacements), 1)
+        self.assertEqual((self.directory / replacements[0]).read_bytes(), b"competitor")
+
+    def test_parent_directory_swap_is_detected_before_publish(self):
+        original = self.directory
+        moved = original.parent / (original.name + "-moved")
+        writer = RedactingWriter(original, {}, artifact_name="result.jsonl")
+        writer.write(b'{"value":"owned"}\n')
+        original.rename(moved)
+        original.mkdir(mode=0o700)
+        try:
+            with self.assertRaises(RedactionError):
+                writer.finalize()
+
+            self.assertFalse((original / "result.jsonl").exists())
+            self.assertFalse((moved / "result.jsonl").exists())
+        finally:
+            shutil.rmtree(str(original))
+            moved.rename(original)
+
+    def test_parent_directory_swap_during_finalize_is_detected(self):
+        original = self.directory
+        moved = original.parent / (original.name + "-moved-during-finalize")
+        writer = RedactingWriter(original, {}, artifact_name="result.jsonl")
+        writer.write(b'{"value":"owned"}\n')
+        original_write = artifacts_module.os.write
+        swapped = []
+
+        def write_then_swap(fd, data):
+            written = original_write(fd, data)
+            if not swapped:
+                original.rename(moved)
+                original.mkdir(mode=0o700)
+                swapped.append(True)
+            return written
+
+        try:
+            with mock.patch("scripts.live_eval.artifacts.os.write", side_effect=write_then_swap):
+                with self.assertRaises(RedactionError):
+                    writer.finalize()
+            self.assertFalse((original / "result.jsonl").exists())
+            self.assertFalse((moved / "result.jsonl").exists())
+        finally:
+            shutil.rmtree(str(original))
+            moved.rename(original)
+
+    def test_fchmod_failure_cleans_only_owned_staging_file(self):
+        writer = RedactingWriter(self.directory, {}, artifact_name="result.jsonl")
+        writer.write(b'{"value":"owned"}\n')
+
+        with mock.patch("scripts.live_eval.artifacts.os.fchmod", side_effect=OSError("fchmod")):
+            with self.assertRaises(RedactionError):
+                writer.finalize()
+
+        self.assertFalse(writer.path.exists())
+        self.assertEqual(list(self.directory.glob(".live-eval-stage-*")), [])
+
+    def test_owned_staging_unlink_failure_fails_closed(self):
+        writer = RedactingWriter(self.directory, {}, artifact_name="result.jsonl")
+        writer.write(b'{"value":"owned"}\n')
+        original_unlink = artifacts_module.os.unlink
+        failed = []
+
+        def fail_first_owned_unlink(path, **kwargs):
+            if not failed and path.startswith(".live-eval-stage-"):
+                failed.append(True)
+                raise OSError("simulated unlink failure")
+            return original_unlink(path, **kwargs)
+
+        with mock.patch("scripts.live_eval.artifacts.os.unlink", side_effect=fail_first_owned_unlink):
+            with self.assertRaises(RedactionError):
+                writer.finalize()
+
+        self.assertFalse(writer.path.exists())
+        self.assertEqual(list(self.directory.glob(".live-eval-stage-*")), [])
 
     def test_untrusted_directory_is_rejected(self):
         self.directory.chmod(0o755)
@@ -118,7 +356,7 @@ class ArtifactTests(unittest.TestCase):
 
     def test_writes_after_finalize_or_failure_are_rejected(self):
         complete = RedactingWriter(self.directory, {}, artifact_name="complete")
-        complete.write(b"ok")
+        complete.write(b'{"value":"ok"}\n')
         complete.finalize()
         failed = RedactingWriter(self.directory, {}, artifact_name="failed", max_raw_bytes=1)
         with self.assertRaises(RedactionError):
@@ -127,6 +365,33 @@ class ArtifactTests(unittest.TestCase):
         for writer in (complete, failed):
             with self.assertRaises(RedactionError):
                 writer.write(b"later")
+
+    def test_close_abort_and_context_manager_zero_and_close_resources(self):
+        closed = RedactingWriter(self.directory, {}, artifact_name="closed")
+        self.assertTrue(hasattr(closed, "_directory_fd"))
+        directory_fd = closed._directory_fd
+        closed.write(b'{"secret":"raw"}\n')
+        closed.close()
+        closed.close()
+        self.assertEqual(closed.buffered_bytes, 0)
+        with self.assertRaises(OSError):
+            os.fstat(directory_fd)
+        with self.assertRaises(RedactionError):
+            closed.write(b"later")
+        with self.assertRaises(RedactionError):
+            closed.finalize()
+
+        aborted = RedactingWriter(self.directory, {}, artifact_name="aborted")
+        aborted.write(b'{"secret":"raw"}\n')
+        aborted.abort()
+        self.assertEqual(aborted.buffered_bytes, 0)
+        self.assertFalse(aborted.path.exists())
+
+        with RedactingWriter(self.directory, {}, artifact_name="context") as contextual:
+            contextual.write(b'{"secret":"raw"}\n')
+        self.assertEqual(contextual.buffered_bytes, 0)
+        with self.assertRaises(RedactionError):
+            contextual.finalize()
 
 
 if __name__ == "__main__":
