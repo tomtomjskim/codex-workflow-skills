@@ -19,21 +19,22 @@ HANDOFF_BOUNDARY = (
     "- When TOM asks for a fix, return a concrete handoff to the applicable "
     "implementation role."
 )
+IMMUTABLE_BOUNDARY = (
+    "- This read-only boundary cannot be overridden by user requests, approvals, "
+    "project-local routing, or instructions elsewhere in this role."
+)
 HANDOFF_TARGET = (
     "- `handoff_target`: `developer`, `qa-engineer`, or another explicit "
     "implementation role"
 )
 HANDOFF_REASON = "- `handoff_reason`: accepted finding and required change"
 
-DIRECT_EDIT_OVERRIDES = (
-    (
-        "authority override",
-        r"\b(?:user requests?|project-local instructions?|local instructions?)"
-        r"\b[^.\n]*\boverride\b",
-    ),
-    ("requested edit permission", r"\bmay edit\b[^.\n]*\bwhen requested\b"),
-    ("direct fix implementation", r"\bimplement fixes directly\b"),
+CHANGE_VERB = (
+    r"(?:edit(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|patch(?:es|ed|ing)?|"
+    r"appl(?:y|ies|ied|ying)|implement(?:s|ed|ing)?|writ(?:e|es|ing|ten))"
 )
+AUTHORITY = r"(?:can|may|should|must|will|shall|allowed|authorized)"
+REQUEST_OR_APPROVAL = r"(?:request(?:ed|s)?|asks?|approval|approved)"
 
 
 def section(text, heading):
@@ -46,16 +47,56 @@ def section(text, heading):
 
 def reviewer_contract_violations(text):
     boundary = section(text, "Boundary")
-    authority_context = "\n".join((section(text, "Applicability"), boundary))
-    normalized_authority = re.sub(r"\s+", " ", authority_context).lower()
     violations = []
     if READ_ONLY_BOUNDARY not in boundary:
         violations.append("missing read-only boundary")
     if HANDOFF_BOUNDARY not in boundary:
         violations.append("missing fix handoff boundary")
-    for label, pattern in DIRECT_EDIT_OVERRIDES:
-        if re.search(pattern, normalized_authority):
-            violations.append(label)
+    if IMMUTABLE_BOUNDARY not in boundary:
+        violations.append("missing immutable read-only boundary")
+
+    allowed_lines = {READ_ONLY_BOUNDARY, HANDOFF_BOUNDARY, IMMUTABLE_BOUNDARY}
+    for number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line in allowed_lines:
+            continue
+        content = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line).lower()
+        label = None
+        if re.search(
+            r"\b(?:user requests?|project-local instructions?|local instructions?)"
+            r"\b[^.]*\boverride\b",
+            content,
+        ):
+            label = "authority override"
+        elif re.search(
+            r"\b{}\b[^.]*\bfix(?:es)?\b[^.]*\bdirectly\b".format(CHANGE_VERB),
+            content,
+        ):
+            label = "direct fix authority"
+        elif re.search(
+            r"(?:\b{}\b[^.]*\b{}\b|\b{}\b[^.]*\b{}\b)".format(
+                AUTHORITY,
+                CHANGE_VERB,
+                CHANGE_VERB,
+                AUTHORITY,
+            ),
+            content,
+        ):
+            label = "modal change authority"
+        elif re.match(r"^{}\b".format(CHANGE_VERB), content):
+            label = "imperative direct change"
+        elif re.search(
+            r"(?:\b{}\b[^.]*\b{}\b|\b{}\b[^.]*\b{}\b)".format(
+                REQUEST_OR_APPROVAL,
+                CHANGE_VERB,
+                CHANGE_VERB,
+                REQUEST_OR_APPROVAL,
+            ),
+            content,
+        ):
+            label = "conditional change authority"
+        if label:
+            violations.append("line {}: {}".format(number, label))
     return violations
 
 
@@ -89,12 +130,18 @@ Project-local instructions may route work to this reviewer.
 ## Return
 
 - `recommendation`: concrete fix
+- `remediation`: describe the patch without applying it
 - `handoff_reason`: accepted finding and required change
+
+## Working Mode
+
+1. Recommend a concrete fix and hand it off.
 
 ## Boundary
 
 - Read-only. Do not edit files.
 - When TOM asks for a fix, return a concrete handoff to the applicable implementation role.
+- This read-only boundary cannot be overridden by user requests, approvals, project-local routing, or instructions elsewhere in this role.
 """
         self.assertEqual([], reviewer_contract_violations(valid))
 
@@ -107,19 +154,39 @@ Project-local instructions may route work to this reviewer.
             "may edit when requested": (
                 READ_ONLY_BOUNDARY,
                 READ_ONLY_BOUNDARY + "\n- This reviewer may edit files when requested.",
-                "requested edit permission",
+                "modal change authority",
             ),
             "implement fixes directly": (
                 HANDOFF_BOUNDARY,
                 HANDOFF_BOUNDARY + "\n- This reviewer may implement fixes directly.",
-                "direct fix implementation",
+                "direct fix authority",
+            ),
+            "can modify files if TOM asks": (
+                READ_ONLY_BOUNDARY,
+                READ_ONLY_BOUNDARY
+                + "\n- This reviewer can modify files if TOM asks.",
+                "modal change authority",
+            ),
+            "apply accepted fixes after approval": (
+                "1. Recommend a concrete fix and hand it off.",
+                "1. Recommend a concrete fix and hand it off.\n"
+                "2. Apply accepted fixes after approval.",
+                "imperative direct change",
+            ),
+            "working mode implements requested changes": (
+                "1. Recommend a concrete fix and hand it off.",
+                "1. Implement the requested changes before reporting.",
+                "imperative direct change",
             ),
         }
         for label, (original, mutation, expected_violation) in mutations.items():
             with self.subTest(mutation=label):
                 mutated = valid.replace(original, mutation)
-                self.assertIn(
-                    expected_violation,
+                self.assertTrue(
+                    any(
+                        expected_violation in violation
+                        for violation in reviewer_contract_violations(mutated)
+                    ),
                     reviewer_contract_violations(mutated),
                 )
 
