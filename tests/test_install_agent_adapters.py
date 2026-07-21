@@ -39,6 +39,14 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.entries[0].action, "create")
         self.assertFalse((self.target / "architect.md").exists())
 
+    def test_approved_roots_must_be_absolute(self):
+        self.write_source()
+
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            plan_links(Path("source"), self.target, suffix=".md")
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            plan_links(self.source, Path("target"), suffix=".md")
+
     def test_correct_absolute_link_is_idempotent(self):
         source = self.write_source()
         (self.target / "architect.md").symlink_to(source)
@@ -88,6 +96,15 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.entries[0].action, "conflict")
         self.assertTrue(conflict.is_symlink())
 
+    def test_target_entry_symlink_loop_is_classified_as_error(self):
+        self.write_source()
+        conflict = self.target / "architect.md"
+        conflict.symlink_to(conflict)
+
+        result = plan_links(self.source, self.target, suffix=".md")
+
+        self.assertEqual(result.entries[0].action, "error")
+
     def test_source_symlink_escaping_approved_root_is_an_error(self):
         outside = self.root / "outside.md"
         outside.write_text("outside", encoding="utf-8")
@@ -98,6 +115,16 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.entries[0].action, "error")
         with self.assertRaises(InstallError):
             apply_links(result)
+
+    def test_internal_source_symlink_is_rejected_without_reading_content(self):
+        actual = self.write_source("actual.txt", "must-not-be-read")
+        (self.source / "architect.md").symlink_to(actual)
+
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("read")):
+            result = plan_links(self.source, self.target, suffix=".md")
+
+        self.assertEqual(result.entries[0].action, "error")
+        self.assertIn("symlink", result.entries[0].reason)
 
     def test_target_symlink_escaping_approved_root_is_an_error(self):
         self.write_source()
@@ -131,9 +158,11 @@ class InstallerTests(unittest.TestCase):
         plan = plan_links(self.source, self.target, suffix=".md")
         source_b.unlink()
 
-        with self.assertRaises(InstallError):
+        with self.assertRaises(InstallError) as raised:
             apply_links(plan)
 
+        self.assertEqual(raised.exception.result.plan_hash, plan.plan_hash)
+        self.assertEqual(raised.exception.result.status, "blocked")
         self.assertEqual(list(self.target.iterdir()), [])
 
     def test_target_change_after_plan_prevents_all_writes(self):
@@ -155,10 +184,19 @@ class InstallerTests(unittest.TestCase):
         plan = plan_links(self.source, self.target, suffix=".md")
         real_symlink = os.symlink
 
+        opened_directory_fds = []
+
         def race(source, target, *args, **kwargs):
-            target_path = Path(target)
-            if target_path.name == "b.md":
-                target_path.write_text("competitor", encoding="utf-8")
+            directory_fd = kwargs.get("dir_fd")
+            self.assertIsNotNone(directory_fd)
+            opened_directory_fds.append(directory_fd)
+            if target == "b.md":
+                competitor_fd = os.open(
+                    target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                    dir_fd=directory_fd,
+                )
+                os.write(competitor_fd, b"competitor")
+                os.close(competitor_fd)
                 raise FileExistsError(target)
             return real_symlink(source, target, *args, **kwargs)
 
@@ -166,9 +204,40 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaises(InstallConflict) as raised:
                 apply_links(plan)
 
-        self.assertEqual(raised.exception.result.created, ("a.md",))
-        self.assertEqual(raised.exception.result.failed, "b.md")
+        self.assertEqual([entry.name for entry in raised.exception.result.created], ["a.md"])
+        self.assertEqual([entry.name for entry in raised.exception.result.failed], ["b.md"])
         self.assertEqual((self.target / "b.md").read_text(encoding="utf-8"), "competitor")
+        for descriptor in opened_directory_fds:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_target_root_swap_never_writes_through_replacement_symlink(self):
+        self.write_source("a.md")
+        self.write_source("b.md")
+        plan = plan_links(self.source, self.target, suffix=".md")
+        moved = self.root / "moved-target"
+        outside = self.root / "outside"
+        outside.mkdir()
+        marker = outside / "marker"
+        marker.write_text("owned", encoding="utf-8")
+        real_symlink = os.symlink
+        calls = []
+
+        def swap_then_link(source, target, *args, **kwargs):
+            calls.append(target)
+            if len(calls) == 1:
+                self.target.rename(moved)
+                self.target.symlink_to(outside, target_is_directory=True)
+            return real_symlink(source, target, *args, **kwargs)
+
+        with mock.patch("scripts.install_agent_adapters.os.symlink", side_effect=swap_then_link):
+            with self.assertRaises(InstallError) as raised:
+                apply_links(plan)
+
+        self.assertEqual([entry.name for entry in raised.exception.result.created], ["a.md"])
+        self.assertFalse((outside / "a.md").exists())
+        self.assertFalse((outside / "b.md").exists())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "owned")
 
     def test_missing_target_directory_is_created_only_during_apply(self):
         self.write_source()
@@ -178,7 +247,8 @@ class InstallerTests(unittest.TestCase):
 
         self.assertFalse(self.target.exists())
         result = apply_links(plan)
-        self.assertEqual(result.created, ("architect.md",))
+        self.assertEqual([entry.name for entry in result.created], ["architect.md"])
+        self.assertTrue(result.target_directory_created)
         self.assertTrue((self.target / "architect.md").is_symlink())
 
     def test_manifest_is_canonical_and_hash_matches_recomputed_plan(self):
@@ -191,6 +261,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(encoded, json.dumps(plan.to_manifest(), ensure_ascii=False,
                                              sort_keys=True, separators=(",", ":")).encode("utf-8"))
         self.assertEqual(plan.plan_hash, plan_links(self.source, self.target, ".md").plan_hash)
+        self.assertTrue(plan.to_manifest()["contains_local_paths"])
+        self.assertTrue(plan.to_manifest()["sensitive"])
 
     def test_cli_dry_run_json_does_not_mutate(self):
         self.write_source()
@@ -207,7 +279,117 @@ class InstallerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(json.loads(output.getvalue())["entries"][0]["action"], "create")
+        self.assertTrue(json.loads(output.getvalue())["contains_local_paths"])
         self.assertFalse((self.target / "architect.md").exists())
+
+    def test_cli_json_emits_final_partial_result_not_plan(self):
+        self.write_source("a.md")
+        self.write_source("b.md")
+        real_symlink = os.symlink
+
+        def race(source, target, *args, **kwargs):
+            directory_fd = kwargs["dir_fd"]
+            if target == "b.md":
+                competitor_fd = os.open(
+                    target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                    dir_fd=directory_fd,
+                )
+                os.close(competitor_fd)
+                raise FileExistsError(target)
+            return real_symlink(source, target, *args, **kwargs)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch("scripts.install_agent_adapters.os.symlink", side_effect=race):
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                exit_code = main([
+                    "--source-root", str(self.source),
+                    "--target-root", str(self.target),
+                    "--suffix", ".md",
+                    "--json",
+                ])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(payload["status"], "partial")
+        self.assertEqual([entry["name"] for entry in payload["created"]], ["a.md"])
+        self.assertEqual([entry["name"] for entry in payload["failed"]], ["b.md"])
+        self.assertEqual(payload["kept"], [])
+        self.assertFalse(payload["target_directory_created"])
+        self.assertEqual(len(payload["plan_hash"]), 64)
+
+    def test_broken_target_root_symlink_is_controlled_json_error(self):
+        self.write_source()
+        self.target.rmdir()
+        self.target.symlink_to(self.root / "missing", target_is_directory=True)
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            exit_code = main([
+                "--source-root", str(self.source),
+                "--target-root", str(self.target),
+                "--suffix", ".md",
+                "--json",
+            ])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertTrue(payload["failed"])
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_target_root_symlink_loop_is_controlled_json_error(self):
+        self.write_source()
+        self.target.rmdir()
+        self.target.symlink_to(self.target, target_is_directory=True)
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exit_code = main([
+                "--source-root", str(self.source),
+                "--target-root", str(self.target),
+                "--suffix", ".md",
+                "--json",
+            ])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(json.loads(output.getvalue())["status"], "blocked")
+
+    def test_target_root_lstat_open_race_is_controlled_and_preserves_external(self):
+        self.write_source()
+        canonical_target = self.target.resolve(strict=True)
+        moved = self.root / "moved-target"
+        outside = self.root / "outside"
+        outside.mkdir()
+        marker = outside / "marker"
+        marker.write_text("owned", encoding="utf-8")
+        real_open = os.open
+        real_symlink = os.symlink
+        raced = []
+
+        def race(path, flags, *args, **kwargs):
+            if not raced and Path(path) == canonical_target and "dir_fd" not in kwargs:
+                raced.append(True)
+                self.target.rename(moved)
+                real_symlink(str(outside), str(self.target), target_is_directory=True)
+            return real_open(path, flags, *args, **kwargs)
+
+        output = io.StringIO()
+        with mock.patch("scripts.install_agent_adapters.os.open", side_effect=race):
+            with contextlib.redirect_stdout(output):
+                exit_code = main([
+                    "--source-root", str(self.source),
+                    "--target-root", str(self.target),
+                    "--suffix", ".md",
+                    "--json",
+                ])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(json.loads(output.getvalue())["status"], "blocked")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "owned")
+        self.assertFalse((outside / "architect.md").exists())
 
     def test_rejects_invalid_suffix_without_exposing_source_contents(self):
         secret = "token-value-that-must-not-leak"

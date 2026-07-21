@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Install direct agent-adapter symlinks without replacing existing paths."""
+"""Install direct agent-adapter symlinks without replacing existing paths.
+
+JSON manifests contain exact approved local paths and must be treated as sensitive.
+"""
 
 import argparse
 import hashlib
@@ -11,6 +14,9 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+
+_PathToken = Tuple[int, int]
 
 
 def _nfc(value: str) -> str:
@@ -38,6 +44,16 @@ def _fingerprint(path: Path) -> Tuple[int, int, int, int, int]:
         metadata.st_size,
         metadata.st_mtime_ns,
     )
+
+
+def _token(metadata: os.stat_result) -> _PathToken:
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _directory_flags() -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("required no-follow directory operations are unavailable")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
 @dataclass(frozen=True)
@@ -68,6 +84,16 @@ class _LinkSpec:
 
 
 @dataclass(frozen=True)
+class _TargetApproval:
+    root: Path
+    parent: Path
+    basename: str
+    parent_token: _PathToken
+    root_token: Optional[_PathToken]
+    present: bool
+
+
+@dataclass(frozen=True)
 class LinkPlan:
     source_root: Path
     target_root: Path
@@ -75,6 +101,10 @@ class LinkPlan:
     entries: Tuple[LinkEntry, ...]
     plan_hash: str
     target_root_present: bool
+    target_parent: Path
+    target_basename: str
+    target_parent_token: _PathToken
+    target_root_token: Optional[_PathToken]
     _specs: Tuple[_LinkSpec, ...] = field(repr=False, compare=False)
 
     def _manifest_without_hash(self) -> Dict[str, object]:
@@ -94,11 +124,19 @@ class LinkPlan:
                 ),
             })
         return {
+            "contains_local_paths": True,
             "entries": [entry.to_manifest() for entry in self.entries],
             "observations": observations,
+            "sensitive": True,
             "source_root": _nfc(str(self.source_root)),
             "suffix": _nfc(self.suffix),
+            "target_parent_lstat": list(self.target_parent_token),
             "target_root": _nfc(str(self.target_root)),
+            "target_root_lstat": (
+                list(self.target_root_token)
+                if self.target_root_token is not None
+                else None
+            ),
             "target_root_present": self.target_root_present,
         }
 
@@ -112,16 +150,50 @@ class LinkPlan:
 
 
 @dataclass(frozen=True)
+class ResultEntry:
+    name: str
+    source: str
+    target: str
+    reason: str
+
+    def to_manifest(self) -> Dict[str, str]:
+        return {
+            "name": self.name,
+            "reason": self.reason,
+            "source": self.source,
+            "target": self.target,
+        }
+
+
+@dataclass(frozen=True)
 class InstallResult:
-    created: Tuple[str, ...] = ()
-    kept: Tuple[str, ...] = ()
-    failed: Optional[str] = None
+    plan_hash: str
+    status: str
+    target_directory_created: bool
+    created: Tuple[ResultEntry, ...] = ()
+    kept: Tuple[ResultEntry, ...] = ()
+    failed: Tuple[ResultEntry, ...] = ()
+
+    def to_manifest(self) -> Dict[str, object]:
+        return {
+            "contains_local_paths": True,
+            "created": [entry.to_manifest() for entry in self.created],
+            "failed": [entry.to_manifest() for entry in self.failed],
+            "kept": [entry.to_manifest() for entry in self.kept],
+            "plan_hash": self.plan_hash,
+            "sensitive": True,
+            "status": self.status,
+            "target_directory_created": self.target_directory_created,
+        }
+
+    def to_json(self) -> str:
+        return _canonical_json(self.to_manifest())
 
 
 class InstallError(Exception):
     def __init__(self, message: str, result: Optional[InstallResult] = None):
         super().__init__(message)
-        self.result = result or InstallResult()
+        self.result = result or InstallResult("", "blocked", False)
 
 
 class InstallConflict(InstallError):
@@ -143,6 +215,8 @@ def _validate_suffix(suffix: str) -> str:
 
 
 def _resolve_source_root(source_root: Path) -> Path:
+    if not Path(source_root).is_absolute():
+        raise ValueError("source root must be an absolute path")
     try:
         resolved = Path(source_root).resolve(strict=True)
     except OSError as error:
@@ -152,28 +226,51 @@ def _resolve_source_root(source_root: Path) -> Path:
     return resolved
 
 
-def _resolve_target_root(target_root: Path) -> Tuple[Path, bool]:
-    raw = Path(target_root)
+def _inspect_directory(path: Path) -> _PathToken:
+    descriptor = None
     try:
-        raw_metadata = raw.lstat()
-    except FileNotFoundError:
-        raw_metadata = None
-    except OSError as error:
-        raise ValueError("target root cannot be inspected: {}".format(error)) from error
+        before = path.lstat()
+        if not stat.S_ISDIR(before.st_mode):
+            raise OSError("not a directory")
+        descriptor = os.open(str(path), _directory_flags())
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or _token(opened) != _token(before):
+            raise OSError("directory identity changed")
+        return _token(opened)
+    except (OSError, RuntimeError):
+        raise ValueError("approved directory is unavailable or changed") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
-    if raw_metadata is not None:
-        resolved = raw.resolve(strict=True)
-        if not stat.S_ISDIR(raw_metadata.st_mode) or not resolved.is_dir():
-            raise ValueError("target root must be a directory")
-        return resolved, True
 
+def _resolve_target_root(target_root: Path) -> _TargetApproval:
+    if not Path(target_root).is_absolute():
+        raise ValueError("target root must be an absolute path")
+    raw = Path(os.path.abspath(str(target_root)))
+    if not raw.name or raw.name in (".", ".."):
+        raise ValueError("target root must have a single directory basename")
     try:
         parent = raw.parent.resolve(strict=True)
-    except OSError as error:
-        raise ValueError("target root parent is unavailable: {}".format(error)) from error
-    if not parent.is_dir():
-        raise ValueError("target root parent must be a directory")
-    return parent / raw.name, False
+    except (OSError, RuntimeError):
+        raise ValueError("target root parent is unavailable") from None
+    parent_token = _inspect_directory(parent)
+    root = parent / raw.name
+    try:
+        root_metadata = root.lstat()
+    except FileNotFoundError:
+        return _TargetApproval(root, parent, raw.name, parent_token, None, False)
+    except OSError:
+        raise ValueError("target root cannot be inspected") from None
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError("target root must be a non-symlink directory")
+    root_token = _inspect_directory(root)
+    if root_token != _token(root_metadata):
+        raise ValueError("target root identity changed during planning")
+    return _TargetApproval(root, parent, raw.name, parent_token, root_token, True)
 
 
 def _classify_target(source: Path, target: Path, target_root: Path) -> Tuple[str, str]:
@@ -195,6 +292,8 @@ def _classify_target(source: Path, target: Path, target_root: Path) -> Tuple[str
         resolved = target.resolve(strict=True)
     except FileNotFoundError:
         return "conflict", "target path is a broken symlink"
+    except RuntimeError:
+        return "error", "target symlink cannot be resolved safely"
     except OSError as error:
         return "error", "target symlink cannot be resolved: {}".format(error)
 
@@ -211,7 +310,9 @@ def plan_links(source_root: Path, target_root: Path, suffix: str) -> LinkPlan:
     """Resolve approved roots and classify every source entry without mutation."""
     suffix = _validate_suffix(suffix)
     source = _resolve_source_root(Path(source_root))
-    target, target_present = _resolve_target_root(Path(target_root))
+    approval = _resolve_target_root(Path(target_root))
+    target = approval.root
+    target_present = approval.present
 
     candidates = []
     try:
@@ -255,12 +356,6 @@ def plan_links(source_root: Path, target_root: Path, suffix: str) -> LinkPlan:
             target_fingerprint = None
             action_reason = ("error", "target path cannot be inspected: {}".format(error))
 
-        try:
-            resolved_candidate = candidate.resolve(strict=True)
-        except OSError as error:
-            resolved_candidate = candidate
-            action_reason = ("error", "source path cannot be resolved: {}".format(error))
-
         alias_key = _nfc(candidate.name).casefold()
         target_name_aliases = [
             child for child in target_aliases.get(alias_key, [])
@@ -272,94 +367,337 @@ def plan_links(source_root: Path, target_root: Path, suffix: str) -> LinkPlan:
             action, reason = "error", "source name has a case or Unicode NFC alias"
         elif target_name_aliases:
             action, reason = "error", "target has a case or Unicode NFC alias"
-        elif not _contains(source, resolved_candidate):
-            action, reason = "error", "source path resolves outside approved root"
-        elif not resolved_candidate.is_file():
+        elif stat.S_ISLNK(source_fingerprint[2]):
+            action, reason = "error", "source symlink candidates are not allowed"
+        elif not stat.S_ISREG(source_fingerprint[2]):
             action, reason = "error", "source path is not a regular file"
         elif action_reason is not None:
             action, reason = action_reason
         else:
-            action, reason = _classify_target(resolved_candidate, target_path, target)
+            action, reason = _classify_target(candidate, target_path, target)
 
         entries.append(LinkEntry(
             display_name,
-            _nfc(str(resolved_candidate)),
+            _nfc(str(candidate)),
             _nfc(str(target / display_name)),
             action,
             reason,
         ))
         specs.append(_LinkSpec(
             candidate.name,
-            resolved_candidate,
+            candidate,
             target_path,
             source_fingerprint,
             target_fingerprint,
         ))
 
     provisional = LinkPlan(
-        source, target, suffix, tuple(entries), "", target_present, tuple(specs)
+        source_root=source,
+        target_root=target,
+        suffix=suffix,
+        entries=tuple(entries),
+        plan_hash="",
+        target_root_present=target_present,
+        target_parent=approval.parent,
+        target_basename=approval.basename,
+        target_parent_token=approval.parent_token,
+        target_root_token=approval.root_token,
+        _specs=tuple(specs),
     )
     digest = hashlib.sha256(
         _canonical_json(provisional._manifest_without_hash()).encode("utf-8")
     ).hexdigest()
     return LinkPlan(
-        source, target, suffix, tuple(entries), digest, target_present, tuple(specs)
+        source_root=source,
+        target_root=target,
+        suffix=suffix,
+        entries=tuple(entries),
+        plan_hash=digest,
+        target_root_present=target_present,
+        target_parent=approval.parent,
+        target_basename=approval.basename,
+        target_parent_token=approval.parent_token,
+        target_root_token=approval.root_token,
+        _specs=tuple(specs),
     )
 
 
 def _preflight(plan: LinkPlan) -> LinkPlan:
     try:
         current = plan_links(plan.source_root, plan.target_root, plan.suffix)
-    except ValueError as error:
-        raise InstallError("plan can no longer be verified: {}".format(error)) from error
+    except ValueError:
+        raise InstallError(
+            "plan can no longer be verified",
+            InstallResult(
+                plan.plan_hash,
+                "blocked",
+                False,
+                failed=(_root_result_entry(plan, "plan can no longer be verified"),),
+            ),
+        ) from None
     if current.plan_hash != plan.plan_hash:
         conflicts = [entry for entry in current.entries if entry.action == "conflict"]
         error_type = InstallConflict if conflicts else InstallError
-        raise error_type("filesystem state changed after planning; no links were created")
+        failed = tuple(
+            _result_entry(entry, "filesystem state changed after planning")
+            for entry in current.entries
+            if entry.action in ("conflict", "error")
+        ) or (_root_result_entry(current, "filesystem state changed after planning"),)
+        raise error_type(
+            "filesystem state changed after planning; no links were created",
+            InstallResult(plan.plan_hash, "blocked", False, failed=failed),
+        )
     errors = [entry for entry in current.entries if entry.action == "error"]
     if errors:
-        raise InstallError("plan contains error entries; no links were created")
+        raise InstallError(
+            "plan contains error entries; no links were created",
+            InstallResult(
+                current.plan_hash,
+                "blocked",
+                False,
+                failed=tuple(_result_entry(entry) for entry in errors),
+            ),
+        )
     conflicts = [entry for entry in current.entries if entry.action == "conflict"]
     if conflicts:
-        raise InstallConflict("plan contains conflicts; no links were created")
+        raise InstallConflict(
+            "plan contains conflicts; no links were created",
+            InstallResult(
+                current.plan_hash,
+                "blocked",
+                False,
+                failed=tuple(_result_entry(entry) for entry in conflicts),
+            ),
+        )
     return current
+
+
+def _result_entry(entry: LinkEntry, reason: Optional[str] = None) -> ResultEntry:
+    return ResultEntry(entry.name, entry.source, entry.target, reason or entry.reason)
+
+
+def _root_result_entry(plan: LinkPlan, reason: str) -> ResultEntry:
+    return ResultEntry(
+        plan.target_basename,
+        _nfc(str(plan.source_root)),
+        _nfc(str(plan.target_root)),
+        reason,
+    )
+
+
+def _failed_result(
+    plan: LinkPlan,
+    created: List[ResultEntry],
+    kept: Tuple[ResultEntry, ...],
+    failed: ResultEntry,
+    target_directory_created: bool,
+) -> InstallResult:
+    return InstallResult(
+        plan.plan_hash,
+        "partial" if created else "blocked",
+        target_directory_created,
+        tuple(created),
+        kept,
+        (failed,),
+    )
+
+
+def _open_approved_directory(path: Path, expected: _PathToken) -> int:
+    descriptor = None
+    try:
+        descriptor = os.open(str(path), _directory_flags())
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or _token(metadata) != expected:
+            raise OSError("directory identity changed")
+        return descriptor
+    except (OSError, RuntimeError):
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise InstallError("approved directory identity changed") from None
+
+
+def _verify_root_identity(
+    plan: LinkPlan,
+    parent_fd: int,
+    root_fd: int,
+    root_token: _PathToken,
+) -> None:
+    current_parent_fd = None
+    try:
+        if _token(os.fstat(parent_fd)) != plan.target_parent_token:
+            raise OSError("parent descriptor changed")
+        if _token(os.fstat(root_fd)) != root_token:
+            raise OSError("root descriptor changed")
+        current_parent_fd = os.open(str(plan.target_parent), _directory_flags())
+        if _token(os.fstat(current_parent_fd)) != plan.target_parent_token:
+            raise OSError("parent path changed")
+        root_path = os.stat(
+            plan.target_basename, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if not stat.S_ISDIR(root_path.st_mode) or _token(root_path) != root_token:
+            raise OSError("root path changed")
+    except (OSError, RuntimeError):
+        raise InstallError("approved target directory identity changed") from None
+    finally:
+        if current_parent_fd is not None:
+            try:
+                os.close(current_parent_fd)
+            except OSError:
+                pass
 
 
 def apply_links(plan: LinkPlan) -> InstallResult:
     """Create direct symlinks; stop on EEXIST and never overwrite."""
     current = _preflight(plan)
-    created: List[str] = []
-    kept = tuple(entry.name for entry in current.entries if entry.action == "keep")
-
-    if not current.target_root_present:
-        try:
-            os.mkdir(str(current.target_root), 0o700)
-        except FileExistsError as error:
-            result = InstallResult(tuple(created), kept, current.target_root.name)
-            raise InstallConflict(
-                "target directory appeared during apply; nothing was removed", result
-            ) from error
-        except OSError as error:
-            result = InstallResult(tuple(created), kept, current.target_root.name)
-            raise InstallError("target directory could not be created: {}".format(error), result) from error
-
+    created = []  # type: List[ResultEntry]
+    kept = tuple(
+        _result_entry(entry) for entry in current.entries if entry.action == "keep"
+    )
+    target_directory_created = False
+    parent_fd = None
+    root_fd = None
     specs = {spec.name: spec for spec in current._specs}
-    for entry in current.entries:
-        if entry.action != "create":
-            continue
-        spec = specs[entry.name]
+    try:
         try:
-            os.symlink(str(spec.source), str(spec.target))
-        except FileExistsError as error:
-            result = InstallResult(tuple(created), kept, entry.name)
-            raise InstallConflict(
-                "target appeared during apply; existing path was preserved", result
-            ) from error
-        except OSError as error:
-            result = InstallResult(tuple(created), kept, entry.name)
-            raise InstallError("link creation failed: {}".format(error), result) from error
-        created.append(entry.name)
-    return InstallResult(tuple(created), kept)
+            parent_fd = _open_approved_directory(
+                current.target_parent, current.target_parent_token
+            )
+        except InstallError as error:
+            result = _failed_result(
+                current, created, kept,
+                _root_result_entry(current, "target parent identity changed"),
+                target_directory_created,
+            )
+            raise InstallError(str(error), result) from None
+
+        if not current.target_root_present:
+            try:
+                os.mkdir(
+                    current.target_basename,
+                    0o700,
+                    dir_fd=parent_fd,
+                )
+                target_directory_created = True
+            except FileExistsError:
+                result = _failed_result(
+                    current, created, kept,
+                    _root_result_entry(current, "target directory appeared during apply"),
+                    target_directory_created,
+                )
+                raise InstallConflict(
+                    "target directory appeared during apply; nothing was removed", result
+                ) from None
+            except OSError:
+                result = _failed_result(
+                    current, created, kept,
+                    _root_result_entry(current, "target directory could not be created"),
+                    target_directory_created,
+                )
+                raise InstallError("target directory could not be created", result) from None
+            try:
+                root_fd = os.open(
+                    current.target_basename,
+                    _directory_flags(),
+                    dir_fd=parent_fd,
+                )
+                root_metadata = os.fstat(root_fd)
+                if not stat.S_ISDIR(root_metadata.st_mode):
+                    raise OSError("created target is not a directory")
+                if hasattr(os, "geteuid") and root_metadata.st_uid != os.geteuid():
+                    raise OSError("created target ownership changed")
+                root_token = _token(root_metadata)
+            except OSError:
+                result = _failed_result(
+                    current, created, kept,
+                    _root_result_entry(current, "created target directory identity changed"),
+                    target_directory_created,
+                )
+                raise InstallError("created target directory is not trusted", result) from None
+        else:
+            if current.target_root_token is None:
+                raise InstallError("target root identity is missing")
+            try:
+                root_fd = os.open(
+                    current.target_basename,
+                    _directory_flags(),
+                    dir_fd=parent_fd,
+                )
+                root_metadata = os.fstat(root_fd)
+                if (
+                    not stat.S_ISDIR(root_metadata.st_mode)
+                    or _token(root_metadata) != current.target_root_token
+                ):
+                    raise OSError("target root changed")
+                root_token = current.target_root_token
+            except OSError:
+                result = _failed_result(
+                    current, created, kept,
+                    _root_result_entry(current, "target root identity changed"),
+                    target_directory_created,
+                )
+                raise InstallError("target root identity changed", result) from None
+
+        for entry in current.entries:
+            if entry.action != "create":
+                continue
+            spec = specs[entry.name]
+            try:
+                _verify_root_identity(current, parent_fd, root_fd, root_token)
+                if _fingerprint(spec.source) != spec.source_fingerprint:
+                    raise InstallError("source identity changed")
+            except (InstallError, OSError):
+                result = _failed_result(
+                    current, created, kept,
+                    _result_entry(entry, "approved source or target identity changed"),
+                    target_directory_created,
+                )
+                raise InstallError("approved source or target identity changed", result) from None
+            try:
+                os.symlink(str(spec.source), entry.name, dir_fd=root_fd)
+            except FileExistsError:
+                result = _failed_result(
+                    current, created, kept,
+                    _result_entry(entry, "target appeared during apply and was preserved"),
+                    target_directory_created,
+                )
+                raise InstallConflict(
+                    "target appeared during apply; existing path was preserved", result
+                ) from None
+            except OSError:
+                result = _failed_result(
+                    current, created, kept,
+                    _result_entry(entry, "direct symlink creation failed"),
+                    target_directory_created,
+                )
+                raise InstallError("link creation failed", result) from None
+            created.append(_result_entry(entry, "direct symlink created"))
+            try:
+                _verify_root_identity(current, parent_fd, root_fd, root_token)
+            except InstallError:
+                result = _failed_result(
+                    current, created, kept,
+                    _root_result_entry(current, "target path changed during apply"),
+                    target_directory_created,
+                )
+                raise InstallError("target path changed during apply", result) from None
+        return InstallResult(
+            current.plan_hash,
+            "success",
+            target_directory_created,
+            tuple(created),
+            kept,
+            (),
+        )
+    finally:
+        for descriptor in (root_fd, parent_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -372,22 +710,73 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _planning_failure_result(args: argparse.Namespace) -> InstallResult:
+    source = _nfc(os.path.abspath(str(args.source_root)))
+    target = _nfc(os.path.abspath(str(args.target_root)))
+    return InstallResult(
+        "",
+        "blocked",
+        False,
+        failed=(ResultEntry(
+            Path(target).name or "target-root",
+            source,
+            target,
+            "approved source or target could not be planned safely",
+        ),),
+    )
+
+
+def _print_non_json_result(result: InstallResult, message: str = "") -> None:
+    if message:
+        print("installer error: {}".format(message), file=sys.stderr)
+    stream = sys.stderr if result.status != "success" else sys.stdout
+    print(
+        "{}: created={} kept={} failed={} target_directory_created={}".format(
+            result.status,
+            len(result.created),
+            len(result.kept),
+            len(result.failed),
+            str(result.target_directory_created).lower(),
+        ),
+        file=stream,
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         plan = plan_links(args.source_root, args.target_root, args.suffix)
+    except (ValueError, OSError, RuntimeError):
+        result = _planning_failure_result(args)
+        if args.json:
+            print(result.to_json())
+        else:
+            _print_non_json_result(result, "planning failed safely")
+        return 2
+
+    if args.dry_run:
         if args.json:
             print(plan.to_json())
         else:
             for entry in plan.entries:
                 print("{}\t{}\t{}".format(entry.action, entry.name, entry.reason))
-        if args.dry_run:
-            return 2 if any(entry.action in ("conflict", "error") for entry in plan.entries) else 0
-        apply_links(plan)
-        return 0
-    except (InstallError, ValueError) as error:
-        print("installer error: {}".format(error), file=sys.stderr)
+        return 2 if any(
+            entry.action in ("conflict", "error") for entry in plan.entries
+        ) else 0
+
+    try:
+        result = apply_links(plan)
+    except InstallError as error:
+        if args.json:
+            print(error.result.to_json())
+        else:
+            _print_non_json_result(error.result, str(error))
         return 2
+    if args.json:
+        print(result.to_json())
+    else:
+        _print_non_json_result(result)
+    return 0
 
 
 if __name__ == "__main__":
