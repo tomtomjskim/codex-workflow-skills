@@ -37,6 +37,7 @@ _MANIFEST_FIELDS = {
 }
 _REGULAR_MODES = {"100644", "100755"}
 _OID_LENGTHS = {"sha1": 40, "sha256": 64}
+_PathToken = Tuple[int, int, int]
 
 
 @dataclass(frozen=True)
@@ -110,10 +111,12 @@ def install_checkout_skills(repo: Path, codex_home: Path) -> CheckoutManifest:
     home = _private_empty_home(codex_home)
     snapshot = _checkout_snapshot(root, require_clean=True)
     staged = Path(tempfile.mkdtemp(prefix=".skills-stage-", dir=str(home)))
+    staged_token = _required_path_token(staged)
     published = home / "skills"
     manifest_path = home / _MANIFEST_NAME
-    published_owned = False
-    manifest_owned = False
+    staging_published = False
+    published_token = None
+    manifest_token = None
     try:
         staged.chmod(0o700)
         _materialize_snapshot(staged, snapshot)
@@ -121,19 +124,25 @@ def install_checkout_skills(repo: Path, codex_home: Path) -> CheckoutManifest:
         _fsync_tree(staged)
         _require_install_identity(root, snapshot.manifest)
         _publish_directory_noreplace(staged, published)
-        published_owned = True
+        staging_published = True
+        published_token = staged_token
+        _require_matching_path_token(published, published_token)
         _make_directories_read_only(published)
         _verify_materialized(published, snapshot)
-        _write_exclusive(manifest_path, _manifest_bytes(snapshot.manifest), 0o400)
-        manifest_owned = True
+        manifest_token = _write_exclusive(
+            manifest_path, _manifest_bytes(snapshot.manifest), 0o400
+        )
         _fsync_directory(home)
-    except Exception:
-        if staged.exists():
-            _remove_owned_tree(staged)
-        if published_owned and published.exists() and not published.is_symlink():
-            _remove_owned_tree(published)
-        if manifest_owned and manifest_path.exists() and not manifest_path.is_symlink():
-            manifest_path.unlink()
+    except Exception as error:
+        warnings = []
+        failed_path = getattr(error, "owned_path", None)
+        if manifest_token is None and failed_path == manifest_path:
+            manifest_token = getattr(error, "owned_path_token", None)
+        if not staging_published:
+            _cleanup_owned_tree(staged, staged_token, warnings)
+        _cleanup_owned_tree(published, published_token, warnings)
+        _cleanup_owned_file(manifest_path, manifest_token, warnings)
+        _attach_cleanup_warnings(error, warnings)
         raise
     return snapshot.manifest
 
@@ -444,8 +453,11 @@ def _validated_hash_mapping(value: object) -> Mapping[str, str]:
     return value
 
 
-def _write_exclusive(path: Path, content: bytes, final_mode: int) -> None:
+def _write_exclusive(
+    path: Path, content: bytes, final_mode: int
+) -> _PathToken:
     descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    token = _stat_token(os.fstat(descriptor))
     try:
         offset = 0
         while offset < len(content):
@@ -455,8 +467,17 @@ def _write_exclusive(path: Path, content: bytes, final_mode: int) -> None:
             offset += written
         os.fsync(descriptor)
         os.fchmod(descriptor, final_mode)
+    except Exception as error:
+        _annotate_owned_path(error, path, token)
+        raise
     finally:
         os.close(descriptor)
+    try:
+        _require_matching_path_token(path, token)
+    except Exception as error:
+        _annotate_owned_path(error, path, token)
+        raise
+    return token
 
 
 def _read_regular_file(path: Path) -> bytes:
@@ -572,6 +593,93 @@ def _remove_owned_tree(path: Path) -> None:
                 child.chmod(0o700)
                 child.rmdir()
     path.rmdir()
+
+
+def _cleanup_owned_tree(
+    path: Path,
+    token: Optional[_PathToken],
+    warnings: list,
+) -> None:
+    if token is None:
+        return
+    if not _cleanup_token_matches(path, token, warnings):
+        return
+    _remove_owned_tree(path)
+
+
+def _cleanup_owned_file(
+    path: Path,
+    token: Optional[_PathToken],
+    warnings: list,
+) -> None:
+    if token is None:
+        return
+    if not _cleanup_token_matches(path, token, warnings):
+        return
+    path.unlink()
+
+
+def _cleanup_token_matches(
+    path: Path, token: _PathToken, warnings: list
+) -> bool:
+    current = _path_token(path)
+    if current == token:
+        return True
+    state = "missing" if current is None else "replaced"
+    warnings.append("cleanup skipped for {}: pathname {}".format(path, state))
+    return False
+
+
+def _attach_cleanup_warnings(error: Exception, warnings: Sequence[str]) -> None:
+    if not warnings:
+        return
+    existing = tuple(getattr(error, "cleanup_warnings", ()))
+    combined = existing + tuple(warnings)
+    try:
+        setattr(error, "cleanup_warnings", combined)
+    except (AttributeError, TypeError):
+        pass
+    add_note = getattr(error, "add_note", None)
+    if add_note is not None:
+        for warning in warnings:
+            add_note(warning)
+
+
+def _annotate_owned_path(
+    error: Exception, path: Path, token: _PathToken
+) -> None:
+    try:
+        setattr(error, "owned_path", path)
+        setattr(error, "owned_path_token", token)
+    except (AttributeError, TypeError):
+        pass
+
+
+def _stat_token(metadata: os.stat_result) -> _PathToken:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def _path_token(path: Path) -> Optional[_PathToken]:
+    try:
+        return _stat_token(path.lstat())
+    except FileNotFoundError:
+        return None
+
+
+def _required_path_token(path: Path) -> _PathToken:
+    token = _path_token(path)
+    if token is None:
+        raise ValueError("owned path disappeared after creation: {}".format(path))
+    return token
+
+
+def _require_matching_path_token(path: Path, token: _PathToken) -> None:
+    if _path_token(path) != token:
+        raise ValueError("owned pathname identity changed: {}".format(path))
 
 
 def _private_empty_home(path: Path) -> Path:

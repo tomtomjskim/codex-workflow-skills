@@ -327,6 +327,93 @@ class CheckoutTests(unittest.TestCase):
 
         self.assertEqual(tuple(self.codex_home.iterdir()), ())
 
+    def test_post_publish_path_swap_preserves_replacement_on_later_failure(self):
+        original_write = checkout_module._write_exclusive
+        skills = self.codex_home / "skills"
+        replacement = skills / "competitor"
+
+        def swap_skills_then_fail(path, content, mode):
+            if path.name == ".live-eval-checkout.json":
+                skills.chmod(0o755)
+                skills.rename(self.codex_home / "owned-skills-moved-away")
+                skills.mkdir()
+                replacement.write_text("keep\n", encoding="utf-8")
+                raise OSError("simulated post-publish failure")
+            return original_write(path, content, mode)
+
+        with patch(
+            "scripts.live_eval.checkout._write_exclusive",
+            side_effect=swap_skills_then_fail,
+        ):
+            with self.assertRaises(OSError) as raised:
+                install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertTrue(raised.exception.cleanup_warnings)
+        self.assertEqual(replacement.read_text(encoding="utf-8"), "keep\n")
+
+    def test_post_manifest_path_swap_preserves_replacement_on_later_failure(self):
+        original_fsync = checkout_module._fsync_directory
+        manifest = self.codex_home / ".live-eval-checkout.json"
+
+        def swap_manifest_then_fail(path):
+            if path == self.codex_home:
+                manifest.rename(self.codex_home / "owned-manifest-moved-away")
+                manifest.write_text("competitor\n", encoding="utf-8")
+                raise OSError("simulated post-manifest failure")
+            return original_fsync(path)
+
+        with patch(
+            "scripts.live_eval.checkout._fsync_directory",
+            side_effect=swap_manifest_then_fail,
+        ):
+            with self.assertRaises(OSError) as raised:
+                install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertEqual(manifest.read_text(encoding="utf-8"), "competitor\n")
+        self.assertFalse((self.codex_home / "skills").exists())
+        self.assertTrue(raised.exception.cleanup_warnings)
+
+    def test_staging_path_recreation_is_preserved_on_failure(self):
+        original_identity = checkout_module._require_install_identity
+        replacement_paths = []
+
+        def swap_staging_then_fail(repo, manifest):
+            staged = next(self.codex_home.glob(".skills-stage-*"))
+            staged.rename(self.codex_home / "owned-stage-moved-away")
+            staged.mkdir()
+            replacement = staged / "competitor"
+            replacement.write_text("keep\n", encoding="utf-8")
+            replacement_paths.append(replacement)
+            original_identity(repo, manifest)
+            raise OSError("simulated staging failure")
+
+        with patch(
+            "scripts.live_eval.checkout._require_install_identity",
+            side_effect=swap_staging_then_fail,
+        ):
+            with self.assertRaises(OSError) as raised:
+                install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertEqual(replacement_paths[0].read_text(encoding="utf-8"), "keep\n")
+        self.assertTrue(raised.exception.cleanup_warnings)
+
+    def test_unchanged_owned_paths_are_removed_after_late_failure(self):
+        original_fsync = checkout_module._fsync_directory
+
+        def fail_home_fsync(path):
+            if path == self.codex_home:
+                raise OSError("simulated final fsync failure")
+            return original_fsync(path)
+
+        with patch(
+            "scripts.live_eval.checkout._fsync_directory",
+            side_effect=fail_home_fsync,
+        ):
+            with self.assertRaises(OSError):
+                install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
+
     def test_canonical_name_key_rejects_case_and_unicode_aliases_deterministically(self):
         self.assertEqual(canonical_name_key("workflow"), canonical_name_key("WORKFLOW"))
         self.assertEqual(canonical_name_key("é"), canonical_name_key("e\u0301"))
