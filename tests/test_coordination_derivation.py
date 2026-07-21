@@ -38,6 +38,15 @@ TRIGGER_MATRIX = {
 }
 
 
+def _external_prepared(catalog):
+    plan = copy.deepcopy(PLAN)
+    plan["workstreams"][0]["consumes"] = [
+        {"kind": "api", "id": "external-v1"}
+    ]
+    plan["workstreams"][1]["produces"] = []
+    return prepare_coordination(plan, catalog)
+
+
 class DerivationTests(unittest.TestCase):
     def test_derives_object_ref_shared_api_and_reviewer_union(self):
         result = derive_coordination(MANIFEST, INVENTORY, TRIGGER_MATRIX)
@@ -82,6 +91,36 @@ class DerivationTests(unittest.TestCase):
         manifest["inventory_hash"] = "sha256:" + "0" * 64
 
         result = derive_coordination(manifest, INVENTORY, TRIGGER_MATRIX)
+
+        self.assertEqual(result.completeness, "mismatch")
+        self.assertEqual(result.route, "blocked")
+
+    def test_external_consume_without_catalog_evidence_is_unverified(self):
+        prepared = _external_prepared(None)
+
+        result = derive_coordination(
+            prepared.manifest, prepared.inventory, TRIGGER_MATRIX
+        )
+
+        self.assertEqual(result.completeness, "unverified")
+        self.assertEqual(result.route, "blocked")
+
+    def test_known_external_consume_is_verified_and_independent(self):
+        prepared = _external_prepared({"known_interface_ids": ["external-v1"]})
+
+        result = derive_coordination(
+            prepared.manifest, prepared.inventory, TRIGGER_MATRIX
+        )
+
+        self.assertEqual(result.completeness, "verified")
+        self.assertEqual(result.route, "independent")
+
+    def test_explicit_catalog_omission_is_inventory_mismatch(self):
+        prepared = _external_prepared({"known_interface_ids": ["different-v1"]})
+
+        result = derive_coordination(
+            prepared.manifest, prepared.inventory, TRIGGER_MATRIX
+        )
 
         self.assertEqual(result.completeness, "mismatch")
         self.assertEqual(result.route, "blocked")

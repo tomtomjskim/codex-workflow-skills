@@ -164,6 +164,16 @@ def derive_coordination(
         for ref in workstream["produces"]:
             producers.setdefault(_identity(ref), set()).add(workstream["id"])
 
+    consumed_refs = {
+        _identity(ref)
+        for workstream in manifest["workstreams"]
+        for ref in workstream["consumes"]
+    }
+    external_refs = consumed_refs.difference(producers)
+    known_interface_ids = set(inventory["known_interface_ids"])
+    if any(ref_id not in known_interface_ids for _, ref_id in external_refs):
+        return _blocked("mismatch" if known_interface_ids else "unverified")
+
     consumers: Set[str] = set()
     handoffs = set()
     for workstream in manifest["workstreams"]:
