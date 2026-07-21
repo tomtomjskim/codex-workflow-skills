@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import subprocess
 import tempfile
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from scripts.validate_policy_contracts import (
+    _scan_file_stream,
     scan_tracked_text_files,
     validate_repository_contracts,
     validate_review_sample,
@@ -44,6 +46,46 @@ class PolicyContractTests(unittest.TestCase):
         self.assertIn(
             "HIGH requires direct evidence or needs-investigation", errors
         )
+
+    def test_high_requires_conservative_source_or_needs_investigation(self):
+        for source in (
+            "probably auth.py",
+            "probably auth.py:12",
+            "https://example.invalid/claim",
+            "auth.py",
+        ):
+            with self.subTest(source=source):
+                sample = copy.deepcopy(SUPPORTED_FINDING)
+                sample["severity"] = "HIGH"
+                sample["finding_evidence"]["source"] = source
+                self.assertIn(
+                    "HIGH requires direct evidence or needs-investigation",
+                    validate_review_sample(sample),
+                )
+
+        investigated = copy.deepcopy(SUPPORTED_FINDING)
+        investigated["severity"] = "HIGH"
+        investigated["finding_evidence"]["source"] = "guess"
+        investigated["verification_status"] = "needs-investigation"
+        self.assertNotIn(
+            "HIGH requires direct evidence or needs-investigation",
+            validate_review_sample(investigated),
+        )
+
+    def test_high_accepts_conservative_direct_source_grammar(self):
+        for source in (
+            "src/auth.py:12",
+            "command:python3 -m unittest tests.test_auth",
+            "artifact:sha256:" + "a" * 64,
+        ):
+            with self.subTest(source=source):
+                sample = copy.deepcopy(SUPPORTED_FINDING)
+                sample["severity"] = "HIGH"
+                sample["finding_evidence"]["source"] = source
+                self.assertNotIn(
+                    "HIGH requires direct evidence or needs-investigation",
+                    validate_review_sample(sample),
+                )
 
     def test_invalid_enums_and_weak_verification_claims_are_rejected(self):
         invalid = copy.deepcopy(SUPPORTED_FINDING)
@@ -84,6 +126,51 @@ class PolicyContractTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("PRIVATE.md", errors[0])
         self.assertIn("private path", errors[0])
+
+    def test_hygiene_does_not_follow_tracked_symlink_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo_root = base / "repo"
+            repo_root.mkdir()
+            outside = base / "outside.txt"
+            outside.write_text("/U" "sers/example/private\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=repo_root, check=True)
+            (repo_root / "external-link").symlink_to(outside)
+            subprocess.run(["git", "add", "external-link"], cwd=repo_root, check=True)
+
+            errors = scan_tracked_text_files(repo_root)
+
+        self.assertEqual(errors, [])
+
+    def test_hygiene_scans_symlink_text_itself(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo_root, check=True)
+            (repo_root / "sensitive-link").symlink_to(
+                "/U" "sers/example/private"
+            )
+            subprocess.run(["git", "add", "sensitive-link"], cwd=repo_root, check=True)
+
+            errors = scan_tracked_text_files(repo_root)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("private path", errors[0])
+
+    def test_binary_scan_stops_after_initial_nul_chunk(self):
+        class FirstChunkBinary(io.BytesIO):
+            def __init__(self):
+                super().__init__(b"\0" + b"x" * 100)
+                self.read_calls = 0
+
+            def read(self, size=-1):
+                self.read_calls += 1
+                if self.read_calls > 1:
+                    raise AssertionError("binary scanner read beyond first NUL chunk")
+                return super().read(size)
+
+        stream = FirstChunkBinary()
+        self.assertEqual(_scan_file_stream(stream, Path("large.bin"), 16), [])
+        self.assertEqual(stream.read_calls, 1)
 
     def test_policy_checker_emits_structured_json_errors(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -24,6 +24,8 @@ Prepare artifacts together from one approved canonical JSON plan:
 workflow prepare-coordination --repo-root <approved-root> --plan <plan.json> --out-dir <temporary-dir> --json
 ```
 
+The output directory must not exist before preparation. The CLI encodes both canonical payloads first, writes and synchronizes them in one private sibling staging directory, then publishes that directory as a unit. An existing target or any staging failure blocks preparation without mutating the target.
+
 Validate the prepared artifacts and receive the dispatch receipt:
 
 ```bash
@@ -35,8 +37,10 @@ workflow validate-coordination --repo-root <approved-root> --manifest <manifest.
 Before accepting a workstream handoff, validate its changed paths against the same current receipt:
 
 ```bash
-workflow validate-handoff --repo-root <approved-root> --receipt <receipt.json> --workstream-id <id> --changed-path <path> --json
+workflow validate-handoff --repo-root <approved-root> --manifest <manifest.json> --inventory <inventory.json> --contract <contract.json> --receipt <receipt.json> --workstream-id <id> --changed-path <path> --json
 ```
+
+For handoff validation, pass the authoritative `--manifest`, `--inventory`, and current optional `--contract` again. The CLI reruns coordination validation with the canonical trigger matrix and compares the complete regenerated receipt with the submitted receipt before checking owned paths. A CLI receipt expires after five minutes; rerun coordination validation instead of handing off with stale evidence.
 
 Each command accepts only UTF-8 JSON and emits JSON. A structured error and nonzero exit blocks parallel validation.
 

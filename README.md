@@ -169,6 +169,8 @@ For covered concurrent work, prepare a manifest and inventory together from one 
   --json
 ```
 
+The output directory must not exist before this command. Preparation builds and synchronizes both files in a private sibling staging directory, then publishes the directory as one unit. Existing output is never reused or mutated.
+
 Validate the generated artifacts before every concurrent dispatch. A contracted route also requires the current frozen contract:
 
 ```bash
@@ -185,11 +187,16 @@ Validate each workstream handoff against the current receipt and its derived wri
 ```bash
 ./scripts/workflow validate-handoff \
   --repo-root /path/to/approved-repo \
+  --manifest /path/to/temporary-coordination/manifest.json \
+  --inventory /path/to/temporary-coordination/inventory.json \
+  --contract /path/to/temporary-coordination/contract.json \
   --receipt /path/to/temporary-coordination/receipt.json \
   --workstream-id frontend \
   --changed-path src/ui/settings.py \
   --json
 ```
+
+Handoff validation requires the authoritative `--manifest` and `--inventory`, plus `--contract` when the route is contracted. It reruns coordination validation with the built-in reviewer matrix and requires exact canonical equality with the submitted receipt before ownership validation. CLI receipts use canonical UUID run IDs and expire after five minutes; rerun `validate-coordination` when a receipt is stale.
 
 All three commands emit JSON and return nonzero with a structured error when validation fails. Covered parallel dispatch requires a current CLI version 1 receipt. If the CLI is missing or incompatible, validation fails, the receipt is stale, or changes cannot be attributed to a workstream, use the single-owner sequential fallback and record `parallel_validation: blocked`; do not continue with unvalidated parallel writers.
 

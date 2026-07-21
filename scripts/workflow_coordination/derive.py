@@ -158,6 +158,11 @@ def derive_coordination(
         return _blocked(completeness)
     if not _valid_trigger_matrix(trigger_matrix):
         return _blocked("incompatible")
+    if any(
+        surface not in trigger_matrix["changed_surface_reviewers"]
+        for surface in manifest["changed_surfaces"]
+    ):
+        return _blocked("incompatible")
 
     producers: Dict[InterfaceIdentity, Set[str]] = {}
     for workstream in manifest["workstreams"]:

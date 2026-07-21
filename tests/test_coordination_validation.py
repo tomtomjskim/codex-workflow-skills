@@ -36,7 +36,7 @@ PREPARED = prepare_coordination(PLAN, None)
 TRIGGER_MATRIX = {
     "schema_version": 1,
     "profile_reviewers": {"shared_interface": ["api-reviewer"]},
-    "changed_surface_reviewers": {},
+    "changed_surface_reviewers": {"api": [], "ui": []},
 }
 TREE_HASH = "a" * 40
 

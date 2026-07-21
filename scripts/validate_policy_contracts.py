@@ -2,8 +2,11 @@
 """Dependency-free policy and tracked-file hygiene validation."""
 
 import argparse
+import codecs
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +43,8 @@ _REPOSITORY_CONTRACT_SNIPPETS = {
         '"parallel_validation": "blocked"',
         '"execution": "sequential"',
         "CLI version 1",
+        "output directory must not exist",
+        "authoritative `--manifest`",
     ),
     "skills/workflow-intake/SKILL.md": (
         "references/parallel-coordination.md",
@@ -76,6 +81,8 @@ _REPOSITORY_CONTRACT_SNIPPETS = {
         "validate-coordination",
         "validate-handoff",
         "sequential fallback",
+        "output directory must not exist",
+        "authoritative `--manifest`",
     ),
 }
 
@@ -85,11 +92,20 @@ def _nonempty(value: object) -> bool:
 
 
 def _direct_finding_evidence(value: object) -> bool:
+    source = value.get("source") if isinstance(value, dict) else None
+    direct_source = isinstance(source, str) and (
+        re.fullmatch(
+            r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*:[1-9][0-9]*", source
+        )
+        is not None
+        or re.fullmatch(r"command:\S(?:.*\S)?", source) is not None
+        or re.fullmatch(r"artifact:sha256:[0-9a-f]{64}", source) is not None
+    )
     return (
         isinstance(value, dict)
         and _nonempty(value.get("observed_problem"))
         and _nonempty(value.get("failure_mode"))
-        and _nonempty(value.get("source"))
+        and direct_source
     )
 
 
@@ -102,8 +118,10 @@ def validate_review_sample(sample: dict) -> List[str]:
     severity = sample.get("severity")
     if severity not in SEVERITIES:
         errors.append("invalid severity: {}".format(severity))
-    if severity == "HIGH" and not _direct_finding_evidence(
-        sample.get("finding_evidence")
+    if (
+        severity == "HIGH"
+        and not _direct_finding_evidence(sample.get("finding_evidence"))
+        and sample.get("verification_status") != "needs-investigation"
     ):
         errors.append("HIGH requires direct evidence or needs-investigation")
 
@@ -158,28 +176,68 @@ def _tracked_paths(repo_root: Path) -> List[Path]:
     return [repo_root / Path(raw.decode("utf-8")) for raw in result.stdout.split(b"\0") if raw]
 
 
+def _scan_line(line: str, relative_path: Path, line_number: int) -> List[str]:
+    return [
+        "{}:{}: {}".format(relative_path, line_number, label)
+        for pattern, label in _HYGIENE_PATTERNS
+        if pattern.search(line)
+    ]
+
+
+def _scan_file_stream(stream, relative_path: Path, chunk_size: int = 65536) -> List[str]:
+    """Scan UTF-8 chunks, stopping immediately when the initial chunk is binary."""
+    first = stream.read(chunk_size)
+    if b"\0" in first:
+        return []
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    errors = []
+    pending = ""
+    line_number = 0
+    chunk = first
+    try:
+        while chunk:
+            pending += decoder.decode(chunk)
+            lines = pending.split("\n")
+            pending = lines.pop()
+            for line in lines:
+                line_number += 1
+                errors.extend(_scan_line(line, relative_path, line_number))
+            chunk = stream.read(chunk_size)
+        pending += decoder.decode(b"", final=True)
+    except UnicodeDecodeError:
+        return []
+    if pending:
+        errors.extend(_scan_line(pending, relative_path, line_number + 1))
+    return errors
+
+
 def scan_tracked_text_files(repo_root: Path) -> List[str]:
     """Use git ls-files -z, skip binary files, and scan every tracked text file."""
     root = Path(repo_root)
     errors = []
     for path in _tracked_paths(root):
+        relative_path = path.relative_to(root)
         try:
-            data = path.read_bytes()
+            file_mode = path.lstat().st_mode
         except OSError as error:
-            errors.append("{}: cannot read tracked file: {}".format(path.relative_to(root), error))
+            errors.append("{}: cannot inspect tracked file: {}".format(relative_path, error))
             continue
-        if b"\0" in data:
+        if stat.S_ISLNK(file_mode):
+            try:
+                target = os.readlink(str(path))
+            except OSError as error:
+                errors.append("{}: cannot read symlink: {}".format(relative_path, error))
+                continue
+            for line_number, line in enumerate(target.splitlines() or [target], 1):
+                errors.extend(_scan_line(line, relative_path, line_number))
+            continue
+        if not stat.S_ISREG(file_mode):
             continue
         try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        for line_number, line in enumerate(text.splitlines(), 1):
-            for pattern, label in _HYGIENE_PATTERNS:
-                if pattern.search(line):
-                    errors.append(
-                        "{}:{}: {}".format(path.relative_to(root), line_number, label)
-                    )
+            with path.open("rb") as stream:
+                errors.extend(_scan_file_stream(stream, relative_path))
+        except OSError as error:
+            errors.append("{}: cannot read tracked file: {}".format(relative_path, error))
     return errors
 
 

@@ -34,7 +34,10 @@ INVENTORY = PREPARED.inventory
 TRIGGER_MATRIX = {
     "schema_version": 1,
     "profile_reviewers": {"shared_interface": ["api-reviewer"]},
-    "changed_surface_reviewers": {"database": ["data-reviewer"]},
+    "changed_surface_reviewers": {
+        "database": ["data-reviewer"],
+        "api/settings": [],
+    },
 }
 
 
@@ -138,6 +141,18 @@ class DerivationTests(unittest.TestCase):
                 self.assertEqual(result.completeness, "incompatible")
                 self.assertEqual(result.route, "blocked")
                 self.assertEqual(result.required_reviewers, ())
+
+    def test_unknown_security_surface_is_incompatible_and_blocked(self):
+        plan = copy.deepcopy(PLAN)
+        plan["changed_surfaces"] = ["authorizaton"]
+        prepared = prepare_coordination(plan, None)
+
+        result = derive_coordination(
+            prepared.manifest, prepared.inventory, TRIGGER_MATRIX
+        )
+
+        self.assertEqual(result.completeness, "incompatible")
+        self.assertEqual(result.route, "blocked")
 
     def test_outputs_are_deterministically_sorted(self):
         plan = copy.deepcopy(PLAN)
