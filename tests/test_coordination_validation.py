@@ -346,6 +346,28 @@ class CoordinationValidationTests(unittest.TestCase):
             {"future": ["src/future/component"]},
         )
 
+    def test_rejects_internal_symlink_exact_and_ancestor_aliases(self):
+        (self.repo_root / "src" / "link").symlink_to(
+            self.repo_root / "src" / "ui", target_is_directory=True
+        )
+        cases = (
+            ("src/link/future", "src/ui/future"),
+            ("src/link/future/child", "src/ui/future"),
+        )
+        for linked_path, direct_path in cases:
+            with self.subTest(linked_path=linked_path, direct_path=direct_path):
+                plan = copy.deepcopy(PLAN)
+                plan["workstreams"][0]["exclusive_write_paths"] = [linked_path]
+                plan["workstreams"][1]["exclusive_write_paths"] = [direct_path]
+                prepared = prepare_coordination(plan, None)
+                with self.assertRaisesRegex(ValidationError, "path overlap"):
+                    validate_coordination(
+                        self.repo_root,
+                        prepared.manifest,
+                        prepared.inventory,
+                        None,
+                    )
+
     def test_clock_requires_parseable_rfc3339_utc(self):
         invalid_clocks = (
             lambda: datetime(2026, 7, 21, 0, 0, 0),

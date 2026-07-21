@@ -67,12 +67,20 @@ def _normalize_path(repo_root: Path, value: object) -> str:
     if normalized in ("", "."):
         raise ValidationError("repository root cannot be an owned path")
 
-    root = repo_root.resolve(strict=True)
-    resolved = (root / normalized).resolve(strict=False)
     try:
-        resolved.relative_to(root)
+        root = repo_root.resolve(strict=True)
+        resolved = (root / normalized).resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise ValidationError("path identity cannot be resolved: {}".format(value)) from error
+    try:
+        canonical_relative = resolved.relative_to(root)
     except ValueError as error:
         raise ValidationError("path escapes repository root: {}".format(value)) from error
+    canonical = str(canonical_relative)
+    if canonical in ("", "."):
+        raise ValidationError("repository root cannot be an owned path")
+    if not unicodedata.is_normalized("NFC", canonical):
+        raise ValidationError("resolved path must use Unicode NFC: {}".format(value))
 
     current = root
     for part in posix_path.parts:
@@ -97,7 +105,7 @@ def _normalize_path(repo_root: Path, value: object) -> str:
         ):
             raise ValidationError("path alias does not match filesystem case: {}".format(value))
         break
-    return normalized
+    return canonical
 
 
 def _validate_paths(repo_root: Path, workstreams: List[dict]) -> Dict[str, List[str]]:

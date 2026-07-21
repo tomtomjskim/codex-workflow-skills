@@ -91,6 +91,18 @@ class HandoffValidationTests(unittest.TestCase):
                 self.repo_root, receipt, "frontend", ["src/api/settings.py"]
             )
 
+    def test_handoff_uses_canonical_internal_symlink_identity(self):
+        (self.repo_root / "src" / "link").symlink_to(
+            self.repo_root / "src" / "ui", target_is_directory=True
+        )
+
+        validate_handoff(
+            self.repo_root,
+            self.receipt,
+            "frontend",
+            ["src/link/future/settings.py"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
