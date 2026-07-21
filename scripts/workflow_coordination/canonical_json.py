@@ -28,6 +28,10 @@ def _reject_constant(value: str) -> object:
 
 
 def _validate_string(value: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise CanonicalJSONError("strings must be valid UTF-8") from error
     if not unicodedata.is_normalized("NFC", value):
         raise CanonicalJSONError("strings must use Unicode NFC")
 
