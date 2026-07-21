@@ -31,6 +31,17 @@ SUPPORTED_FINDING = {
 
 
 class PolicyContractTests(unittest.TestCase):
+    def test_repository_validator_runs_authoritative_git_change_tests(self):
+        root = Path(__file__).parents[1]
+        validator = (root / "scripts" / "validate_repo.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("require_file tests/test_git_changes.py", validator)
+        self.assertIn(
+            "run python3 -m unittest tests.test_git_changes -v", validator
+        )
+
     def test_repository_contracts_require_receipt_fallback_and_canonical_agents(self):
         errors = validate_repository_contracts(Path(__file__).parents[1])
 

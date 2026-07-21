@@ -51,6 +51,7 @@ require_file scripts/workflow_coordination/canonical_json.py
 require_file scripts/workflow_coordination/reviewer_routing.py
 require_file tests/test_canonical_json.py
 require_file tests/test_policy_contracts.py
+require_file tests/test_git_changes.py
 require_file tests/test_workflow_cli.py
 require_file tests/test_install_agent_adapters.py
 require_file skills/workflow-intake/references/parallel-coordination.md
@@ -81,6 +82,7 @@ fi
 run git diff --check
 run python3 scripts/validate_policy_contracts.py --repo-root .
 run python3 -m unittest tests.test_policy_contracts -v
+run python3 -m unittest tests.test_git_changes -v
 run python3 -m unittest discover -s tests -p 'test_*coordination*.py' -v
 run python3 -m unittest tests.test_workflow_cli -v
 run python3 -m unittest tests.test_install_agent_adapters -v
