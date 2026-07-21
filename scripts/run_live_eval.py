@@ -871,7 +871,9 @@ def _bounded_process(
     stdin_failed = threading.Event()
     stdin_completed = threading.Event()
     stop_requested = threading.Event()
+    writer_start = threading.Event()
     deadline = time.monotonic() + float(timeout_seconds)
+    stdin_writer_fd = None
 
     def read_stream(stream: object, target: bytearray, limit: int) -> None:
         while True:
@@ -886,15 +888,15 @@ def _bounded_process(
 
     def write_stdin() -> None:
         try:
-            if process.stdin is None:
-                if input_bytes:
-                    stdin_failed.set()
-                else:
-                    stdin_completed.set()
+            writer_start.wait()
+            if stop_requested.is_set():
+                return
+            if stdin_writer_fd is None:
+                stdin_failed.set()
                 return
             offset = 0
             while offset < len(input_bytes):
-                written = process.stdin.write(input_bytes[offset:])
+                written = os.write(stdin_writer_fd, input_bytes[offset:])
                 if not isinstance(written, int) or written <= 0:
                     stdin_failed.set()
                     return
@@ -906,7 +908,11 @@ def _bounded_process(
         except Exception:
             stdin_failed.set()
         finally:
-            _close_process_stdin(process)
+            if stdin_writer_fd is not None:
+                try:
+                    os.close(stdin_writer_fd)
+                except OSError:
+                    pass
 
     readers = (
         threading.Thread(
@@ -917,9 +923,32 @@ def _bounded_process(
         ),
     )
     stdin_writer = threading.Thread(target=write_stdin, daemon=True)
+    try:
+        stdin_writer.start()
+    except Exception:
+        _terminate_process_group(process)
+        raise ProcessExecutionFailure() from None
+    try:
+        if process.stdin is None:
+            raise ValueError("stdin pipe is unavailable")
+        stdin_writer_fd = os.dup(process.stdin.fileno())
+    except (AttributeError, OSError, ValueError):
+        stop_requested.set()
+        writer_start.set()
+        _terminate_process_group(process)
+        stdin_writer.join(timeout=1)
+        raise ProcessExecutionFailure() from None
+    try:
+        process.stdin.close()
+    except Exception:
+        stop_requested.set()
+        writer_start.set()
+        _terminate_process_group(process)
+        stdin_writer.join(timeout=1)
+        raise ProcessExecutionFailure() from None
+    writer_start.set()
     for reader in readers:
         reader.start()
-    stdin_writer.start()
     timed_out = False
     group_terminated = False
     while process.poll() is None:
@@ -988,16 +1017,8 @@ def _close_process_stdin(process: object) -> None:
     if stream is None:
         return
     try:
-        descriptor = stream.fileno()
-    except (AttributeError, OSError, ValueError):
-        try:
-            stream.close()
-        except (OSError, ValueError):
-            pass
-        return
-    try:
-        os.close(descriptor)
-    except OSError:
+        stream.close()
+    except Exception:
         pass
 
 

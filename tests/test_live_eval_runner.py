@@ -1,3 +1,4 @@
+import gc
 import io
 import json
 import os
@@ -7,6 +8,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -122,7 +124,15 @@ class FakePopen:
         self.kwargs = kwargs
         self.stdout = io.BytesIO(specification.get("stdout", b""))
         self.stderr = io.BytesIO(specification.get("stderr", b""))
-        self.stdin = specification.get("stdin", io.BytesIO())
+        self._child_stdin_read_fd = None
+        if specification.get("pipe_stdin"):
+            self._child_stdin_read_fd, write_fd = os.pipe()
+            self.stdin = os.fdopen(write_fd, "wb", buffering=0)
+        elif "stdin" in specification:
+            self.stdin = specification["stdin"]
+        else:
+            self.stdin = tempfile.TemporaryFile("w+b")
+        self.stdin_fd = self.stdin.fileno()
         self.returncode = specification.get("returncode", 0)
         self.pid = self.next_pid
         type(self).next_pid += 1
@@ -133,9 +143,20 @@ class FakePopen:
 
     def wait(self, timeout=None):
         del timeout
+        self.close_child_stdin()
         if self.returncode is None:
             self.returncode = -15
         return self.returncode
+
+    def close_child_stdin(self):
+        if self._child_stdin_read_fd is None:
+            return
+        descriptor = self._child_stdin_read_fd
+        self._child_stdin_read_fd = None
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
 
 
 def final_output(response):
@@ -658,32 +679,18 @@ class RunnerTests(unittest.TestCase):
                     run_eval(self.request(max_stdin_bytes=limit), FakeCodex())
 
     def test_timeout_starts_before_large_stdin_write_and_kills_group(self):
-        class NeverReadStdin:
-            def __init__(self):
-                self.started = threading.Event()
-                self.released = threading.Event()
-
-            def write(self, value):
-                self.started.set()
-                self.released.wait(2)
-                return len(value)
-
-            def close(self):
-                self.released.set()
-
         invocation = self.invocation()
-        blocked_stdin = NeverReadStdin()
         FakePopen.calls = []
-        FakePopen.outputs = [{"stdin": blocked_stdin, "returncode": None}]
+        FakePopen.outputs = [{"pipe_stdin": True, "returncode": None}]
         raised = []
 
         def invoke():
             try:
                 SubprocessCodex().invoke(
                     invocation,
-                    "x" * 65536,
+                    "x" * (1024 * 1024),
                     0.05,
-                    max_stdin_bytes=65536,
+                    max_stdin_bytes=1024 * 1024,
                     max_stdout_bytes=32,
                     max_stderr_bytes=32,
                 )
@@ -698,7 +705,7 @@ class RunnerTests(unittest.TestCase):
             worker.join(timeout=0.5)
             was_still_blocked = worker.is_alive()
             if was_still_blocked:
-                blocked_stdin.close()
+                FakePopen.calls[0].close_child_stdin()
                 worker.join(timeout=1)
 
         self.assertFalse(was_still_blocked)
@@ -707,19 +714,15 @@ class RunnerTests(unittest.TestCase):
         kill_group.assert_called_once_with(FakePopen.calls[0].pid, signal.SIGTERM)
 
     def test_stdin_writer_error_is_sanitized_nonretryable_process_failure(self):
-        class FailingStdin:
-            def write(self, _value):
-                raise RuntimeError("secret-writer-detail")
-
-            def close(self):
-                return None
-
         invocation = self.invocation()
         FakePopen.calls = []
-        FakePopen.outputs = [{"stdin": FailingStdin(), "returncode": None}]
+        FakePopen.outputs = [{"returncode": None}]
 
         with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen), mock.patch(
             "scripts.run_live_eval.os.killpg"
+        ), mock.patch(
+            "scripts.run_live_eval.os.write",
+            side_effect=RuntimeError("secret-writer-detail"),
         ):
             with self.assertRaises(live_runner.ProcessExecutionFailure) as raised:
                 SubprocessCodex().invoke(
@@ -732,6 +735,192 @@ class RunnerTests(unittest.TestCase):
                 )
 
         self.assertNotIn("secret-writer-detail", repr(raised.exception))
+
+    def test_normal_stdin_writer_owns_dup_and_never_closes_reused_fd(self):
+        invocation = self.invocation()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"returncode": 0}]
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen), mock.patch(
+            "scripts.run_live_eval.os.dup", wraps=os.dup
+        ) as duplicate:
+            SubprocessCodex().invoke(
+                invocation,
+                "prompt",
+                1,
+                max_stdin_bytes=32,
+                max_stdout_bytes=32,
+                max_stderr_bytes=32,
+            )
+
+        process = FakePopen.calls[0]
+        original_closed = process.stdin.closed
+        unrelated_read, unrelated_write = os.pipe()
+        FakePopen.calls.clear()
+        del process
+        gc.collect()
+        unrelated_valid = True
+        try:
+            os.write(unrelated_write, b"x")
+            unrelated_valid = os.read(unrelated_read, 1) == b"x"
+        except OSError:
+            unrelated_valid = False
+        finally:
+            for descriptor in (unrelated_read, unrelated_write):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+        self.assertTrue(original_closed)
+        duplicate.assert_called_once()
+        self.assertTrue(unrelated_valid)
+
+    def test_timeout_cleanup_never_closes_fd_reused_after_original_stream_close(self):
+        invocation = self.invocation()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"pipe_stdin": True, "returncode": None}]
+        raised = []
+
+        def invoke():
+            try:
+                SubprocessCodex().invoke(
+                    invocation,
+                    "x" * (1024 * 1024),
+                    0.2,
+                    max_stdin_bytes=1024 * 1024,
+                    max_stdout_bytes=32,
+                    max_stderr_bytes=32,
+                )
+            except BaseException as error:
+                raised.append(error)
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen), mock.patch(
+            "scripts.run_live_eval.os.killpg"
+        ), mock.patch("scripts.run_live_eval.os.dup", wraps=os.dup) as duplicate:
+            worker = threading.Thread(target=invoke, daemon=True)
+            worker.start()
+            deadline = time.monotonic() + 0.1
+            while not FakePopen.calls and time.monotonic() < deadline:
+                time.sleep(0.005)
+            process = FakePopen.calls[0]
+            while not process.stdin.closed and time.monotonic() < deadline:
+                time.sleep(0.005)
+            original_closed = process.stdin.closed
+            unrelated_read, unrelated_write = os.pipe()
+            reused_original_fd = process.stdin_fd in (unrelated_read, unrelated_write)
+            worker.join(timeout=1)
+
+        FakePopen.calls.clear()
+        del process
+        gc.collect()
+        unrelated_valid = True
+        try:
+            os.write(unrelated_write, b"x")
+            unrelated_valid = os.read(unrelated_read, 1) == b"x"
+        except OSError:
+            unrelated_valid = False
+        finally:
+            for descriptor in (unrelated_read, unrelated_write):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+        self.assertTrue(original_closed)
+        self.assertTrue(reused_original_fd)
+        duplicate.assert_called_once()
+        self.assertEqual(len(raised), 1)
+        self.assertIsInstance(raised[0], InvocationTimeout)
+        self.assertTrue(unrelated_valid)
+
+    def test_stdin_dup_failure_is_sanitized_and_cleans_process_group(self):
+        invocation = self.invocation()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"returncode": None}]
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen), mock.patch(
+            "scripts.run_live_eval.os.dup", side_effect=OSError("secret-dup-detail")
+        ), mock.patch("scripts.run_live_eval.os.killpg") as kill_group:
+            with self.assertRaises(live_runner.ProcessExecutionFailure) as raised:
+                SubprocessCodex().invoke(
+                    invocation,
+                    "prompt",
+                    0.05,
+                    max_stdin_bytes=32,
+                    max_stdout_bytes=32,
+                    max_stderr_bytes=32,
+                )
+
+        self.assertNotIn("secret-dup-detail", repr(raised.exception))
+        self.assertTrue(FakePopen.calls[0].stdin.closed)
+        kill_group.assert_called_once_with(FakePopen.calls[0].pid, signal.SIGTERM)
+
+    def test_writer_thread_start_failure_never_creates_main_owned_dup(self):
+        invocation = self.invocation()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"returncode": None}]
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen), mock.patch(
+            "scripts.run_live_eval.threading.Thread.start",
+            side_effect=RuntimeError("secret-thread-detail"),
+        ), mock.patch("scripts.run_live_eval.os.dup", wraps=os.dup) as duplicate, mock.patch(
+            "scripts.run_live_eval.os.killpg"
+        ) as kill_group:
+            with self.assertRaises(live_runner.ProcessExecutionFailure) as raised:
+                SubprocessCodex().invoke(
+                    invocation,
+                    "prompt",
+                    0.05,
+                    max_stdin_bytes=32,
+                    max_stdout_bytes=32,
+                    max_stderr_bytes=32,
+                )
+
+        self.assertNotIn("secret-thread-detail", repr(raised.exception))
+        duplicate.assert_not_called()
+        self.assertTrue(FakePopen.calls[0].stdin.closed)
+        kill_group.assert_called_once_with(FakePopen.calls[0].pid, signal.SIGTERM)
+
+    def test_original_stdin_close_failure_is_sanitized_and_cleans_group(self):
+        class CloseFailingStream:
+            def __init__(self):
+                self.backing = tempfile.TemporaryFile("w+b")
+
+            def fileno(self):
+                return self.backing.fileno()
+
+            def write(self, value):
+                return self.backing.write(value)
+
+            def close(self):
+                raise RuntimeError("secret-close-detail")
+
+        invocation = self.invocation()
+        stream = CloseFailingStream()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"stdin": stream, "returncode": None}]
+        try:
+            with mock.patch(
+                "scripts.run_live_eval.subprocess.Popen", FakePopen
+            ), mock.patch("scripts.run_live_eval.os.killpg") as kill_group:
+                with self.assertRaises(live_runner.ProcessExecutionFailure) as raised:
+                    SubprocessCodex().invoke(
+                        invocation,
+                        "prompt",
+                        0.05,
+                        max_stdin_bytes=32,
+                        max_stdout_bytes=32,
+                        max_stderr_bytes=32,
+                    )
+
+            self.assertNotIn("secret-close-detail", repr(raised.exception))
+            kill_group.assert_called_once_with(FakePopen.calls[0].pid, signal.SIGTERM)
+        finally:
+            try:
+                stream.backing.close()
+            except OSError:
+                pass
 
     def test_results_and_errors_never_repr_secret_values(self):
         secret = "must-not-appear-secret"
