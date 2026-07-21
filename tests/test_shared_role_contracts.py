@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -260,6 +262,67 @@ Review the requested scope.
         self.assertIn("Do not cross an approval gate", boundary)
         self.assertIn("`handoff_target`", returned)
         self.assertIn("`handoff_reason`", returned)
+
+
+class SharedAdapterAuditTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        configured = os.environ.get("SHARED_AGENTS_ROOT")
+        cls.root = Path(configured) if configured else Path.home() / ".agents"
+        if not cls.root.is_dir():
+            raise unittest.SkipTest(
+                "not_run: shared agent root is unavailable: {}".format(cls.root)
+            )
+        cls.common = cls.root / "common-agents"
+        cls.claude = cls.root / "adapters" / "claude"
+        cls.codex = cls.root / "adapters" / "codex"
+
+    def test_canonical_name_sets_match_common_and_both_adapters(self):
+        common_names = {path.stem for path in self.common.glob("*.md")}
+        claude_adapter_names = {path.stem for path in self.claude.glob("*.md")}
+        codex_adapter_names = {path.stem for path in self.codex.glob("*.toml")}
+        self.assertEqual(common_names, claude_adapter_names)
+        self.assertEqual(common_names, codex_adapter_names)
+
+    def test_adapter_declared_names_match_canonical_filenames(self):
+        for path in sorted(self.claude.glob("*.md")):
+            with self.subTest(adapter="claude", name=path.stem):
+                text = path.read_text(encoding="utf-8")
+                declared = re.search(r"(?m)^name:\s*([^\s]+)\s*$", text)
+                self.assertIsNotNone(declared)
+                self.assertEqual(path.stem, declared.group(1))
+
+        interpreter = Path("/usr/local/bin/python3.12")
+        if not interpreter.is_file():
+            self.skipTest("not_run: /usr/local/bin/python3.12 is unavailable")
+        paths = sorted(self.codex.glob("*.toml"))
+        parser = (
+            "import json,pathlib,sys,tomllib;"
+            "print(json.dumps({p.name:tomllib.loads(p.read_text(encoding='utf-8')) "
+            "for p in map(pathlib.Path,sys.argv[1:])}))"
+        )
+        result = subprocess.run(
+            [str(interpreter), "-c", parser, *(str(path) for path in paths)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        parsed = json.loads(result.stdout)
+        for path in paths:
+            with self.subTest(adapter="codex", name=path.stem):
+                self.assertEqual(path.stem, parsed[path.name]["name"])
+
+    def test_active_codex_agent_links_are_not_broken(self):
+        active = Path.home() / ".codex" / "agents"
+        if not active.is_dir():
+            self.skipTest("not_run: active Codex agent directory is unavailable")
+        broken_codex_links = sorted(
+            path.name
+            for path in active.iterdir()
+            if path.is_symlink() and not path.exists()
+        )
+        self.assertEqual([], broken_codex_links)
 
 
 if __name__ == "__main__":

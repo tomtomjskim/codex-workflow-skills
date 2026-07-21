@@ -1,19 +1,44 @@
 # Reviewer Trigger Matrix
 
-Select reviewer agents from exact changed-surface tags. Do not run every reviewer by default, and do not substitute display labels or locally invented role names for canonical agent names.
+Derive reviewer lenses from exact changed-surface tags. Resolve every lens through
+the canonical registry below. Do not duplicate or override these mappings in a
+review packet.
 
-| Changed-surface tag | Canonical reviewer agents |
+## Canonical Lens Registry
+
+| Reviewer lens | Canonical agent |
 |---|---|
-| `auth`, `authorization`, `roles`, `tenant-boundary`, `secrets`, `file-io`, `shell`, `network` | `security-reviewer` |
-| `data-mutation` | `security-reviewer`, `qa-engineer` |
-| `database`, `migration` | `security-reviewer`, `qa-engineer`, `dba` |
-| `public-api`, `api`, `sdk`, `integration-contract` | `code-reviewer`, `api-reviewer` |
-| `ai-llm`, `tests`, `ci` | `qa-engineer`, `test-coverage-reviewer` |
-| `ui`, `user-flow` | `ux-reviewer`, `accessibility-reviewer`, `qa-engineer` |
+| `accessibility` | `accessibility-reviewer` |
+| `api` | `api-reviewer` |
+| `architecture` | `architect` |
+| `code` | `code-reviewer` |
+| `database` | `dba` |
 | `performance` | `performance-reviewer` |
-| `concurrency` | `performance-reviewer`, `code-reviewer` |
-| `architecture` | `architect`, `code-reviewer` |
+| `qa` | `qa-engineer` |
+| `security` | `security-reviewer` |
+| `test-coverage` | `test-coverage-reviewer` |
+| `ux` | `ux-reviewer` |
 
-The derived `shared_interface` profile additionally requires `api-reviewer`. The CLI's canonical matrix is authoritative for coordination receipts; submitted manifests and contracts cannot replace or narrow it.
+## Changed-Surface Triggers
 
-For a material domain not represented by an exact tag, record the gap and use sequential execution until the plan is revised and validated. For skipped reviewers, record the reason. A required reviewer that is unavailable blocks integration unless the user approves a defer with an owner, reason, and residual risk.
+| Changed-surface tags | Required reviewer lenses |
+|---|---|
+| `auth`, `authorization`, `roles`, `tenant-boundary` | `qa`, `security` |
+| `secrets`, `file-io`, `shell`, `network` | `security` |
+| `data-mutation` | `qa`, `security` |
+| `database`, `migration` | `database`, `qa`, `security` |
+| `public-api`, `api`, `sdk`, `integration-contract` | `api`, `code` |
+| `ai-llm`, `tests`, `ci` | `qa`, `test-coverage` |
+| `ui`, `user-flow` | `accessibility`, `qa`, `ux` |
+| `performance` | `performance` |
+| `concurrency` | `code`, `performance` |
+| `architecture` | `architecture`, `code` |
+
+Add the `api` lens when the derived coordination profile is
+`shared_interface`. Treat this file as the sole reviewer routing source; do not
+accept packet-authored lens or agent substitutions.
+
+Record an unmapped material surface as a routing gap and execute sequentially
+until the mapping is revised and validated. Record a reason for every skipped
+reviewer. Block integration when a required reviewer is unavailable unless the
+user approves a defer receipt with an owner, reason, and residual risk.

@@ -19,6 +19,15 @@ review_packet:
   risk_areas:
   context_sources:
   reviewers_required:
+  reviewer_registry:
+    - lens:
+      canonical_agent:
+      required: true
+      status: pending
+      dispatch_evidence: null
+      completion_evidence: null
+      contract_core_hash:
+      defer_receipt: null
   validation_plan:
     validation_level:
     e2e_decision:
@@ -29,6 +38,16 @@ review_packet:
   open_questions:
   scope_change_policy:
 ```
+
+Derive `reviewer_registry` from `reviewer-trigger-matrix.md`. Initialize every
+required reviewer with `status: pending` and `completion_evidence: null`. Record
+dispatch evidence only after dispatch. Record completion evidence only from the
+reviewer's returned artifact for the current `contract_core_hash`. Do not accept
+self-declared completion or a packet-authored `completed` status.
+
+Use `defer_receipt` only for a user-approved defer that records the owner,
+reason, residual risk, and re-review condition. Mark evidence from another
+contract hash as `stale`.
 
 If the packet is missing:
 
