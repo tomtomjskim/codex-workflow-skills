@@ -1,9 +1,10 @@
 """Fail-closed validation for coordination artifacts and handoffs."""
 
 import copy
-import subprocess
+import re
+import unicodedata
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Dict, List, Optional, Set
 
@@ -49,6 +50,8 @@ def _workstreams(manifest: object) -> List[dict]:
 def _normalize_path(repo_root: Path, value: object) -> str:
     if not isinstance(value, str) or not value:
         raise ValidationError("owned path must be a non-empty string")
+    if not unicodedata.is_normalized("NFC", value):
+        raise ValidationError("path must use Unicode NFC: {}".format(value))
     if any(character in value for character in _GLOB_METACHARACTERS):
         raise ValidationError("glob metacharacter in path: {}".format(value))
     if "\\" in value:
@@ -70,6 +73,30 @@ def _normalize_path(repo_root: Path, value: object) -> str:
         resolved.relative_to(root)
     except ValueError as error:
         raise ValidationError("path escapes repository root: {}".format(value)) from error
+
+    current = root
+    for part in posix_path.parts:
+        if not current.exists():
+            break
+        if not current.is_dir():
+            raise ValidationError("path parent is not a directory: {}".format(value))
+        try:
+            children = tuple(current.iterdir())
+        except OSError as error:
+            raise ValidationError(
+                "path identity cannot be verified: {}".format(value)
+            ) from error
+        exact = next((child for child in children if child.name == part), None)
+        if exact is not None:
+            current = exact
+            continue
+        identity = unicodedata.normalize("NFC", part).casefold()
+        if any(
+            unicodedata.normalize("NFC", child.name).casefold() == identity
+            for child in children
+        ):
+            raise ValidationError("path alias does not match filesystem case: {}".format(value))
+        break
     return normalized
 
 
@@ -109,7 +136,27 @@ def _validate_paths(repo_root: Path, workstreams: List[dict]) -> Dict[str, List[
 
     for index, (path, workstream_id) in enumerate(all_owned_paths):
         for other_path, other_workstream_id in all_owned_paths[index + 1 :]:
-            if path == other_path or path in other_path.parents or other_path in path.parents:
+            identity = PurePosixPath(*(part.casefold() for part in path.parts))
+            other_identity = PurePosixPath(
+                *(part.casefold() for part in other_path.parts)
+            )
+            actual_overlap = (
+                path == other_path
+                or path in other_path.parents
+                or other_path in path.parents
+            )
+            identity_overlap = (
+                identity == other_identity
+                or identity in other_identity.parents
+                or other_identity in identity.parents
+            )
+            if identity_overlap and not actual_overlap:
+                raise ValidationError(
+                    "path alias between {} and {}: {} / {}".format(
+                        workstream_id, other_workstream_id, path, other_path
+                    )
+                )
+            if actual_overlap:
                 raise ValidationError(
                     "path overlap between {} and {}: {} / {}".format(
                         workstream_id, other_workstream_id, path, other_path
@@ -211,34 +258,32 @@ def _validate_contract(
     return core_hash
 
 
-def _checkout_tree_hash(repo_root: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD^{tree}"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValidationError("checkout tree hash unavailable") from error
-    tree_hash = result.stdout.strip()
-    if not tree_hash:
-        raise ValidationError("checkout tree hash unavailable")
-    return tree_hash
+def _validate_checkout_tree_hash(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+        raise ValidationError("checkout tree hash must be 40 or 64 lowercase hex characters")
+    return value
 
 
 def _recorded_at(clock: Callable[[], object]) -> str:
     value = clock()
     if isinstance(value, str):
-        if not value.endswith("Z"):
+        if re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", value
+        ) is None:
+            raise ValidationError("recorded_at must be UTC RFC3339")
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError as error:
+            raise ValidationError("recorded_at must be UTC RFC3339") from error
+        if parsed.utcoffset() != timedelta(0):
             raise ValidationError("recorded_at must be UTC RFC3339")
         return value
     if not isinstance(value, datetime):
-        raise ValidationError("clock must return datetime or UTC RFC3339 string")
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        raise ValidationError("clock must return timezone-aware UTC RFC3339")
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValidationError("recorded_at must be UTC RFC3339")
+    recorded_at = value.isoformat().replace("+00:00", "Z")
+    return _recorded_at(lambda: recorded_at)
 
 
 def validate_coordination(
@@ -286,11 +331,7 @@ def validate_coordination(
     ):
         raise ValidationError("contracted route execution ledger must be frozen")
 
-    tree_hash = checkout_tree_hash
-    if tree_hash is None:
-        tree_hash = _checkout_tree_hash(root)
-    if not isinstance(tree_hash, str) or not tree_hash:
-        raise ValidationError("checkout tree hash must be a non-empty string")
+    tree_hash = _validate_checkout_tree_hash(checkout_tree_hash)
 
     run_factory = run_id_factory or (lambda: str(uuid.uuid4()))
     run_id = run_factory()
@@ -328,7 +369,7 @@ def validate_handoff(
     if not isinstance(receipt, ValidationReceipt):
         raise ValidationError("validation receipt is required")
     owned_values = receipt.normalized_paths.get(workstream_id)
-    if not isinstance(owned_values, list):
+    if not isinstance(owned_values, tuple):
         raise ValidationError("unknown workstream: {}".format(workstream_id))
     if not isinstance(changed_paths, list):
         raise ValidationError("changed paths must be a list")

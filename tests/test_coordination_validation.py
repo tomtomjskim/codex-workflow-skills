@@ -1,6 +1,7 @@
 import copy
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from scripts.workflow_coordination.canonical_json import sha256_id
@@ -37,6 +38,7 @@ TRIGGER_MATRIX = {
     "profile_reviewers": {"shared_interface": ["api-reviewer"]},
     "changed_surface_reviewers": {},
 }
+TREE_HASH = "a" * 40
 
 
 def _contract(prepared=PREPARED):
@@ -137,7 +139,7 @@ class CoordinationValidationTests(unittest.TestCase):
                 PREPARED.inventory,
                 None,
                 trigger_matrix=TRIGGER_MATRIX,
-                checkout_tree_hash="sha256:" + "a" * 64,
+                checkout_tree_hash=TREE_HASH,
             )
 
         receipt = validate_coordination(
@@ -146,23 +148,23 @@ class CoordinationValidationTests(unittest.TestCase):
             PREPARED.inventory,
             _contract(),
             trigger_matrix=TRIGGER_MATRIX,
-            checkout_tree_hash="sha256:" + "a" * 64,
+            checkout_tree_hash=TREE_HASH,
             run_id_factory=lambda: "test-run",
             clock=lambda: "2026-07-21T00:00:00Z",
         )
         self.assertEqual(receipt.manifest_hash, sha256_id(PREPARED.manifest))
         self.assertEqual(receipt.inventory_hash, sha256_id(PREPARED.inventory))
         self.assertEqual(receipt.derived_route, "contracted")
-        self.assertEqual(receipt.derived_profiles, {"shared_interface": True})
+        self.assertEqual(dict(receipt.derived_profiles), {"shared_interface": True})
         self.assertEqual(
             receipt.required_sets["required_handoffs"],
-            [["backend", "frontend"]],
+            (("backend", "frontend"),),
         )
         self.assertEqual(
-            receipt.normalized_paths,
+            receipt.to_dict()["normalized_paths"],
             {"backend": ["src/api"], "frontend": ["src/ui"]},
         )
-        self.assertTrue(receipt.checkout_tree_hash.startswith("sha256:"))
+        self.assertEqual(receipt.checkout_tree_hash, TREE_HASH)
         self.assertTrue(receipt.run_id)
         self.assertTrue(receipt.recorded_at.endswith("Z"))
 
@@ -173,7 +175,7 @@ class CoordinationValidationTests(unittest.TestCase):
                 PREPARED.manifest,
                 PREPARED.inventory,
                 _contract(),
-                checkout_tree_hash="sha256:" + "a" * 64,
+                checkout_tree_hash=TREE_HASH,
             )
         with self.assertRaisesRegex(ValidationError, "current contract required"):
             validate_coordination(
@@ -182,7 +184,7 @@ class CoordinationValidationTests(unittest.TestCase):
                 PREPARED.inventory,
                 None,
                 trigger_matrix=TRIGGER_MATRIX,
-                checkout_tree_hash="sha256:" + "a" * 64,
+                checkout_tree_hash=TREE_HASH,
             )
 
     def test_rejects_broken_ledger_chain_and_hash_domain(self):
@@ -191,7 +193,7 @@ class CoordinationValidationTests(unittest.TestCase):
         entry_body = {
             "contract_core_hash": core_hash,
             "previous_entry_hash": sha256_id(None),
-            "checkout_tree_hash": "sha256:" + "a" * 64,
+            "checkout_tree_hash": TREE_HASH,
             "producer_id": "frontend",
             "command_or_scenario_id": "unit-test",
             "artifact_digest": "sha256:" + "b" * 64,
@@ -209,7 +211,7 @@ class CoordinationValidationTests(unittest.TestCase):
             PREPARED.inventory,
             contract,
             trigger_matrix=TRIGGER_MATRIX,
-            checkout_tree_hash="sha256:" + "a" * 64,
+            checkout_tree_hash=TREE_HASH,
         )
 
         broken = copy.deepcopy(contract)
@@ -223,7 +225,7 @@ class CoordinationValidationTests(unittest.TestCase):
                 PREPARED.inventory,
                 broken,
                 trigger_matrix=TRIGGER_MATRIX,
-                checkout_tree_hash="sha256:" + "a" * 64,
+                checkout_tree_hash=TREE_HASH,
             )
 
     def test_rejects_unfrozen_contracted_contract(self):
@@ -236,7 +238,7 @@ class CoordinationValidationTests(unittest.TestCase):
                 PREPARED.inventory,
                 contract,
                 trigger_matrix=TRIGGER_MATRIX,
-                checkout_tree_hash="sha256:" + "a" * 64,
+                checkout_tree_hash=TREE_HASH,
             )
 
     def test_wraps_noncanonical_artifact_as_validation_error(self):
@@ -249,8 +251,122 @@ class CoordinationValidationTests(unittest.TestCase):
                 invalid_inventory,
                 None,
                 trigger_matrix=TRIGGER_MATRIX,
-                checkout_tree_hash="sha256:" + "a" * 64,
+                checkout_tree_hash=TREE_HASH,
             )
+
+    def test_requires_explicit_real_git_tree_hash(self):
+        for tree_hash in (None, "sha256:" + "a" * 64, "A" * 40, "a" * 39):
+            with self.subTest(tree_hash=tree_hash):
+                with self.assertRaisesRegex(ValidationError, "checkout tree hash"):
+                    validate_coordination(
+                        self.repo_root,
+                        PREPARED.manifest,
+                        PREPARED.inventory,
+                        _contract(),
+                        trigger_matrix=TRIGGER_MATRIX,
+                        checkout_tree_hash=tree_hash,
+                    )
+
+    def test_rejects_case_alias_and_non_nfc_paths(self):
+        alias_plan = copy.deepcopy(PLAN)
+        alias_plan["workstreams"][0]["exclusive_write_paths"] = [
+            "src/UI/component"
+        ]
+        alias_plan["workstreams"][1]["exclusive_write_paths"] = ["src/ui"]
+        alias = prepare_coordination(alias_plan, None)
+        with self.assertRaisesRegex(ValidationError, "path alias"):
+            validate_coordination(
+                self.repo_root, alias.manifest, alias.inventory, None
+            )
+
+        non_nfc = copy.deepcopy(PREPARED.manifest)
+        non_nfc["workstreams"][0]["exclusive_write_paths"] = ["src/cafe\u0301"]
+        with self.assertRaisesRegex(ValidationError, "NFC"):
+            validate_coordination(self.repo_root, non_nfc, PREPARED.inventory, None)
+
+    def test_rejects_existing_filesystem_component_case_alias(self):
+        independent_plan = {
+            "changed_surfaces": [],
+            "workstreams": [
+                {
+                    "id": "wrong-case",
+                    "owner": "wrong-case-owner",
+                    "scope": ["src/UI/future"],
+                    "exclusive_write_paths": ["src/UI/future"],
+                    "depends_on": [],
+                    "consumes": [],
+                    "produces": [],
+                }
+            ],
+        }
+        prepared = prepare_coordination(independent_plan, None)
+        with self.assertRaisesRegex(ValidationError, "path alias"):
+            validate_coordination(
+                self.repo_root, prepared.manifest, prepared.inventory, None
+            )
+
+    def test_rejects_symlink_escape_and_allows_nonexistent_in_root_parent(self):
+        with tempfile.TemporaryDirectory() as outside:
+            (self.repo_root / "src" / "link").symlink_to(Path(outside), target_is_directory=True)
+            escaped_plan = copy.deepcopy(PLAN)
+            escaped_plan["workstreams"][0]["exclusive_write_paths"] = [
+                "src/link/future"
+            ]
+            escaped = prepare_coordination(escaped_plan, None)
+            with self.assertRaisesRegex(ValidationError, "escapes repository root"):
+                validate_coordination(
+                    self.repo_root, escaped.manifest, escaped.inventory, None
+                )
+
+        independent_plan = {
+            "changed_surfaces": [],
+            "workstreams": [
+                {
+                    "id": "future",
+                    "owner": "future-owner",
+                    "scope": ["src/future/component"],
+                    "exclusive_write_paths": ["src/future/component"],
+                    "depends_on": [],
+                    "consumes": [],
+                    "produces": [],
+                }
+            ],
+        }
+        independent = prepare_coordination(independent_plan, None)
+        receipt = validate_coordination(
+            self.repo_root,
+            independent.manifest,
+            independent.inventory,
+            None,
+            trigger_matrix=TRIGGER_MATRIX,
+            checkout_tree_hash=TREE_HASH,
+        )
+        self.assertEqual(
+            receipt.to_dict()["normalized_paths"],
+            {"future": ["src/future/component"]},
+        )
+
+    def test_clock_requires_parseable_rfc3339_utc(self):
+        invalid_clocks = (
+            lambda: datetime(2026, 7, 21, 0, 0, 0),
+            lambda: datetime(
+                2026, 7, 21, 9, 0, 0, tzinfo=timezone(timedelta(hours=9))
+            ),
+            lambda: "not-a-timestampZ",
+            lambda: "2026-07-21 00:00:00Z",
+        )
+        for clock in invalid_clocks:
+            with self.subTest(clock=clock):
+                with self.assertRaisesRegex(ValidationError, "UTC RFC3339"):
+                    validate_coordination(
+                        self.repo_root,
+                        PREPARED.manifest,
+                        PREPARED.inventory,
+                        _contract(),
+                        trigger_matrix=TRIGGER_MATRIX,
+                        checkout_tree_hash=TREE_HASH,
+                        clock=clock,
+                    )
 
 
 if __name__ == "__main__":

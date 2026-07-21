@@ -17,12 +17,13 @@ class HandoffValidationTests(unittest.TestCase):
             manifest_hash="sha256:" + "1" * 64,
             inventory_hash="sha256:" + "2" * 64,
             contract_core_hash=None,
-            checkout_tree_hash="sha256:" + "3" * 64,
+            checkout_tree_hash="3" * 40,
             derived_route="independent",
-            required_sets={},
+            required_sets={"nested": [["value"]]},
             normalized_paths={"frontend": ["src/ui"]},
             run_id="test-run",
             recorded_at="2026-07-21T00:00:00Z",
+            derived_profiles={"shared_interface": False},
         )
 
     def test_handoff_rejects_cross_workstream_write(self):
@@ -47,6 +48,47 @@ class HandoffValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "parent traversal"):
             validate_handoff(
                 self.repo_root, self.receipt, "frontend", ["src/ui/../api.py"]
+            )
+
+    def test_receipt_is_recursively_immutable_and_to_dict_is_detached(self):
+        with self.assertRaises(TypeError):
+            self.receipt.normalized_paths["frontend"] = ("src/api",)
+        with self.assertRaises(AttributeError):
+            self.receipt.normalized_paths["frontend"].append("src/api")
+        with self.assertRaises(TypeError):
+            self.receipt.required_sets["nested"][0][0] = "changed"
+        with self.assertRaises(TypeError):
+            self.receipt.derived_profiles["shared_interface"] = True
+
+        exported = self.receipt.to_dict()
+        exported["normalized_paths"]["frontend"][0] = "src/api"
+        exported["required_sets"]["nested"][0][0] = "changed"
+        exported["derived_profiles"]["shared_interface"] = True
+
+        with self.assertRaisesRegex(ValidationError, "outside owned paths"):
+            validate_handoff(
+                self.repo_root, self.receipt, "frontend", ["src/api/settings.py"]
+            )
+
+    def test_receipt_does_not_alias_constructor_inputs(self):
+        paths = {"frontend": ["src/ui"]}
+        receipt = ValidationReceipt(
+            schema_version=1,
+            manifest_hash="sha256:" + "1" * 64,
+            inventory_hash="sha256:" + "2" * 64,
+            contract_core_hash=None,
+            checkout_tree_hash="3" * 40,
+            derived_route="independent",
+            required_sets={},
+            normalized_paths=paths,
+            run_id="test-run",
+            recorded_at="2026-07-21T00:00:00Z",
+        )
+        paths["frontend"][0] = "src/api"
+
+        with self.assertRaisesRegex(ValidationError, "outside owned paths"):
+            validate_handoff(
+                self.repo_root, receipt, "frontend", ["src/api/settings.py"]
             )
 
 
