@@ -1,13 +1,17 @@
 import hashlib
 import json
-import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import scripts.live_eval.checkout as checkout_module
 from scripts.live_eval.checkout import (
+    canonical_name_key,
     install_checkout_skills,
+    require_unique_canonical_names,
     verify_loaded_checkout,
 )
 
@@ -50,6 +54,9 @@ class CheckoutTests(unittest.TestCase):
             (skill / "references" / "policy.md").write_text(
                 "policy {}\n".format(index), encoding="utf-8"
             )
+        executable = self.repo / "skills" / "workflow" / "run.sh"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o755)
         self.git("init", "-q")
         self.git("config", "user.email", "checkout@example.invalid")
         self.git("config", "user.name", "Checkout Test")
@@ -66,44 +73,79 @@ class CheckoutTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         ).stdout.strip()
 
-    def test_installs_only_expected_skills_and_hashes_them(self):
+    def new_home(self, name):
+        home = self.root / name
+        home.mkdir(mode=0o700)
+        return home
+
+    def test_materializes_only_expected_read_only_skills_from_head_objects(self):
         manifest = install_checkout_skills(self.repo, self.codex_home)
 
-        self.assertEqual(manifest.skill_names, EXPECTED_SKILLS)
-        self.assertEqual(manifest.tree_hash, self.git("rev-parse", "HEAD^{tree}"))
-        self.assertEqual(tuple(manifest.skill_hashes), EXPECTED_SKILLS)
-        self.assertTrue(
-            all(value.startswith("sha256:") for value in manifest.skill_hashes.values())
-        )
-        canonical_plugin = json.dumps(
-            json.loads((self.repo / ".codex-plugin" / "plugin.json").read_text()),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+        object_format = self.git("rev-parse", "--show-object-format")
+        self.assertEqual(manifest.object_format, object_format)
         self.assertEqual(
-            manifest.plugin_manifest_hash,
-            "sha256:" + hashlib.sha256(canonical_plugin).hexdigest(),
+            manifest.tree_hash,
+            "{}:{}".format(object_format, self.git("rev-parse", "HEAD^{tree}")),
         )
+        self.assertEqual(
+            manifest.plugin_blob_oid,
+            "{}:{}".format(
+                object_format,
+                self.git("rev-parse", "HEAD:.codex-plugin/plugin.json"),
+            ),
+        )
+        self.assertEqual(manifest.skill_names, EXPECTED_SKILLS)
+        self.assertEqual(tuple(manifest.skill_hashes), EXPECTED_SKILLS)
+        self.assertEqual(tuple(manifest.materialized_hashes), EXPECTED_SKILLS)
+        for hashes in (manifest.skill_hashes, manifest.materialized_hashes):
+            self.assertTrue(all(value.startswith("sha256:") for value in hashes.values()))
+
         installed = self.codex_home / "skills"
         self.assertEqual(
             tuple(sorted(item.name for item in installed.iterdir())), EXPECTED_SKILLS
         )
         for name in EXPECTED_SKILLS:
-            link = installed / name
-            self.assertTrue(link.is_symlink())
-            self.assertEqual(link.resolve(), (self.repo / "skills" / name).resolve())
+            skill = installed / name
+            self.assertTrue(skill.is_dir())
+            self.assertFalse(skill.is_symlink())
+            self.assertEqual(stat.S_IMODE(skill.stat().st_mode), 0o555)
+        self.assertEqual(
+            (installed / "workflow" / "SKILL.md").read_bytes(),
+            (self.repo / "skills" / "workflow" / "SKILL.md").read_bytes(),
+        )
+        self.assertEqual(
+            stat.S_IMODE((installed / "workflow" / "SKILL.md").stat().st_mode),
+            0o444,
+        )
+        self.assertEqual(
+            stat.S_IMODE((installed / "workflow" / "run.sh").stat().st_mode),
+            0o555,
+        )
 
         result = verify_loaded_checkout(self.repo, self.codex_home)
         self.assertEqual(result.classification, "ready")
         self.assertEqual(result.result, "pass")
         self.assertEqual(result.manifest, manifest)
 
-    def test_reinstall_is_refused_instead_of_overwriting_existing_state(self):
-        install_checkout_skills(self.repo, self.codex_home)
+    def test_plugin_hash_is_canonical_head_blob_content(self):
+        manifest = install_checkout_skills(self.repo, self.codex_home)
+        plugin = subprocess.run(
+            ("git", "cat-file", "blob", "HEAD:.codex-plugin/plugin.json"),
+            cwd=str(self.repo),
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        canonical = json.dumps(
+            json.loads(plugin),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
 
-        with self.assertRaises(ValueError):
-            install_checkout_skills(self.repo, self.codex_home)
+        self.assertEqual(
+            manifest.plugin_manifest_hash,
+            "sha256:" + hashlib.sha256(canonical).hexdigest(),
+        )
 
     def test_dirty_checkout_is_rejected_before_install(self):
         (self.repo / "skills" / "workflow" / "SKILL.md").write_text(
@@ -112,111 +154,95 @@ class CheckoutTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             install_checkout_skills(self.repo, self.codex_home)
-        self.assertFalse((self.codex_home / "skills").exists())
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
 
-    def test_untracked_checkout_content_is_rejected_before_install(self):
-        (self.repo / "skills" / "workflow" / "untracked.md").write_text(
-            "untracked\n", encoding="utf-8"
-        )
-
-        with self.assertRaises(ValueError):
-            install_checkout_skills(self.repo, self.codex_home)
-        self.assertFalse((self.codex_home / "skills").exists())
-
-    def test_ignored_file_inside_skill_is_rejected_before_install(self):
-        (self.repo / ".gitignore").write_text("ignored.md\n", encoding="utf-8")
+    def test_ignored_source_content_is_not_read_or_materialized(self):
+        (self.repo / ".gitignore").write_text("ignored-*\n", encoding="utf-8")
         self.git("add", ".gitignore")
         self.git("commit", "-qm", "ignore fixture")
-        (self.repo / "skills" / "workflow" / "ignored.md").write_text(
-            "ignored but loadable\n", encoding="utf-8"
+        secret = self.root / "outside-secret"
+        secret.write_text("must not be loaded\n", encoding="utf-8")
+        ignored = self.repo / "skills" / "workflow" / "ignored-link"
+        ignored.symlink_to(secret)
+
+        install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertFalse((self.codex_home / "skills" / "workflow" / "ignored-link").exists())
+        self.assertEqual(
+            verify_loaded_checkout(self.repo, self.codex_home).classification, "ready"
         )
 
-        with self.assertRaises(ValueError):
-            install_checkout_skills(self.repo, self.codex_home)
-        self.assertFalse((self.codex_home / "skills").exists())
+    def test_worktree_mutation_after_install_cannot_change_loaded_bytes(self):
+        installed = self.codex_home / "skills" / "workflow" / "SKILL.md"
+        original = (self.repo / "skills" / "workflow" / "SKILL.md").read_bytes()
+        install_checkout_skills(self.repo, self.codex_home)
+        source = self.repo / "skills" / "workflow" / "SKILL.md"
+        source.write_text("changed worktree only\n", encoding="utf-8")
 
-    def test_unexpected_skill_or_copy_blocks_preflight(self):
-        mutations = ("unexpected", "copy")
+        self.assertEqual(installed.read_bytes(), original)
+        self.assertEqual(
+            verify_loaded_checkout(self.repo, self.codex_home).classification, "ready"
+        )
+
+    def test_head_tree_change_after_install_blocks_preflight(self):
+        install_checkout_skills(self.repo, self.codex_home)
+        marker = self.repo / "tracked-marker"
+        marker.write_text("next\n", encoding="utf-8")
+        self.git("add", "tracked-marker")
+        self.git("commit", "-qm", "next")
+
+        result = verify_loaded_checkout(self.repo, self.codex_home)
+
+        self.assertEqual(result.classification, "blocked_isolation")
+
+    def test_changed_mode_content_extra_or_link_blocks_preflight(self):
+        mutations = ("mode", "content", "extra", "link")
         for mutation in mutations:
             with self.subTest(mutation=mutation):
-                home = self.root / "home-{}".format(mutation)
-                home.mkdir()
+                home = self.new_home("home-{}".format(mutation))
                 install_checkout_skills(self.repo, home)
-                if mutation == "unexpected":
-                    (home / "skills" / "surprise").mkdir()
+                target = home / "skills" / "workflow" / "SKILL.md"
+                if mutation == "mode":
+                    target.chmod(0o644)
+                elif mutation == "content":
+                    target.chmod(0o644)
+                    target.write_text("tampered\n", encoding="utf-8")
+                elif mutation == "extra":
+                    directory = home / "skills" / "workflow"
+                    directory.chmod(0o755)
+                    (directory / "extra").write_text("extra\n", encoding="utf-8")
                 else:
-                    link = home / "skills" / "workflow"
-                    link.unlink()
-                    shutil.copytree(self.repo / "skills" / "workflow", link)
+                    target.parent.chmod(0o755)
+                    target.unlink()
+                    target.symlink_to(self.repo / "skills" / "workflow" / "SKILL.md")
 
                 result = verify_loaded_checkout(self.repo, home)
 
                 self.assertEqual(result.classification, "blocked_isolation")
                 self.assertEqual(result.result, "blocked")
 
-    def test_broken_retargeted_or_escaped_link_blocks_preflight(self):
-        mutations = ("broken", "retargeted", "escaped")
-        for mutation in mutations:
-            with self.subTest(mutation=mutation):
-                home = self.root / "home-{}".format(mutation)
-                home.mkdir()
-                install_checkout_skills(self.repo, home)
-                link = home / "skills" / "workflow"
-                link.unlink()
-                if mutation == "broken":
-                    link.symlink_to(self.repo / "skills" / "missing")
-                elif mutation == "retargeted":
-                    link.symlink_to(self.repo / "skills" / "workflow-intake")
-                else:
-                    external = self.root / "external-skill"
-                    external.mkdir(exist_ok=True)
-                    link.symlink_to(external)
+    def test_unexpected_skill_and_tampered_manifest_block_preflight(self):
+        unexpected_home = self.new_home("home-unexpected")
+        install_checkout_skills(self.repo, unexpected_home)
+        skills = unexpected_home / "skills"
+        skills.chmod(0o755)
+        (skills / "surprise").mkdir()
+        self.assertEqual(
+            verify_loaded_checkout(self.repo, unexpected_home).classification,
+            "blocked_isolation",
+        )
 
-                result = verify_loaded_checkout(self.repo, home)
+        manifest_home = self.new_home("home-manifest")
+        install_checkout_skills(self.repo, manifest_home)
+        manifest_path = manifest_home / ".live-eval-checkout.json"
+        manifest_path.chmod(0o600)
+        manifest_path.write_text("{}", encoding="utf-8")
+        self.assertEqual(
+            verify_loaded_checkout(self.repo, manifest_home).classification,
+            "blocked_isolation",
+        )
 
-                self.assertEqual(result.classification, "blocked_isolation")
-
-    def test_changed_file_or_checkout_identity_after_manifest_blocks_preflight(self):
-        mutations = ("skill", "plugin", "head")
-        for mutation in mutations:
-            with self.subTest(mutation=mutation):
-                home = self.root / "home-{}".format(mutation)
-                home.mkdir()
-                install_checkout_skills(self.repo, home)
-                if mutation == "skill":
-                    (self.repo / "skills" / "workflow" / "SKILL.md").write_text(
-                        "changed\n", encoding="utf-8"
-                    )
-                elif mutation == "plugin":
-                    (self.repo / ".codex-plugin" / "plugin.json").write_text(
-                        '{"name":"changed"}\n', encoding="utf-8"
-                    )
-                else:
-                    marker = self.repo / "tracked-marker"
-                    marker.write_text("next\n", encoding="utf-8")
-                    self.git("add", "tracked-marker")
-                    self.git("commit", "-qm", "next")
-
-                result = verify_loaded_checkout(self.repo, home)
-
-                self.assertEqual(result.classification, "blocked_isolation")
-                self.git("reset", "--hard", "-q", "HEAD")
-                if mutation != "head":
-                    self.git("clean", "-fdq")
-
-    def test_case_alias_blocks_preflight(self):
-        install_checkout_skills(self.repo, self.codex_home)
-        alias = self.codex_home / "skills" / "WORKFLOW"
-        try:
-            alias.symlink_to(self.repo / "skills" / "workflow")
-        except FileExistsError:
-            self.skipTest("filesystem is case-insensitive")
-
-        result = verify_loaded_checkout(self.repo, self.codex_home)
-
-        self.assertEqual(result.classification, "blocked_isolation")
-
-    def test_external_symlink_in_skill_is_rejected_without_reading_target(self):
+    def test_tracked_symlink_entry_is_rejected_without_reading_target(self):
         secret = self.root / "outside-secret"
         secret.write_text("must not be read\n", encoding="utf-8")
         external_link = self.repo / "skills" / "workflow" / "external"
@@ -229,19 +255,85 @@ class CheckoutTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             install_checkout_skills(self.repo, self.codex_home)
 
-    def test_nested_external_symlink_escape_is_rejected(self):
-        external = self.root / "external-directory"
-        external.mkdir()
-        (external / "policy.md").write_text("outside\n", encoding="utf-8")
-        bridge = self.repo / "bridge"
-        bridge.symlink_to(external, target_is_directory=True)
-        link = self.repo / "skills" / "workflow" / "nested-escape"
-        link.symlink_to(self.repo / "bridge" / "policy.md")
-        self.git("add", "bridge", "skills/workflow/nested-escape")
-        self.git("commit", "-qm", "nested link escape")
-
+    def test_requires_private_empty_codex_home_without_clobbering(self):
+        occupied = self.new_home("occupied-home")
+        marker = occupied / "marker"
+        marker.write_text("keep\n", encoding="utf-8")
         with self.assertRaises(ValueError):
-            install_checkout_skills(self.repo, self.codex_home)
+            install_checkout_skills(self.repo, occupied)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+
+        permissive = self.new_home("permissive-home")
+        permissive.chmod(0o755)
+        with self.assertRaises(ValueError):
+            install_checkout_skills(self.repo, permissive)
+
+    def test_publish_race_does_not_delete_competing_skills_directory(self):
+        marker = self.codex_home / "skills" / "competitor"
+
+        def competing_publish(_staged, target):
+            target.mkdir()
+            marker.write_text("keep\n", encoding="utf-8")
+            raise FileExistsError("simulated concurrent publisher")
+
+        with patch(
+            "scripts.live_eval.checkout._publish_directory_noreplace",
+            side_effect=competing_publish,
+        ):
+            with self.assertRaises(FileExistsError):
+                install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep\n")
+
+    def test_manifest_race_does_not_delete_competing_manifest(self):
+        original_write = checkout_module._write_exclusive
+        marker = self.codex_home / ".live-eval-checkout.json"
+
+        def competing_write(path, content, mode):
+            if path == marker:
+                marker.write_text("competitor\n", encoding="utf-8")
+                raise FileExistsError("simulated concurrent manifest writer")
+            return original_write(path, content, mode)
+
+        with patch(
+            "scripts.live_eval.checkout._write_exclusive",
+            side_effect=competing_write,
+        ):
+            with self.assertRaises(FileExistsError):
+                install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertEqual(marker.read_text(encoding="utf-8"), "competitor\n")
+
+    def test_head_change_during_materialization_blocks_publish(self):
+        original_verify = checkout_module._verify_materialized
+        changed = []
+
+        def change_head_after_verify(root, snapshot, directory_mode=0o555):
+            result = original_verify(root, snapshot, directory_mode)
+            if not changed and directory_mode == 0o700:
+                marker = self.repo / "concurrent-head-change"
+                marker.write_text("next\n", encoding="utf-8")
+                self.git("add", "concurrent-head-change")
+                self.git("commit", "-qm", "concurrent head change")
+                changed.append(True)
+            return result
+
+        with patch(
+            "scripts.live_eval.checkout._verify_materialized",
+            side_effect=change_head_after_verify,
+        ):
+            with self.assertRaises(ValueError):
+                install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
+
+    def test_canonical_name_key_rejects_case_and_unicode_aliases_deterministically(self):
+        self.assertEqual(canonical_name_key("workflow"), canonical_name_key("WORKFLOW"))
+        self.assertEqual(canonical_name_key("é"), canonical_name_key("e\u0301"))
+        with self.assertRaises(ValueError):
+            require_unique_canonical_names(("workflow", "WORKFLOW"))
+        with self.assertRaises(ValueError):
+            require_unique_canonical_names(("é", "e\u0301"))
 
     def test_source_checkout_is_not_mutated_by_installer(self):
         before = self.git("status", "--porcelain=v1", "--untracked-files=all")
