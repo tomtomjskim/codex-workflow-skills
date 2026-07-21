@@ -117,6 +117,24 @@ ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-l
 
 If a symlink already exists, remove or update that symlink first.
 
+### Shared Agent Adapter Installer
+
+Validate adapter installation against an isolated target before considering a global change. Use the real shared Claude adapter directory only as the source, and use a private temporary directory with a pre-created private target:
+
+```bash
+tmp_root="$(mktemp -d)"
+chmod 700 "$tmp_root"
+mkdir -m 700 "$tmp_root/agents"
+python3 scripts/install_agent_adapters.py \
+  --source-root "$HOME/.agents/adapters/claude" \
+  --target-root "$tmp_root/agents" \
+  --suffix .md
+```
+
+The temporary result should contain exactly 16 direct symlinks to the expected files under `$HOME/.agents/adapters/claude`; remove the temporary directory after verification.
+
+For the real target, `$HOME/.claude/agents` must already exist as a real, non-symlink directory. If it is absent or a symlink, stop without invoking the installer or creating the directory and request a separate preparation approval. When the precondition passes, run only `--dry-run --json` first. The manifest contains exact local paths and is sensitive; keep it in a mode-0700 temporary directory and report only its hash, create/keep counts, and conflicts. A non-dry-run apply is a separate action requiring explicit approval and must not run in the same approval step.
+
 ### Post-install Check
 
 Confirm the skill files are visible:

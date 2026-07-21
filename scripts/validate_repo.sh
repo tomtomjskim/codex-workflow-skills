@@ -45,12 +45,14 @@ require_file docs/sample-workflow-intake.md
 require_file docs/sample-adversarial-review.md
 require_file tests/acceptance-scenarios.md
 require_file scripts/workflow
+require_file scripts/install_agent_adapters.py
 require_file scripts/validate_policy_contracts.py
 require_file scripts/workflow_coordination/canonical_json.py
 require_file scripts/workflow_coordination/reviewer_routing.py
 require_file tests/test_canonical_json.py
 require_file tests/test_policy_contracts.py
 require_file tests/test_workflow_cli.py
+require_file tests/test_install_agent_adapters.py
 require_file skills/workflow-intake/references/parallel-coordination.md
 require_file skills/adversarial-review-loop/references/reviewer-routing.json
 require_file scripts/run_live_eval.py
@@ -81,6 +83,7 @@ run python3 scripts/validate_policy_contracts.py --repo-root .
 run python3 -m unittest tests.test_policy_contracts -v
 run python3 -m unittest discover -s tests -p 'test_*coordination*.py' -v
 run python3 -m unittest tests.test_workflow_cli -v
+run python3 -m unittest tests.test_install_agent_adapters -v
 run python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
 
 require_match '\[sample-workflow-intake\.md\]\(docs/sample-workflow-intake\.md\)' README.md 'workflow intake sample link'
