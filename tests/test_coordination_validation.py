@@ -6,7 +6,11 @@ from pathlib import Path
 
 from scripts.workflow_coordination.canonical_json import sha256_id
 from scripts.workflow_coordination.prepare import prepare_coordination
-from scripts.workflow_coordination.validate import ValidationError, validate_coordination
+from scripts.workflow_coordination.reviewer_routing import ReviewerRouting
+from scripts.workflow_coordination.validate import (
+    ValidationError,
+    validate_coordination as _validate_coordination,
+)
 
 
 PLAN = {
@@ -38,7 +42,19 @@ TRIGGER_MATRIX = {
     "profile_reviewers": {"shared_interface": ["api-reviewer"]},
     "changed_surface_reviewers": {"api": [], "ui": []},
 }
+ROUTING = ReviewerRouting(
+    schema_version=1,
+    lens_agents={"api": "api-reviewer"},
+    profile_lenses={"shared_interface": ("api",)},
+    changed_surface_lenses={"api": (), "ui": ()},
+)
 TREE_HASH = "a" * 40
+
+
+def validate_coordination(*args, **kwargs):
+    if kwargs.get("trigger_matrix") == TRIGGER_MATRIX:
+        kwargs.setdefault("reviewer_routing", ROUTING)
+    return _validate_coordination(*args, **kwargs)
 
 
 def _contract(prepared=PREPARED):
@@ -63,9 +79,9 @@ def _contract(prepared=PREPARED):
     }
     core_hash = sha256_id(core)
     records = (
-        ("handoff", ["backend", "frontend"], "backend"),
-        ("checkpoint", ["backend", "frontend"], "backend"),
-        ("acknowledgement", "frontend", "frontend"),
+        ("handoff", ["backend", "frontend"], "backend-owner"),
+        ("checkpoint", ["backend", "frontend"], "backend-owner"),
+        ("acknowledgement", "frontend", "frontend-owner"),
     )
     entries = []
     previous_hash = sha256_id(None)
@@ -108,6 +124,19 @@ def _contract(prepared=PREPARED):
             ],
         },
     }
+
+
+def _rehash_ledger(contract):
+    previous_hash = sha256_id(None)
+    entry_hashes = []
+    for entry in contract["execution_ledger"]["entries"]:
+        entry["previous_entry_hash"] = previous_hash
+        body = {key: value for key, value in entry.items() if key != "entry_hash"}
+        entry["entry_hash"] = sha256_id(body)
+        previous_hash = entry["entry_hash"]
+        entry_hashes.append(entry["entry_hash"])
+    contract["execution_ledger"]["ledger_hash"] = sha256_id(entry_hashes)
+    return contract
 
 
 class CoordinationValidationTests(unittest.TestCase):
@@ -228,7 +257,7 @@ class CoordinationValidationTests(unittest.TestCase):
         self.assertTrue(receipt.recorded_at.endswith("Z"))
 
     def test_rejects_missing_policy_tree_hash_and_contract(self):
-        with self.assertRaisesRegex(ValidationError, "trigger matrix"):
+        with self.assertRaisesRegex(ValidationError, "reviewer routing authority"):
             validate_coordination(
                 self.repo_root,
                 PREPARED.manifest,
@@ -393,6 +422,77 @@ class CoordinationValidationTests(unittest.TestCase):
                         trigger_matrix=TRIGGER_MATRIX,
                         checkout_tree_hash=TREE_HASH,
                     )
+
+    def test_rejects_unauthorized_and_unverified_evidence_producers(self):
+        cases = []
+        wrong_handoff_owner = _contract()
+        wrong_handoff_owner["execution_ledger"]["entries"][0][
+            "producer_id"
+        ] = "frontend-owner"
+        cases.append((_rehash_ledger(wrong_handoff_owner), "evidence producer"))
+
+        wrong_ack_owner = _contract()
+        wrong_ack_owner["execution_ledger"]["entries"][2][
+            "producer_id"
+        ] = "backend-owner"
+        cases.append((_rehash_ledger(wrong_ack_owner), "evidence producer"))
+
+        unverified = _contract()
+        unverified["execution_ledger"]["entries"][0]["producer_id"] = "unverified"
+        cases.append((_rehash_ledger(unverified), "unverified"))
+
+        for contract, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValidationError, message):
+                    validate_coordination(
+                        self.repo_root,
+                        PREPARED.manifest,
+                        PREPARED.inventory,
+                        contract,
+                        trigger_matrix=TRIGGER_MATRIX,
+                        checkout_tree_hash=TREE_HASH,
+                    )
+
+    def test_reviewer_registry_requires_canonical_lens_agent_pair(self):
+        contract = _contract()
+        contract["execution_ledger"]["reviewer_registry"][0]["lens"] = "security"
+        with self.assertRaisesRegex(ValidationError, "canonical reviewer pair"):
+            validate_coordination(
+                self.repo_root,
+                PREPARED.manifest,
+                PREPARED.inventory,
+                contract,
+                trigger_matrix=TRIGGER_MATRIX,
+                checkout_tree_hash=TREE_HASH,
+            )
+
+    def test_custom_trigger_matrix_requires_matching_routing_authority(self):
+        with self.assertRaisesRegex(ValidationError, "reviewer routing authority"):
+            _validate_coordination(
+                self.repo_root,
+                PREPARED.manifest,
+                PREPARED.inventory,
+                _contract(),
+                trigger_matrix=TRIGGER_MATRIX,
+                checkout_tree_hash=TREE_HASH,
+            )
+
+        mismatched = ReviewerRouting(
+            schema_version=1,
+            lens_agents={"security": "security-reviewer"},
+            profile_lenses={"shared_interface": ("security",)},
+            changed_surface_lenses={"api": (), "ui": ()},
+        )
+        with self.assertRaisesRegex(ValidationError, "reviewer routing authority"):
+            _validate_coordination(
+                self.repo_root,
+                PREPARED.manifest,
+                PREPARED.inventory,
+                _contract(),
+                trigger_matrix=TRIGGER_MATRIX,
+                reviewer_routing=mismatched,
+                checkout_tree_hash=TREE_HASH,
+            )
 
     def test_wraps_noncanonical_artifact_as_validation_error(self):
         invalid_inventory = copy.deepcopy(PREPARED.inventory)

@@ -246,6 +246,7 @@ def handle_validate_coordination(args: argparse.Namespace) -> int:
         inventory,
         contract,
         trigger_matrix=args.trigger_matrix,
+        reviewer_routing=args.reviewer_routing,
         checkout_tree_hash=tree_hash,
     )
     payload = receipt.to_dict()
@@ -339,6 +340,7 @@ def handle_validate_handoff(args: argparse.Namespace) -> int:
         _read_json(args.inventory),
         _read_json(args.contract),
         trigger_matrix=args.trigger_matrix,
+        reviewer_routing=args.reviewer_routing,
         checkout_tree_hash=receipt.checkout_tree_hash,
         run_id_factory=lambda: receipt.run_id,
         clock=lambda: receipt.recorded_at,
@@ -413,7 +415,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         args = parser.parse_args(argv)
         if args.command in ("validate-coordination", "validate-handoff"):
-            args.trigger_matrix = build_trigger_matrix(load_reviewer_routing())
+            args.reviewer_routing = load_reviewer_routing()
+            args.trigger_matrix = build_trigger_matrix(args.reviewer_routing)
         return args.handler(args)
     except (
         ArgumentError,

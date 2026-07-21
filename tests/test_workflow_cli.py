@@ -77,9 +77,8 @@ class WorkflowCLITests(unittest.TestCase):
         )
 
     def _write_contract(self, prepared):
-        matrix = WORKFLOW_MODULE.build_trigger_matrix(
-            WORKFLOW_MODULE.load_reviewer_routing()
-        )
+        routing = WORKFLOW_MODULE.load_reviewer_routing()
+        matrix = WORKFLOW_MODULE.build_trigger_matrix(routing)
         derived = derive_coordination(
             prepared["manifest"],
             prepared["inventory"],
@@ -125,17 +124,21 @@ class WorkflowCLITests(unittest.TestCase):
             },
         }
         core_hash = sha256_id(core)
+        owners = {
+            workstream["id"]: workstream["owner"]
+            for workstream in prepared["manifest"]["workstreams"]
+        }
         records = []
         records.extend(
-            ("handoff", list(edge), edge[0])
+            ("handoff", list(edge), owners[edge[0]])
             for edge in derived.required_handoffs
         )
         records.extend(
-            ("checkpoint", list(edge), edge[0])
+            ("checkpoint", list(edge), owners[edge[0]])
             for edge in derived.required_checkpoints
         )
         records.extend(
-            ("acknowledgement", workstream_id, workstream_id)
+            ("acknowledgement", workstream_id, owners[workstream_id])
             for workstream_id in derived.required_acknowledgements
         )
         entries = []
@@ -169,7 +172,11 @@ class WorkflowCLITests(unittest.TestCase):
                 "integration_gate": {"status": "open"},
                 "reviewer_registry": [
                     {
-                        "lens": reviewer,
+                        "lens": next(
+                            lens
+                            for lens, agent in routing.lens_agents.items()
+                            if agent == reviewer
+                        ),
                         "canonical_agent": reviewer,
                         "required": True,
                         "contract_core_hash": core_hash,
@@ -384,6 +391,41 @@ class WorkflowCLITests(unittest.TestCase):
         self.assertIn("base worktree must be clean", json.loads(dirty.stderr)["error"]["message"])
         self.assertNotEqual(mismatch.returncode, 0)
         self.assertIn("does not match", json.loads(mismatch.stderr)["error"]["message"])
+
+    def test_exclusive_path_overlap_is_structured_fail_closed(self):
+        plan = json.loads(PLAN_FIXTURE.read_text(encoding="utf-8"))
+        plan["workstreams"][1]["exclusive_write_paths"] = ["src"]
+        plan_path = Path(self.temporary_directory.name) / "overlap-plan.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        overlap_out = Path(self.temporary_directory.name) / "overlap-coordination"
+        prepared = run_cli(
+            "prepare-coordination",
+            "--repo-root",
+            self.repo_root,
+            "--plan",
+            plan_path,
+            "--out-dir",
+            overlap_out,
+            "--json",
+        )
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+
+        result = run_cli(
+            "validate-coordination",
+            "--repo-root",
+            self.repo_root,
+            "--manifest",
+            overlap_out / "manifest.json",
+            "--inventory",
+            overlap_out / "inventory.json",
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stderr)
+        self.assertEqual(payload["error"]["type"], "ValidationError")
+        self.assertIn("path overlap", payload["error"]["message"])
+        self.assertEqual(payload["fallback"]["execution"], "sequential")
 
     def test_handoff_rejects_tampered_receipt_fields_and_stale_artifact(self):
         prepared = json.loads(self._prepare().stdout)

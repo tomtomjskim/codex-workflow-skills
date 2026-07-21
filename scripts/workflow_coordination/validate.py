@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Set
 from .canonical_json import CanonicalJSONError, sha256_id
 from .derive import derive_coordination
 from .receipts import ValidationReceipt
+from .reviewer_routing import ReviewerRouting, build_trigger_matrix
 
 
 class ValidationError(ValueError):
@@ -327,12 +328,30 @@ def _required_ledger_records(derived: object) -> Set[object]:
     return records
 
 
+def _validate_reviewer_authority(
+    trigger_matrix: object, reviewer_routing: object
+) -> ReviewerRouting:
+    if not isinstance(reviewer_routing, ReviewerRouting):
+        raise ValidationError("reviewer routing authority is required")
+    if reviewer_routing.schema_version != 1:
+        raise ValidationError("reviewer routing authority is incompatible")
+    if build_trigger_matrix(reviewer_routing) != trigger_matrix:
+        raise ValidationError("reviewer routing authority does not match trigger matrix")
+    if len(set(reviewer_routing.lens_agents.values())) != len(
+        reviewer_routing.lens_agents
+    ):
+        raise ValidationError("reviewer routing authority is incompatible")
+    return reviewer_routing
+
+
 def _validate_contract(
     contract: object,
     manifest_hash: str,
     inventory_hash: str,
     derived: object,
     checkout_tree_hash: str,
+    workstreams: List[dict],
+    reviewer_routing: ReviewerRouting,
 ) -> str:
     contract = _exact_object(contract, _CONTRACT_KEYS, "contract")
     core = contract.get("contract_core")
@@ -350,8 +369,12 @@ def _validate_contract(
         raise ValidationError("initial contract core parent hash must be null")
     if revision > 1:
         _sha256_identifier(parent_hash, "parent contract core hash")
-    _nonempty_string(core.get("contract_owner"), "contract owner")
-    _nonempty_string(core.get("integration_owner"), "integration owner")
+    contract_owner = _nonempty_string(core.get("contract_owner"), "contract owner")
+    integration_owner = _nonempty_string(
+        core.get("integration_owner"), "integration owner"
+    )
+    if contract_owner == "unverified" or integration_owner == "unverified":
+        raise ValidationError("unverified contract authority cannot validate dispatch")
 
     core_hash = _canonical_hash(core)
     if core.get("manifest_hash") != manifest_hash:
@@ -382,7 +405,6 @@ def _validate_contract(
         _canonical_hash(value)
     active_extensions = {
         "shared_interface": "interface_contract",
-        "path_overlap": "path_ownership",
         "integration_dependency": "integration",
     }
     for profile_name, extension_name in active_extensions.items():
@@ -403,6 +425,8 @@ def _validate_contract(
     previous_hash = _canonical_hash(None)
     entry_hashes = []
     completed_records = set()
+    owners = {workstream["id"]: workstream["owner"] for workstream in workstreams}
+    required_records = _required_ledger_records(derived)
     for index, entry in enumerate(entries):
         entry = _exact_object(entry, _ENTRY_KEYS, "ledger entry")
         if entry.get("contract_core_hash") != core_hash:
@@ -418,8 +442,18 @@ def _validate_contract(
         if entry.get("status") not in ("completed", "failed", "stale"):
             raise ValidationError("ledger entry status is invalid")
         record = (entry.get("record_type"), _entry_subject(entry))
-        if record not in _required_ledger_records(derived):
+        if record not in required_records:
             raise ValidationError("unexpected ledger evidence record")
+        producer_id = entry["producer_id"]
+        if producer_id == "unverified":
+            raise ValidationError("unverified evidence producer cannot validate dispatch")
+        record_type, subject_id = record
+        if record_type in ("handoff", "checkpoint"):
+            allowed_producers = {owners[subject_id[0]], integration_owner}
+        else:
+            allowed_producers = {owners[subject_id], contract_owner}
+        if producer_id not in allowed_producers:
+            raise ValidationError("evidence producer is not authorized for record")
         if record in completed_records:
             raise ValidationError("duplicate ledger evidence record")
         if entry["status"] == "completed":
@@ -434,7 +468,7 @@ def _validate_contract(
     if ledger.get("ledger_hash") != _canonical_hash(entry_hashes):
         raise ValidationError("ledger hash mismatch")
 
-    missing_records = _required_ledger_records(derived).difference(completed_records)
+    missing_records = required_records.difference(completed_records)
     if missing_records:
         raise ValidationError("required ledger evidence is missing or incomplete")
 
@@ -450,12 +484,15 @@ def _validate_contract(
     completed_reviewers = set()
     seen_reviewers = set()
     expected_reviewers = set(derived.required_reviewers)
+    canonical_reviewer_pairs = set(reviewer_routing.lens_agents.items())
     for reviewer in registry:
         reviewer = _exact_object(reviewer, _REVIEWER_KEYS, "reviewer registry entry")
         canonical_agent = _nonempty_string(
             reviewer.get("canonical_agent"), "reviewer canonical agent"
         )
-        _nonempty_string(reviewer.get("lens"), "reviewer lens")
+        lens = _nonempty_string(reviewer.get("lens"), "reviewer lens")
+        if (lens, canonical_agent) not in canonical_reviewer_pairs:
+            raise ValidationError("reviewer registry must use canonical reviewer pair")
         if canonical_agent not in expected_reviewers:
             raise ValidationError("unexpected reviewer registry entry")
         if canonical_agent in seen_reviewers:
@@ -520,6 +557,7 @@ def validate_coordination(
     contract: Optional[dict],
     *,
     trigger_matrix: Optional[dict] = None,
+    reviewer_routing: Optional[ReviewerRouting] = None,
     checkout_tree_hash: Optional[str] = None,
     run_id_factory: Optional[Callable[[], object]] = None,
     clock: Optional[Callable[[], object]] = None
@@ -535,6 +573,9 @@ def validate_coordination(
     manifest_hash = _canonical_hash(manifest)
     inventory_hash = _canonical_hash(inventory)
     tree_hash = _validate_checkout_tree_hash(checkout_tree_hash)
+    routing_authority = _validate_reviewer_authority(
+        trigger_matrix, reviewer_routing
+    )
     derived = derive_coordination(
         manifest,
         inventory,
@@ -557,6 +598,8 @@ def validate_coordination(
             inventory_hash,
             derived,
             tree_hash,
+            workstreams,
+            routing_authority,
         )
 
     if contract is None and derived.route == "contracted":

@@ -69,7 +69,8 @@ The workflow must select the smallest route that can catch the relevant failure.
 |---|---|---|---|
 | A0/A1 copy, docs, isolated styling, single-file maintenance | Not used | Existing smallest relevant check | Not used |
 | A2 multi-file, single workstream | Optional lightweight task/test plan | Relevant repository tests | Not used |
-| Concurrent workstreams with a shared interface, overlapping write surface, or explicit integration dependency | Required | Contract schema and handoff checks | Not used by default |
+| Concurrent workstreams with a shared interface or explicit integration dependency | Required | Contract schema and handoff checks | Not used by default |
+| Concurrent workstreams with overlapping exclusive write paths | Not executable in v1; split ownership or serialize, then revalidate | Path-overlap rejection | Not used |
 | Concurrent workstreams with no shared interface, write surface, or integration dependency | Not used; validate the canonical manifest only | Ownership, inventory completeness, and path-disjointness checks | Not used |
 | Public API, auth, database, or shared integration contract | Required when multiple consumers or implementers are involved | Contract and integration checks | Targeted when agent/workflow behavior changed |
 | Shared agent or workflow instruction change | Required only when the change itself creates parallel work | Full deterministic policy checks | Three tagged scenarios by default, five maximum before release |
@@ -203,7 +204,7 @@ Every evidence entry binds to immutable context within the declared trust model:
   "contract_core_hash": "sha256:<canonical-contract-core-hash>",
   "previous_entry_hash": "sha256:<previous-ledger-entry-or-null>",
   "checkout_tree_hash": "<git-tree-or-content-hash>",
-  "producer_id": "<canonical-runtime-agent-id-or-unverified>",
+  "producer_id": "<canonical-runtime-agent-id>",
   "command_or_scenario_id": "<command-or-stable-scenario-id>",
   "artifact_digest": "sha256:<artifact-hash>",
   "run_id": "<unique-run-id>",
@@ -211,17 +212,19 @@ Every evidence entry binds to immutable context within the declared trust model:
 }
 ```
 
-When the runtime cannot provide a canonical agent identity, `producer_id` is
-`unverified`. Session-scoped canonical task IDs are sufficient for ordinary
-handoffs. Explicit user approval is required only for a shared-interface or
-integration contract freeze, a reviewer defer, an authority-owner change, or
-integration closure when the responsible identity is unverified.
+The validator rejects `producer_id: "unverified"`: schema version 1 has no
+authority-defer receipt. A handoff or checkpoint producer must be either the
+source workstream owner or the current integration owner. An acknowledgement
+producer must be either its subject workstream owner or the contract owner.
+Session-scoped canonical task IDs are sufficient only when they equal the
+corresponding canonical owner identity.
 
 `status: frozen` is the entry condition for parallel implementation when the
-validator derives a shared interface, an overlapping write surface, or an
-explicit integration dependency. Completely disjoint workstreams use only the
-validated manifest. Only the derived owner for a shared path may modify shared
-schemas, generated types, route registries, or shared fixtures.
+validator derives a shared interface or an explicit integration dependency.
+Completely disjoint workstreams use only the validated manifest. Overlapping
+exclusive write paths are a diagnostic, blocked-only condition in version 1:
+split the paths or serialize the writers, then rerun validation. Every accepted
+version-1 receipt therefore has `path_overlap: false`.
 
 A contract-core change increments `revision`, moves ledger status to `changed`, and marks
 all earlier handoffs, acknowledgements, and checkpoints `stale`. Integration can
@@ -232,7 +235,7 @@ close only when every required record references the current core hash.
 | Profile and transition | Actor | Prerequisites |
 |---|---|---|
 | independent manifest → dispatch | PM | unique owners; path-disjointness and root-boundary checks pass |
-| path-overlap `draft → frozen` | shared-path owner | path split or serialization decision recorded; affected workstream owners acknowledge; validator passes |
+| path-overlap diagnostic → revalidation | PM | split exclusive paths or serialize writers; revise the manifest; rerun validation before dispatch |
 | shared-interface `draft → frozen` | contract owner | Architect definition and derived consumer approvals complete; API/security review only when the trigger matrix requires it; validator passes |
 | integration-dependency `draft → frozen` | contract owner | derived handoffs, checkpoints, and required reviewers defined; affected owners approve; validator passes |
 | `frozen → changed` | contract owner or approved change requester | change reason and derived affected consumers recorded; revision incremented; prior evidence marked stale |
@@ -250,9 +253,9 @@ conflicts:
 - `shared_interface: true` additionally requires `interface`, affected consumer
   approvals, acknowledgements, compatibility, errors, auth when applicable, and
   consumer-facing examples.
-- `overlapping_write_surface: true` additionally requires a single owner per
-  shared path, an explicit path split or serialization decision, and a handoff.
-  It does not require unrelated interface, auth, or consumer fields.
+- `path_overlap: true` is diagnostic-only and blocks version-1 validation. The
+  `path_ownership` extension is reserved for a future executable profile; it is
+  not active and cannot make an overlapping manifest dispatchable.
 - `integration_dependency: true` additionally requires revision-bound handoffs,
   checkpoints, required reviewers, and the integration gate.
 
@@ -278,7 +281,10 @@ the existing artifact-level rules recommend and authorize it.
   applicable implementation role.
 
 The adversarial review matrix maps changed-surface tags to canonical agent names.
-The validator derives the required reviewer set from that matrix. A manual
+The validator loads that routing artifact as authority, derives the required
+reviewer set from it, and requires the registry to exactly cover each canonical
+`(lens, canonical_agent)` pair. A caller-supplied trigger matrix is accepted only
+when it exactly matches the loaded routing artifact. A manual
 exclusion requires a user-approved defer receipt and residual risk. Reviewer
 execution uses this registry:
 
@@ -600,10 +606,13 @@ conformance remains `not_run` or `partial`.
 - Independent parallel routing requires manifest completeness verified against
   an approved plan/repository inventory or actual diff; otherwise execution is
   sequential unless uncertainty is explicitly approved.
-- Concurrent workstreams with a shared interface, overlapping write surface, or
-  integration dependency are derived by the validator and cannot start until the
+- Concurrent workstreams with a shared interface or integration dependency are
+  derived by the validator and cannot start until the
   current contract core is frozen, the validator issues a current-core-hash
   receipt, and write ownership is unambiguous.
+- Overlapping exclusive write paths are blocked in version 1; the paths must be
+  split or the writers serialized and the revised manifest revalidated. An
+  accepted receipt always records `path_overlap: false`.
 - Contract changes invalidate affected handoffs until acknowledgement and
   revalidation are recorded.
 - The integration gate accepts only current-core-hash handoffs,

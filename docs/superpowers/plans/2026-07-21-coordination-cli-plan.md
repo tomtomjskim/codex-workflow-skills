@@ -230,6 +230,10 @@ def derive_coordination(manifest: dict, inventory: dict, trigger_matrix: dict) -
     """Derive all gate inputs; never accept submitted route or required sets."""
 ```
 
+`path_overlap` remains a derivation diagnostic in version 1. It is not an
+executable contracted profile: validation must reject it so callers split the
+exclusive paths or serialize the writers before deriving a dispatchable route.
+
 - [ ] **Step 4: Run the tests and verify GREEN**
 
 Run: `python3 -m unittest tests.test_coordination_derivation -v`
@@ -310,7 +314,14 @@ def validate_handoff(repo_root: Path, receipt: ValidationReceipt, workstream_id:
 
 For the first release, reject glob metacharacters, absolute paths, `..`,
 nonexistent parents outside root, duplicate owners, cycles, stale core hashes,
-and submitted required sets that differ from derivation.
+submitted required sets that differ from derivation, and exact or ancestor
+exclusive-path overlap. Overlap must return a structured blocked error with the
+split-or-serialize fallback; any accepted receipt has `path_overlap: false`.
+
+Validation also receives the loaded canonical reviewer-routing artifact. It
+rejects a trigger matrix that does not exactly derive from that artifact,
+requires the reviewer registry's exact canonical `(lens, agent)` coverage, and
+rejects `unverified` or unauthorized evidence producers.
 
 - [ ] **Step 4: Run the tests and verify GREEN**
 
