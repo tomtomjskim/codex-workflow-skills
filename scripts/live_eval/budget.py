@@ -70,9 +70,13 @@ class Budget:
     """Tracks call, elapsed-time, and concurrency limits for one run."""
 
     TARGETED_MAX_CALLS = 5
-    TARGETED_MAX_SECONDS = 300.0
+    TARGETED_MAX_SECONDS = 600.0
     TARGETED_CONCURRENCY = 1
     TARGETED_MAX_RAW_BYTES = 1024 * 1024
+    RELEASE_MAX_CALLS = 30
+    RELEASE_MAX_SECONDS = 2700.0
+    RELEASE_CONCURRENCY = 2
+    RELEASE_MAX_RAW_BYTES = 1024 * 1024
 
     def __init__(
         self,
@@ -113,6 +117,20 @@ class Budget:
                 cls.TARGETED_MAX_SECONDS,
                 cls.TARGETED_CONCURRENCY,
                 cls.TARGETED_MAX_RAW_BYTES,
+            ),
+            clock=clock,
+        )
+
+    @classmethod
+    def release_suite(
+        cls, *, clock: Callable[[], float] = time.monotonic
+    ) -> "Budget":
+        return cls(
+            BudgetPolicy(
+                cls.RELEASE_MAX_CALLS,
+                cls.RELEASE_MAX_SECONDS,
+                cls.RELEASE_CONCURRENCY,
+                cls.RELEASE_MAX_RAW_BYTES,
             ),
             clock=clock,
         )

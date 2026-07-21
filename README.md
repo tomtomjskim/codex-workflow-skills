@@ -309,7 +309,17 @@ python3 scripts/run_live_eval.py --tags workflow-intake --model gpt-5.6-sol --dr
 
 Successful dry-run output reports `status=preflight_only` and `model_calls=0`. This is planning evidence, not model-quality evidence.
 
+Targeted execution selects at most three scenarios and is bounded to five model calls, 600 seconds, and concurrency one. Release execution selects at most 26 scenarios and is bounded to 30 model calls, 2,700 seconds, and concurrency two. Release planning remains safe without approval because `--dry-run` cannot make a model call:
+
+```bash
+python3 scripts/run_live_eval.py --release-suite --dry-run
+```
+
+A live release suite is a separate operator-approved action and requires both `--release-suite` and `--approve-release-suite`. Omitting the approval flag blocks before credential or executable checks. The flag is invalid without release-suite selection.
+
 Without `--dry-run`, the runner is an explicit live operation. It refuses execution unless `OPENAI_API_KEY` is present and a `codex` executable is available. Live execution creates a private isolated runtime, installs and seals the exact clean-HEAD skill checkout, and performs a final isolation recheck inside every model-call budget lease. Production execution remains blocked when the runtime cannot prove the required network, MCP, plugin, hook, and unexpected-skill isolation capabilities. Blocked runs without retained evidence clean up their owned runtime; assertion or completed runs retain only redacted mode-0600 JSONL output artifacts and report `manual_cleanup_required=true` with the artifact path. Repository tests and `scripts/validate_repo.sh` never perform a live model call.
+
+`scripts/validate_repo.sh` always runs full repository-owned test discovery. External shared-agent contract and adapter audits are reported as `not_run` unless `SHARED_AGENTS_ROOT` is explicitly configured; the environment-independent reviewer mutation tests still run on every validation.
 
 ## Release History
 

@@ -83,10 +83,11 @@ run git diff --check
 run python3 scripts/validate_policy_contracts.py --repo-root .
 run python3 -m unittest tests.test_policy_contracts -v
 run python3 -m unittest tests.test_git_changes -v
-run python3 -m unittest discover -s tests -p 'test_*coordination*.py' -v
-run python3 -m unittest tests.test_workflow_cli -v
-run python3 -m unittest tests.test_install_agent_adapters -v
-run python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
+if [ -z "${SHARED_AGENTS_ROOT:-}" ]; then
+  printf 'not_run: external shared-agent audit requires SHARED_AGENTS_ROOT\n'
+fi
+# Full discovery includes tests.test_workflow_cli and every other repository-owned test.
+run python3 -m unittest discover -s tests -v
 
 require_match '\[sample-workflow-intake\.md\]\(docs/sample-workflow-intake\.md\)' README.md 'workflow intake sample link'
 require_match '\[sample-adversarial-review\.md\]\(docs/sample-adversarial-review\.md\)' README.md 'adversarial review sample link'

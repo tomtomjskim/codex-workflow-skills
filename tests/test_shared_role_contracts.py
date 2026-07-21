@@ -131,25 +131,7 @@ def reviewer_contract_violations(text):
     return violations
 
 
-class SharedRoleContractTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        configured = os.environ.get("SHARED_AGENTS_ROOT")
-        if not configured:
-            raise unittest.SkipTest("SHARED_AGENTS_ROOT is not configured")
-        cls.common = Path(configured) / "common-agents"
-
-    def read_role(self, role):
-        return (self.common / "{}.md".format(role)).read_text(encoding="utf-8")
-
-    def test_reviewers_are_unconditionally_read_only_with_handoffs(self):
-        for role in REVIEWER_ROLES:
-            with self.subTest(role=role):
-                text = self.read_role(role)
-                returned = section(text, "Return")
-                self.assertEqual([], reviewer_contract_violations(text))
-                self.assertIn(HANDOFF_TARGET, returned)
-                self.assertIn(HANDOFF_REASON, returned)
+class ReviewerContractMutationTests(unittest.TestCase):
 
     def test_reviewer_authority_mutations_cannot_enable_direct_edits(self):
         valid = """# Reviewer
@@ -262,6 +244,29 @@ Review the requested scope.
                 )
                 self.assertNotEqual([], reviewer_contract_violations(text))
 
+
+class SharedRoleContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        configured = os.environ.get("SHARED_AGENTS_ROOT")
+        if not configured:
+            raise unittest.SkipTest(
+                "not_run: SHARED_AGENTS_ROOT is not configured"
+            )
+        cls.common = Path(configured) / "common-agents"
+
+    def read_role(self, role):
+        return (self.common / "{}.md".format(role)).read_text(encoding="utf-8")
+
+    def test_reviewers_are_unconditionally_read_only_with_handoffs(self):
+        for role in REVIEWER_ROLES:
+            with self.subTest(role=role):
+                text = self.read_role(role)
+                returned = section(text, "Return")
+                self.assertEqual([], reviewer_contract_violations(text))
+                self.assertIn(HANDOFF_TARGET, returned)
+                self.assertIn(HANDOFF_REASON, returned)
+
     def test_qa_and_coverage_have_distinct_ownership(self):
         qa = self.read_role("qa-engineer")
         coverage = self.read_role("test-coverage-reviewer")
@@ -288,7 +293,11 @@ class SharedAdapterAuditTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         configured = os.environ.get("SHARED_AGENTS_ROOT")
-        cls.root = Path(configured) if configured else Path.home() / ".agents"
+        if not configured:
+            raise unittest.SkipTest(
+                "not_run: SHARED_AGENTS_ROOT is not configured"
+            )
+        cls.root = Path(configured)
         if not cls.root.is_dir():
             raise unittest.SkipTest(
                 "not_run: shared agent root is unavailable: {}".format(cls.root)

@@ -20,7 +20,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.live_eval.artifacts import RedactingWriter, RedactionError
-from scripts.live_eval.budget import Budget, BudgetExceeded, BudgetPolicy
+from scripts.live_eval.budget import Budget, BudgetExceeded
 from scripts.live_eval.checkout import (
     CheckoutManifest,
     install_checkout_skills,
@@ -48,6 +48,8 @@ from scripts.live_eval.scenarios import (
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_MODELS = (DEFAULT_MODEL,)
 DEFAULT_API_KEY_ENV_NAME = "OPENAI_API_KEY"
+TARGETED_MAX_SCENARIOS = 3
+RELEASE_MAX_SCENARIOS = 26
 CHECKOUT_ENTRIES = (".live-eval-checkout.json", "skills")
 REQUIRED_FLAGS = frozenset(
     {
@@ -143,6 +145,7 @@ class EvalRequest:
     scenario_ids: Tuple[str, ...] = ()
     tags: Tuple[str, ...] = ()
     release_suite: bool = False
+    release_approved: bool = False
     model: str = DEFAULT_MODEL
     dry_run_only: bool = False
     repo_root: Optional[Path] = None
@@ -244,6 +247,12 @@ def _validate_and_select(request: EvalRequest) -> Tuple[Scenario, ...]:
     modes = sum(bool(value) for value in (request.scenario_ids, request.tags, request.release_suite))
     if modes > 1:
         raise ValueError("scenario IDs, tags, and release suite are mutually exclusive")
+    if not isinstance(request.release_approved, bool):
+        raise ValueError("release approval must be a boolean")
+    if request.release_approved and not request.release_suite:
+        raise ValueError("release suite approval requires release suite selection")
+    if request.release_suite and not request.dry_run_only and not request.release_approved:
+        raise ValueError("live release suite approval is required")
     corpus = load_scenarios(request.scenario_path or _default_scenario_path())
     if request.scenario_ids:
         if len(set(request.scenario_ids)) != len(request.scenario_ids):
@@ -253,11 +262,17 @@ def _validate_and_select(request: EvalRequest) -> Tuple[Scenario, ...]:
         except KeyError as error:
             raise ValueError("unknown scenario ID") from None
     elif request.release_suite:
-        selected = select_scenarios(corpus, (), limit=max(1, len(corpus)))
+        if len(corpus) > RELEASE_MAX_SCENARIOS:
+            raise ValueError("release scenario limit exceeded")
+        selected = select_scenarios(corpus, (), limit=RELEASE_MAX_SCENARIOS)
     else:
-        selected = select_scenarios(corpus, request.tags, limit=3)
+        selected = select_scenarios(
+            corpus, request.tags, limit=TARGETED_MAX_SCENARIOS
+        )
     if not selected:
         raise ValueError("no scenarios selected")
+    if not request.release_suite and len(selected) > TARGETED_MAX_SCENARIOS:
+        raise ValueError("targeted scenario limit exceeded")
     return selected
 
 
@@ -286,13 +301,7 @@ def run_eval(request: EvalRequest, codex: CodexProcess) -> EvalResult:
     ):
         return EvalResult("blocked_preflight", "blocked", 0, 0, manifest)
 
-    policy = BudgetPolicy(
-        max_calls=max(1, len(selected) * 2),
-        max_seconds=float(max(1, sum(item.timeout_seconds for item in selected) * 2)),
-        concurrency=1,
-        max_raw_bytes=1024 * 1024,
-    )
-    budget = Budget(policy)
+    budget = Budget.release_suite() if request.release_suite else Budget.targeted()
     results = []
     tree_hash = None
     for scenario in selected:
@@ -1082,10 +1091,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--scenario", action="append", default=[])
     parser.add_argument("--tags", action="append", default=[])
     parser.add_argument("--release-suite", action="store_true")
+    parser.add_argument("--approve-release-suite", action="store_true")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args(argv)
     owned_temp_root = None
+    if arguments.approve_release_suite and not arguments.release_suite:
+        print(
+            json.dumps(
+                {
+                    "status": "blocked_request",
+                    "verification_result": "blocked",
+                    "attempts": 0,
+                    "model_calls": 0,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 2
+    if (
+        arguments.release_suite
+        and not arguments.dry_run
+        and not arguments.approve_release_suite
+    ):
+        print(
+            json.dumps(
+                {
+                    "status": "blocked_release_approval",
+                    "verification_result": "blocked",
+                    "attempts": 0,
+                    "model_calls": 0,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 2
     if arguments.dry_run:
         request = EvalRequest.dry_run(
             scenario_ids=arguments.scenario,
@@ -1112,6 +1154,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             scenario_ids=tuple(arguments.scenario),
             tags=tuple(arguments.tags),
             release_suite=arguments.release_suite,
+            release_approved=arguments.approve_release_suite,
             model=arguments.model,
             repo_root=Path.cwd(),
             temp_root=temp_root,

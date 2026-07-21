@@ -42,10 +42,26 @@ class BudgetTests(unittest.TestCase):
     def test_targeted_budget_blocks_sixth_call_without_off_by_one(self):
         budget = Budget.targeted()
 
+        self.assertEqual(
+            budget.policy,
+            BudgetPolicy(5, 600.0, 1, 1024 * 1024),
+        )
+
         for _ in range(5):
             self.assertEqual(budget.next_decision(), "allowed")
             budget.consume_call()
 
+        self.assertEqual(budget.next_decision(), "blocked_budget")
+
+    def test_release_budget_has_approved_fixed_limits_and_blocks_thirty_first_call(self):
+        budget = Budget.release_suite()
+
+        self.assertEqual(
+            budget.policy,
+            BudgetPolicy(30, 2700.0, 2, 1024 * 1024),
+        )
+        for _ in range(30):
+            budget.consume_call()
         self.assertEqual(budget.next_decision(), "blocked_budget")
 
     def test_timeout_uses_injected_monotonic_clock(self):

@@ -16,6 +16,7 @@ from unittest import mock
 import scripts.run_live_eval as live_runner
 from scripts.live_eval.isolation import CliCapabilities
 from scripts.live_eval.isolation import EvalConfig, build_invocation
+from scripts.live_eval.budget import BudgetPolicy
 from scripts.run_live_eval import (
     EvalResult,
     EvalRequest,
@@ -307,6 +308,65 @@ class RunnerTests(unittest.TestCase):
         self.assertGreater(len(result.manifest.scenario_ids), 3)
         self.assertEqual(result.model_calls, 0)
         self.assertEqual(fake.invoked, [])
+
+    def test_targeted_selection_rejects_more_than_three_scenarios(self):
+        corpus = live_runner.load_scenarios(self.scenarios)
+
+        with self.assertRaisesRegex(ValueError, "targeted scenario limit"):
+            run_eval(
+                EvalRequest.dry_run(scenario_ids=tuple(corpus)[:4]),
+                FakeCodex(),
+            )
+
+    def test_live_release_requires_approval_but_dry_run_does_not(self):
+        unapproved = self.request(
+            scenario_ids=(),
+            release_suite=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "release suite approval"):
+            run_eval(unapproved, FakeCodex())
+
+        planned = run_eval(EvalRequest.dry_run(release_suite=True), FakeCodex())
+        self.assertEqual(len(planned.manifest.scenario_ids), 26)
+        self.assertEqual(planned.model_calls, 0)
+
+    def test_runner_uses_fixed_targeted_and_release_budget_factories(self):
+        captured = []
+
+        def complete(_request, scenario, _codex, budget):
+            captured.append(budget.policy)
+            return (
+                live_runner.ScenarioEvalResult(
+                    scenario.scenario_id,
+                    "completed",
+                    "pass",
+                    1,
+                    1,
+                ),
+                None,
+            )
+
+        corpus = live_runner.load_scenarios(self.scenarios)
+        targeted_ids = tuple(corpus)[:3]
+        with mock.patch("scripts.run_live_eval._run_scenario", side_effect=complete):
+            targeted = run_eval(self.request(scenario_ids=targeted_ids), FakeCodex())
+        self.assertEqual(targeted.verification_result, "pass")
+        self.assertEqual(set(captured), {BudgetPolicy(5, 600.0, 1, 1024 * 1024)})
+
+        captured.clear()
+        with mock.patch("scripts.run_live_eval._run_scenario", side_effect=complete):
+            release = run_eval(
+                self.request(
+                    scenario_ids=(),
+                    release_suite=True,
+                    release_approved=True,
+                ),
+                FakeCodex(),
+            )
+        self.assertEqual(release.verification_result, "pass")
+        self.assertEqual(len(release.manifest.scenario_ids), 26)
+        self.assertEqual(set(captured), {BudgetPolicy(30, 2700.0, 2, 1024 * 1024)})
 
     def test_live_run_uses_same_sealed_invocation_and_asserts_redacted_response(self):
         fake = FakeCodex(
@@ -1029,6 +1089,31 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(payload["status"], "preflight_only")
         self.assertEqual(payload["model_calls"], 0)
 
+    def test_cli_live_release_requires_explicit_approval_before_auth_or_process(self):
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(output):
+            exit_code = main(["--release-suite"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(payload["status"], "blocked_release_approval")
+        self.assertEqual(payload["model_calls"], 0)
+
+    def test_cli_release_dry_run_needs_no_approval_and_approval_is_release_only(self):
+        dry_output = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True), redirect_stdout(dry_output):
+            dry_exit = main(["--release-suite", "--dry-run"])
+        self.assertEqual(dry_exit, 0)
+        self.assertEqual(json.loads(dry_output.getvalue())["model_calls"], 0)
+
+        invalid_output = io.StringIO()
+        with redirect_stdout(invalid_output):
+            invalid_exit = main(["--approve-release-suite", "--dry-run"])
+        self.assertEqual(invalid_exit, 2)
+        self.assertEqual(
+            json.loads(invalid_output.getvalue())["status"], "blocked_request"
+        )
+
     def test_cli_removes_owned_temp_root_when_no_artifact_is_retained(self):
         cli_temp_root = self.runtime / "cli-owned-root"
 
@@ -1150,7 +1235,7 @@ class RunnerTests(unittest.TestCase):
         report = (root / "docs" / "forward-test-report.md").read_text(encoding="utf-8")
 
         self.assertIn("require_file scripts/run_live_eval.py", validation)
-        self.assertIn("test_live_eval_*.py", validation)
+        self.assertIn("unittest discover -s tests -v", validation)
         self.assertIn("preflight_only", readme)
         self.assertIn("model_calls=0", readme)
         self.assertIn("live model execution: not_run", report)
