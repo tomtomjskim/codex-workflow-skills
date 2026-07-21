@@ -1,225 +1,348 @@
+import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.live_eval.isolation import (
     CliCapabilities,
     EvalConfig,
-    Invocation,
     build_invocation,
+    is_credential_like_name,
     preflight_auth,
     preflight_isolation,
+    toml_string,
 )
+
+
+SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+REQUIRED_FLAGS = frozenset(
+    {
+        "-a",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--output-schema",
+        "--sandbox",
+        "--strict-config",
+        "-c",
+    }
+)
+
+
+class RaisingCapabilities:
+    @property
+    def supported_flags(self):
+        raise RuntimeError("malformed capability object")
 
 
 class IsolationTests(unittest.TestCase):
     def setUp(self):
-        self.temporary_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary_directory.cleanup)
-        root = Path(self.temporary_directory.name)
-        self.codex_home = root / "codex-home"
-        self.cwd = root / "neutral-cwd"
-        self.schema = root / "response.schema.json"
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name).resolve()
+        self.temp_root = root / "trusted-temp"
+        self.temp_root.mkdir(mode=0o700)
+        self.codex = root / "codex"
+        self.codex.write_text("fake executable", encoding="utf-8")
+        self.codex.chmod(0o700)
         self.config = EvalConfig(
-            codex_executable=Path("/opt/bin/codex"),
+            codex_executable=self.codex,
             model="gpt-5.4",
             model_allowlist=("gpt-5.4",),
-            codex_home=self.codex_home,
-            cwd=self.cwd,
-            api_key_env_name="OPENAI_API_KEY",
+            temp_root=self.temp_root,
             api_key="process-local-secret",
-            output_schema=self.schema,
-            process_env={
-                "PATH": "/usr/bin:/bin",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "aws-secret",
-                "TERM": "xterm-256color",
-                "HOME": "/neutral-home",
-                "OPENAI_API_KEY": "ambient-secret",
-                "AWS_SECRET_ACCESS_KEY": "aws-secret",
-                "DATABASE_URL": "postgres://secret",
-                "SAFE_BUT_SECRET_VALUE": "process-local-secret",
-            },
         )
 
-    def test_builds_fail_closed_codex_command(self):
+    def capabilities(self, invocation, **overrides):
+        values = {
+            "selected_executable": invocation.executable,
+            "selected_executable_identity": invocation.executable_identity,
+            "cli_version": (0, 142, 4),
+            "supported_flags": REQUIRED_FLAGS,
+            "argv_digest": invocation.argv_digest,
+            "child_env_policy_id": invocation.child_env_policy_id,
+            "child_env_policy_digest": invocation.child_env_policy_digest,
+            "non_profile_child_env": True,
+            "network_disabled": True,
+            "mcp_disabled": True,
+            "plugins_disabled": True,
+            "hooks_disabled": True,
+            "unexpected_skills_absent": True,
+        }
+        values.update(overrides)
+        return CliCapabilities(**values)
+
+    def test_builds_exact_canonical_command_with_enforced_child_environment(self):
+        invocation = build_invocation(self.config)
+        expected_set = (
+            'shell_environment_policy.set={PATH="%s",HOME=%s,TMPDIR=%s}'
+            % (
+                SAFE_PATH,
+                toml_string(str(invocation.codex_home)),
+                toml_string(str(invocation.tmpdir)),
+            )
+        )
+
+        self.assertEqual(
+            invocation.argv,
+            (
+                str(self.codex),
+                "-a",
+                "never",
+                "exec",
+                "--strict-config",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--sandbox",
+                "read-only",
+                "--model",
+                "gpt-5.4",
+                "--output-schema",
+                str(invocation.output_schema),
+                "-c",
+                'shell_environment_policy.inherit="none"',
+                "-c",
+                "shell_environment_policy.experimental_use_profile=false",
+                "-c",
+                "shell_environment_policy.ignore_default_excludes=false",
+                "-c",
+                expected_set,
+            ),
+        )
+
+    def test_creates_fresh_private_run_paths_under_trusted_root(self):
         invocation = build_invocation(self.config)
 
+        self.assertEqual(invocation.run_dir.parent, self.temp_root)
         self.assertEqual(
-            invocation.argv[:4],
-            ("/opt/bin/codex", "-a", "never", "exec"),
+            {item.name for item in invocation.run_dir.iterdir()},
+            {"codex-home", "cwd", "tmp"},
         )
-        self.assertIn("--ephemeral", invocation.argv)
-        self.assertIn("--ignore-user-config", invocation.argv)
-        self.assertIn("--ignore-rules", invocation.argv)
-        self.assertIn("read-only", invocation.argv)
-        self.assertIn("--output-schema", invocation.argv)
-        self.assertEqual(
-            invocation.argv[invocation.argv.index("--output-schema") + 1],
-            str(self.schema),
-        )
+        for path in (
+            invocation.run_dir,
+            invocation.codex_home,
+            invocation.cwd,
+            invocation.tmpdir,
+        ):
+            self.assertTrue(path.is_dir())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+        self.assertEqual(invocation.output_schema.parent, invocation.run_dir)
+        self.assertFalse(invocation.output_schema.exists())
 
-    def test_builds_neutral_directories_and_minimal_transport_environment(self):
+    def test_transport_and_tool_environments_are_exact_and_immutable(self):
         invocation = build_invocation(self.config)
+        expected_tool = {
+            "PATH": SAFE_PATH,
+            "HOME": str(invocation.codex_home),
+            "TMPDIR": str(invocation.tmpdir),
+        }
 
-        self.assertTrue(invocation.codex_home.is_dir())
-        self.assertTrue(invocation.cwd.is_dir())
-        self.assertEqual(invocation.transport_env["CODEX_HOME"], str(self.codex_home))
+        self.assertEqual(dict(invocation.tool_env), expected_tool)
         self.assertEqual(
-            invocation.transport_env["OPENAI_API_KEY"], "process-local-secret"
-        )
-        self.assertEqual(invocation.transport_env["PATH"], "/usr/bin:/bin")
-        self.assertEqual(invocation.transport_env["LANG"], "C.UTF-8")
-        self.assertNotIn("HOME", invocation.transport_env)
-        self.assertNotIn("AWS_SECRET_ACCESS_KEY", invocation.transport_env)
-        self.assertNotIn("aws-secret", invocation.transport_env.values())
-
-    def test_agent_environment_excludes_key_name_value_and_credentials(self):
-        invocation = build_invocation(self.config)
-
-        self.assertEqual(
-            invocation.tool_env,
+            dict(invocation.transport_env),
             {
-                "PATH": "/usr/bin:/bin",
-                "LANG": "C.UTF-8",
-                "TERM": "xterm-256color",
+                **expected_tool,
+                "CODEX_HOME": str(invocation.codex_home),
+                "OPENAI_API_KEY": "process-local-secret",
             },
         )
-        self.assertNotIn("OPENAI_API_KEY", invocation.tool_env)
-        self.assertNotIn("process-local-secret", invocation.tool_env.values())
+        with self.assertRaises(TypeError):
+            invocation.tool_env["PATH"] = "tampered"
+        with self.assertRaises(TypeError):
+            invocation.transport_env["TOKEN"] = "tampered"
 
-    def test_rejects_model_outside_allowlist(self):
-        config = EvalConfig(
-            **{
-                **self.config.__dict__,
-                "model": "unapproved-model",
-            }
+    def test_secret_fields_and_environment_mappings_are_not_in_repr(self):
+        invocation = build_invocation(self.config)
+
+        self.assertNotIn("process-local-secret", repr(self.config))
+        self.assertNotIn("process-local-secret", repr(invocation))
+        self.assertNotIn("OPENAI_API_KEY", repr(invocation))
+
+    def test_rejects_symlink_or_non_directory_temp_root(self):
+        target = self.temp_root.parent / "target"
+        target.mkdir()
+        symlink = self.temp_root.parent / "linked-root"
+        symlink.symlink_to(target, target_is_directory=True)
+        file_root = self.temp_root.parent / "file-root"
+        file_root.write_text("not a directory", encoding="utf-8")
+
+        for root in (symlink, file_root):
+            with self.subTest(root=root):
+                with self.assertRaisesRegex(ValueError, "temp_root"):
+                    build_invocation(replace(self.config, temp_root=root))
+
+    def test_rejects_symlink_in_temp_root_components(self):
+        real_parent = self.temp_root.parent / "real-parent"
+        real_parent.mkdir()
+        nested = real_parent / "nested"
+        nested.mkdir()
+        linked_parent = self.temp_root.parent / "linked-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            build_invocation(replace(self.config, temp_root=linked_parent / "nested"))
+
+    def test_rejects_untrusted_existing_run_contents(self):
+        compromised = self.temp_root / "existing-run"
+        compromised.mkdir()
+        (compromised / "marker").write_text("unexpected", encoding="utf-8")
+
+        with patch(
+            "scripts.live_eval.isolation.tempfile.mkdtemp",
+            return_value=str(compromised),
+        ):
+            with self.assertRaisesRegex(ValueError, "fresh run"):
+                build_invocation(self.config)
+
+    def test_preflight_rechecks_path_identity_and_emptiness_before_probe(self):
+        invocation = build_invocation(self.config)
+        (invocation.cwd / "unexpected").write_text("data", encoding="utf-8")
+        called = []
+
+        report = preflight_isolation(
+            invocation, probe=lambda item: called.append(item)
         )
 
+        self.assertEqual(report.classification, "blocked_isolation")
+        self.assertIn("path_integrity", report.missing_guarantees)
+        self.assertEqual(called, [])
+
+    def test_preflight_rejects_symlink_swap(self):
+        invocation = build_invocation(self.config)
+        external = self.temp_root / "external"
+        external.mkdir()
+        invocation.tmpdir.rmdir()
+        invocation.tmpdir.symlink_to(external, target_is_directory=True)
+
+        report = preflight_isolation(
+            invocation, probe=lambda item: self.capabilities(item)
+        )
+
+        self.assertEqual(report.classification, "blocked_isolation")
+        self.assertIn("path_integrity", report.missing_guarantees)
+
+    def test_preflight_requires_matching_executable_policy_and_argv_proof(self):
+        invocation = build_invocation(self.config)
+        cases = (
+            {"selected_executable": self.temp_root / "other"},
+            {"selected_executable_identity": (0, 0)},
+            {"argv_digest": "sha256:wrong"},
+            {"child_env_policy_id": "wrong-policy"},
+            {"child_env_policy_digest": "sha256:wrong"},
+            {"non_profile_child_env": False},
+            {"cli_version": (0, 142, 3)},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                report = preflight_isolation(
+                    invocation,
+                    probe=lambda item, values=overrides: self.capabilities(
+                        item, **values
+                    ),
+                )
+                self.assertEqual(report.classification, "blocked_isolation")
+
+    def test_preflight_blocks_none_malformed_and_raising_capability_results(self):
+        invocation = build_invocation(self.config)
+        probes = (
+            lambda _: None,
+            lambda _: object(),
+            lambda _: RaisingCapabilities(),
+            lambda item: self.capabilities(item, cli_version=("0", 142, 4)),
+            lambda item: self.capabilities(item, supported_flags={"--ephemeral"}),
+        )
+        for probe in probes:
+            with self.subTest(probe=probe):
+                report = preflight_isolation(invocation, probe=probe)
+                self.assertEqual(report.classification, "blocked_isolation")
+                self.assertEqual(report.result, "blocked")
+
+    def test_preflight_without_probe_or_with_probe_error_is_blocked(self):
+        invocation = build_invocation(self.config)
+
+        missing = preflight_isolation(invocation)
+
+        def failing_probe(_):
+            raise OSError("probe unavailable")
+
+        failed = preflight_isolation(invocation, probe=failing_probe)
+        self.assertEqual(missing.classification, "blocked_isolation")
+        self.assertEqual(failed.classification, "blocked_isolation")
+
+    def test_preflight_accepts_only_untampered_same_invocation_contract(self):
+        invocation = build_invocation(self.config)
+
+        report = preflight_isolation(
+            invocation, probe=lambda item: self.capabilities(item)
+        )
+
+        self.assertEqual(report.classification, "ready")
+        self.assertEqual(report.result, "pass")
+        self.assertEqual(report.invocation_id, invocation.invocation_id)
+        self.assertEqual(report.invocation_instance_id, id(invocation))
+
+    def test_duplicate_unexpected_or_changed_model_argv_is_blocked(self):
+        invocation = build_invocation(self.config)
+        variants = (
+            invocation.argv + ("--ephemeral",),
+            invocation.argv + ("--unknown",),
+            tuple(
+                "other-model" if item == "gpt-5.4" else item
+                for item in invocation.argv
+            ),
+        )
+        for argv in variants:
+            with self.subTest(argv=argv[-2:]):
+                tampered = replace(invocation, argv=argv)
+                report = preflight_isolation(
+                    tampered, probe=lambda item: self.capabilities(item)
+                )
+                self.assertEqual(report.classification, "blocked_isolation")
+                self.assertIn("invocation_policy", report.missing_guarantees)
+
+    def test_rejects_model_outside_immutable_allowlist(self):
+        config = replace(self.config, model_allowlist=["gpt-5.4"])
+        self.assertEqual(config.model_allowlist, ("gpt-5.4",))
         with self.assertRaisesRegex(ValueError, "allowlist"):
-            build_invocation(config)
+            build_invocation(replace(config, model="other-model"))
 
-    def test_oauth_only_is_blocked(self):
-        report = preflight_auth(api_key=None, oauth_files_present=True)
-
-        self.assertEqual(report.classification, "blocked_auth")
-        self.assertEqual(report.result, "blocked")
-
-    def test_explicit_process_key_is_ready_without_oauth_copy(self):
-        report = preflight_auth(
+    def test_oauth_only_is_blocked_and_explicit_key_is_ready(self):
+        blocked = preflight_auth(api_key=None, oauth_files_present=True)
+        ready = preflight_auth(
             api_key="process-local-secret", oauth_files_present=True
         )
 
-        self.assertEqual(report.classification, "ready")
-        self.assertEqual(report.result, "pass")
+        self.assertEqual(blocked.classification, "blocked_auth")
+        self.assertEqual(blocked.result, "blocked")
+        self.assertEqual(ready.classification, "ready")
+        self.assertNotIn("process-local-secret", repr(ready))
 
-    def test_preflight_passes_only_when_all_isolation_features_are_proven(self):
-        invocation = build_invocation(self.config)
-        capabilities = CliCapabilities(
-            supported_flags=frozenset(
-                {
-                    "--ephemeral",
-                    "--ignore-user-config",
-                    "--ignore-rules",
-                    "--sandbox",
-                    "--output-schema",
-                    "-a",
-                }
-            ),
-            tool_env_separation=True,
-            network_disabled=True,
-            mcp_disabled=True,
-            plugins_disabled=True,
-            hooks_disabled=True,
-            unexpected_skills_absent=True,
-            cli_version=(0, 142, 4),
+    def test_rejects_credential_name_variants_and_embedded_secret_values(self):
+        names = (
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GITHUB_PAT",
+            "PGPASSFILE",
+            "PGPASSWORD",
+            "AUTHORIZATION",
+            "SERVICE_APIKEY",
+            "DATABASE_URL",
+            "AWS_SECRET_ACCESS_KEY",
+            "SESSION_TOKEN",
         )
+        self.assertTrue(all(is_credential_like_name(name) for name in names))
+        with self.assertRaisesRegex(ValueError, "OPENAI_API_KEY"):
+            build_invocation(replace(self.config, api_key_env_name="GITHUB_PAT"))
 
-        report = preflight_isolation(invocation, probe=lambda _: capabilities)
+        secret_root = self.temp_root.parent / "prefix-process-local-secret-suffix"
+        secret_root.mkdir(mode=0o700)
+        with self.assertRaisesRegex(ValueError, "secret"):
+            build_invocation(replace(self.config, temp_root=secret_root))
 
-        self.assertEqual(report.classification, "ready")
-        self.assertEqual(report.result, "pass")
-        self.assertEqual(report.missing_guarantees, ())
-
-    def test_preflight_blocks_when_cli_or_environment_proof_is_missing(self):
-        invocation = build_invocation(self.config)
-        capabilities = CliCapabilities(
-            supported_flags=frozenset({"--ephemeral"}),
-            tool_env_separation=False,
-            network_disabled=False,
-            mcp_disabled=False,
-            plugins_disabled=False,
-            hooks_disabled=False,
-            unexpected_skills_absent=False,
-            cli_version=(0, 142, 4),
-        )
-
-        report = preflight_isolation(invocation, probe=lambda _: capabilities)
-
-        self.assertEqual(report.classification, "blocked_isolation")
-        self.assertEqual(report.result, "blocked")
-        self.assertIn("tool_env_separation", report.missing_guarantees)
-        self.assertIn("network_disabled", report.missing_guarantees)
-        self.assertIn("mcp_disabled", report.missing_guarantees)
-        self.assertIn("plugins_disabled", report.missing_guarantees)
-        self.assertIn("hooks_disabled", report.missing_guarantees)
-        self.assertIn("unexpected_skills_absent", report.missing_guarantees)
-        self.assertIn("--ignore-rules", report.missing_guarantees)
-
-    def test_preflight_rejects_invocation_missing_required_command_policy(self):
-        invocation = build_invocation(self.config)
-        tampered = Invocation(
-            argv=tuple(item for item in invocation.argv if item != "--ignore-rules"),
-            transport_env=invocation.transport_env,
-            tool_env=invocation.tool_env,
-            codex_home=invocation.codex_home,
-            cwd=invocation.cwd,
-        )
-        capabilities = CliCapabilities(
-            supported_flags=frozenset(
-                {
-                    "--ephemeral",
-                    "--ignore-user-config",
-                    "--ignore-rules",
-                    "--sandbox",
-                    "--output-schema",
-                    "-a",
-                }
-            ),
-            tool_env_separation=True,
-            network_disabled=True,
-            mcp_disabled=True,
-            plugins_disabled=True,
-            hooks_disabled=True,
-            unexpected_skills_absent=True,
-            cli_version=(0, 142, 4),
-        )
-
-        report = preflight_isolation(tampered, probe=lambda _: capabilities)
-
-        self.assertEqual(report.classification, "blocked_isolation")
-        self.assertIn("invocation_policy", report.missing_guarantees)
-
-    def test_preflight_fails_closed_when_probe_errors(self):
-        invocation = build_invocation(self.config)
-
-        def failing_probe(_):
-            raise OSError("CLI unavailable")
-
-        report = preflight_isolation(invocation, probe=failing_probe)
-
-        self.assertEqual(report.classification, "blocked_isolation")
-        self.assertEqual(report.result, "blocked")
-        self.assertEqual(report.missing_guarantees, ("cli_feature_probe",))
-
-    def test_preflight_without_injected_capabilities_is_blocked(self):
-        invocation = build_invocation(self.config)
-
-        report = preflight_isolation(invocation)
-
-        self.assertEqual(report.classification, "blocked_isolation")
-        self.assertEqual(report.result, "blocked")
-        self.assertEqual(report.missing_guarantees, ("cli_capability_probe",))
+    def test_toml_string_escapes_untrusted_path_text(self):
+        self.assertEqual(toml_string('a"b\\c\n'), '"a\\"b\\\\c\\n"')
 
 
 if __name__ == "__main__":
