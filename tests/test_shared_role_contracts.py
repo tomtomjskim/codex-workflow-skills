@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -277,10 +278,24 @@ class SharedAdapterAuditTests(unittest.TestCase):
         cls.claude = cls.root / "adapters" / "claude"
         cls.codex = cls.root / "adapters" / "codex"
 
+    def test_shared_agent_roots_are_real_nonempty_directories(self):
+        for name, path in (
+            ("common", self.common),
+            ("claude", self.claude),
+            ("codex", self.codex),
+        ):
+            with self.subTest(root=name):
+                self.assertTrue(path.is_dir())
+                self.assertFalse(path.is_symlink())
+                self.assertGreater(len(tuple(path.iterdir())), 0)
+
     def test_canonical_name_sets_match_common_and_both_adapters(self):
         common_names = {path.stem for path in self.common.glob("*.md")}
         claude_adapter_names = {path.stem for path in self.claude.glob("*.md")}
         codex_adapter_names = {path.stem for path in self.codex.glob("*.toml")}
+        self.assertGreater(len(common_names), 0)
+        self.assertGreater(len(claude_adapter_names), 0)
+        self.assertGreater(len(codex_adapter_names), 0)
         self.assertEqual(common_names, claude_adapter_names)
         self.assertEqual(common_names, codex_adapter_names)
 
@@ -292,9 +307,19 @@ class SharedAdapterAuditTests(unittest.TestCase):
                 self.assertIsNotNone(declared)
                 self.assertEqual(path.stem, declared.group(1))
 
-        interpreter = Path("/usr/local/bin/python3.12")
-        if not interpreter.is_file():
-            self.skipTest("not_run: /usr/local/bin/python3.12 is unavailable")
+        interpreter_name = shutil.which("python3.12")
+        if interpreter_name is None:
+            self.skipTest("not_run: python3.12 was not found on PATH")
+        interpreter = Path(interpreter_name)
+        version = subprocess.run(
+            [str(interpreter), "-c", "import sys; print(sys.version_info[:2])"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, version.returncode, version.stderr)
+        parsed_version = tuple(int(part) for part in re.findall(r"\d+", version.stdout))
+        self.assertGreaterEqual(parsed_version, (3, 12))
         paths = sorted(self.codex.glob("*.toml"))
         parser = (
             "import json,pathlib,sys,tomllib;"

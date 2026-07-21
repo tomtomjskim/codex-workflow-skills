@@ -196,7 +196,7 @@ Validate each workstream handoff against the current receipt and its derived wri
   --json
 ```
 
-Handoff validation requires the authoritative `--manifest` and `--inventory`, plus `--contract` when the route is contracted. It reruns coordination validation with the built-in reviewer matrix and requires exact canonical equality with the submitted receipt before ownership validation. CLI receipts use canonical UUID run IDs and expire after five minutes; rerun `validate-coordination` when a receipt is stale.
+Handoff validation requires the authoritative `--manifest` and `--inventory`, plus `--contract` when the route is contracted. It reruns coordination validation with the authoritative manifest, inventory, contract, and shared reviewer routing artifact before requiring exact canonical equality with the submitted receipt. The shared reviewer routing artifact is authoritative for reviewer derivation. CLI receipts use canonical UUID run IDs and expire after five minutes; rerun `validate-coordination` when a receipt is stale.
 
 All three commands emit JSON and return nonzero with a structured error when validation fails. Covered parallel dispatch requires a current CLI version 1 receipt. If the CLI is missing or incompatible, validation fails, the receipt is stale, or changes cannot be attributed to a workstream, use the single-owner sequential fallback and record `parallel_validation: blocked`; do not continue with unvalidated parallel writers.
 

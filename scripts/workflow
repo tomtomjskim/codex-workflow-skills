@@ -31,6 +31,10 @@ from scripts.workflow_coordination.prepare import (  # noqa: E402
     prepare_coordination,
 )
 from scripts.workflow_coordination.receipts import ValidationReceipt  # noqa: E402
+from scripts.workflow_coordination.reviewer_routing import (  # noqa: E402
+    build_trigger_matrix,
+    load_reviewer_routing,
+)
 from scripts.workflow_coordination.validate import (  # noqa: E402
     ValidationError,
     validate_coordination,
@@ -39,37 +43,7 @@ from scripts.workflow_coordination.validate import (  # noqa: E402
 
 
 CLI_VERSION = 1
-CANONICAL_TRIGGER_MATRIX = {
-    "schema_version": 1,
-    "profile_reviewers": {
-        "shared_interface": ["api-reviewer"],
-    },
-    "changed_surface_reviewers": {
-        "auth": ["security-reviewer"],
-        "authorization": ["security-reviewer"],
-        "roles": ["security-reviewer"],
-        "tenant-boundary": ["security-reviewer"],
-        "secrets": ["security-reviewer"],
-        "file-io": ["security-reviewer"],
-        "shell": ["security-reviewer"],
-        "network": ["security-reviewer"],
-        "data-mutation": ["security-reviewer", "qa-engineer"],
-        "database": ["security-reviewer", "qa-engineer", "dba"],
-        "migration": ["security-reviewer", "qa-engineer", "dba"],
-        "public-api": ["code-reviewer", "api-reviewer"],
-        "api": ["code-reviewer", "api-reviewer"],
-        "sdk": ["code-reviewer", "api-reviewer"],
-        "integration-contract": ["code-reviewer", "api-reviewer"],
-        "ai-llm": ["qa-engineer", "test-coverage-reviewer"],
-        "tests": ["qa-engineer", "test-coverage-reviewer"],
-        "ci": ["qa-engineer", "test-coverage-reviewer"],
-        "ui": ["ux-reviewer", "accessibility-reviewer", "qa-engineer"],
-        "user-flow": ["ux-reviewer", "accessibility-reviewer", "qa-engineer"],
-        "performance": ["performance-reviewer"],
-        "concurrency": ["performance-reviewer", "code-reviewer"],
-        "architecture": ["architect", "code-reviewer"],
-    },
-}
+CANONICAL_TRIGGER_MATRIX = build_trigger_matrix(load_reviewer_routing())
 
 
 class ArgumentError(ValueError):

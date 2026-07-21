@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "lens_agents": {
+    "accessibility": "accessibility-reviewer",
+    "api": "api-reviewer",
+    "architecture": "architect",
+    "code": "code-reviewer",
+    "database": "dba",
+    "performance": "performance-reviewer",
+    "qa": "qa-engineer",
+    "security": "security-reviewer",
+    "test-coverage": "test-coverage-reviewer",
+    "ux": "ux-reviewer"
+  },
+  "profile_lenses": {
+    "shared_interface": [
+      "api"
+    ]
+  },
+  "changed_surface_lenses": {
+    "ai-llm": [
+      "qa",
+      "test-coverage"
+    ],
+    "api": [
+      "api",
+      "code"
+    ],
+    "architecture": [
+      "architecture",
+      "code"
+    ],
+    "auth": [
+      "qa",
+      "security"
+    ],
+    "authorization": [
+      "qa",
+      "security"
+    ],
+    "ci": [
+      "qa",
+      "test-coverage"
+    ],
+    "concurrency": [
+      "code",
+      "performance"
+    ],
+    "data-mutation": [
+      "qa",
+      "security"
+    ],
+    "database": [
+      "database",
+      "qa",
+      "security"
+    ],
+    "file-io": [
+      "security"
+    ],
+    "integration-contract": [
+      "api",
+      "code"
+    ],
+    "migration": [
+      "database",
+      "qa",
+      "security"
+    ],
+    "network": [
+      "security"
+    ],
+    "performance": [
+      "performance"
+    ],
+    "public-api": [
+      "api",
+      "code"
+    ],
+    "roles": [
+      "qa",
+      "security"
+    ],
+    "sdk": [
+      "api",
+      "code"
+    ],
+    "secrets": [
+      "security"
+    ],
+    "shell": [
+      "security"
+    ],
+    "tenant-boundary": [
+      "qa",
+      "security"
+    ],
+    "tests": [
+      "qa",
+      "test-coverage"
+    ],
+    "ui": [
+      "accessibility",
+      "qa",
+      "ux"
+    ],
+    "user-flow": [
+      "accessibility",
+      "qa",
+      "ux"
+    ]
+  }
+}

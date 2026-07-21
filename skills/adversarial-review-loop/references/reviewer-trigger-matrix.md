@@ -1,8 +1,9 @@
 # Reviewer Trigger Matrix
 
 Derive reviewer lenses from exact changed-surface tags. Resolve every lens through
-the canonical registry below. Do not duplicate or override these mappings in a
-review packet.
+the canonical registry below. `reviewer-routing.json` is authoritative; this
+human-readable matrix must mirror it exactly. Do not duplicate or override these
+mappings in a review packet.
 
 ## Canonical Lens Registry
 
@@ -34,9 +35,13 @@ review packet.
 | `concurrency` | `code`, `performance` |
 | `architecture` | `architecture`, `code` |
 
-Add the `api` lens when the derived coordination profile is
-`shared_interface`. Treat this file as the sole reviewer routing source; do not
-accept packet-authored lens or agent substitutions.
+## Profile Triggers
+
+| Coordination profile | Required reviewer lenses |
+|---|---|
+| `shared_interface` | `api` |
+
+Do not accept packet-authored lens or agent substitutions.
 
 Record an unmapped material surface as a routing gap and execute sequentially
 until the mapping is revised and validated. Record a reason for every skipped
