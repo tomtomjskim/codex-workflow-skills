@@ -947,8 +947,16 @@ def _bounded_process(
         stdin_writer.join(timeout=1)
         raise ProcessExecutionFailure() from None
     writer_start.set()
-    for reader in readers:
-        reader.start()
+    started_readers = []
+    try:
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
+    except Exception:
+        _cleanup_reader_start_failure(
+            process, stop_requested, stdin_writer, started_readers
+        )
+        raise ProcessExecutionFailure() from None
     timed_out = False
     group_terminated = False
     while process.poll() is None:
@@ -1004,12 +1012,46 @@ def _terminate_process_group(process: object) -> None:
     try:
         process.wait(timeout=0.2)
         return
-    except (subprocess.TimeoutExpired, TimeoutError):
+    except Exception:
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except OSError:
         pass
+
+
+def _cleanup_reader_start_failure(
+    process: object,
+    stop_requested: threading.Event,
+    stdin_writer: threading.Thread,
+    started_readers: Sequence[threading.Thread],
+) -> None:
+    stop_requested.set()
+    try:
+        _terminate_process_group(process)
+    except Exception:
+        pass
+    _close_process_output_streams(process)
+    for thread in (stdin_writer,) + tuple(started_readers):
+        try:
+            thread.join(timeout=1)
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=0.2)
+    except Exception:
+        pass
+
+
+def _close_process_output_streams(process: object) -> None:
+    for name in ("stdout", "stderr"):
+        stream = getattr(process, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:
+            pass
 
 
 def _close_process_stdin(process: object) -> None:

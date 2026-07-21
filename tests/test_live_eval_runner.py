@@ -122,8 +122,10 @@ class FakePopen:
         specification = self.outputs.pop(0)
         self.argv = tuple(argv)
         self.kwargs = kwargs
-        self.stdout = io.BytesIO(specification.get("stdout", b""))
-        self.stderr = io.BytesIO(specification.get("stderr", b""))
+        stdout = specification.get("stdout", b"")
+        stderr = specification.get("stderr", b"")
+        self.stdout = io.BytesIO(stdout) if isinstance(stdout, bytes) else stdout
+        self.stderr = io.BytesIO(stderr) if isinstance(stderr, bytes) else stderr
         self._child_stdin_read_fd = None
         if specification.get("pipe_stdin"):
             self._child_stdin_read_fd, write_fd = os.pipe()
@@ -134,6 +136,7 @@ class FakePopen:
             self.stdin = tempfile.TemporaryFile("w+b")
         self.stdin_fd = self.stdin.fileno()
         self.returncode = specification.get("returncode", 0)
+        self.wait_calls = 0
         self.pid = self.next_pid
         type(self).next_pid += 1
         type(self).calls.append(self)
@@ -143,6 +146,7 @@ class FakePopen:
 
     def wait(self, timeout=None):
         del timeout
+        self.wait_calls += 1
         self.close_child_stdin()
         if self.returncode is None:
             self.returncode = -15
@@ -881,6 +885,79 @@ class RunnerTests(unittest.TestCase):
         duplicate.assert_not_called()
         self.assertTrue(FakePopen.calls[0].stdin.closed)
         kill_group.assert_called_once_with(FakePopen.calls[0].pid, signal.SIGTERM)
+
+    def test_reader_start_failures_cleanup_started_threads_and_do_not_retry(self):
+        class BlockingReadStream:
+            def __init__(self):
+                self.closed = False
+                self.released = threading.Event()
+
+            def read(self, _size):
+                self.released.wait(2)
+                return b""
+
+            def close(self):
+                self.closed = True
+                self.released.set()
+
+        class ReadySubprocessCodex(SubprocessCodex):
+            def probe(self, invocation):
+                return FakeCodex().probe(invocation)
+
+            def invoke(self, *arguments, **keywords):
+                with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen):
+                    return super().invoke(*arguments, **keywords)
+
+        original_start = threading.Thread.start
+        original_dup = os.dup
+        for failing_start in (2, 3):
+            with self.subTest(failing_start=failing_start):
+                blocking_stdout = BlockingReadStream()
+                FakePopen.calls = []
+                FakePopen.outputs = [
+                    {
+                        "stdout": blocking_stdout if failing_start == 3 else b"",
+                        "returncode": None,
+                    }
+                ]
+                start_count = [0]
+                started_threads = []
+                duplicated_fds = []
+
+                def controlled_start(thread):
+                    start_count[0] += 1
+                    if start_count[0] == failing_start:
+                        raise RuntimeError("secret-reader-start-detail")
+                    started_threads.append(thread)
+                    return original_start(thread)
+
+                def duplicate(descriptor):
+                    duplicated = original_dup(descriptor)
+                    duplicated_fds.append(duplicated)
+                    return duplicated
+
+                with mock.patch(
+                    "scripts.run_live_eval.threading.Thread.start",
+                    autospec=True,
+                    side_effect=controlled_start,
+                ), mock.patch(
+                    "scripts.run_live_eval.os.dup", side_effect=duplicate
+                ), mock.patch("scripts.run_live_eval.os.killpg") as kill_group:
+                    result = run_eval(self.request(), ReadySubprocessCodex())
+
+                process = FakePopen.calls[0]
+                self.assertEqual(result.status, "blocked_process", repr(result))
+                self.assertEqual(result.attempts, 1)
+                self.assertEqual(result.model_calls, 1)
+                self.assertNotIn("secret-reader-start-detail", repr(result))
+                kill_group.assert_called_once_with(process.pid, signal.SIGTERM)
+                self.assertGreaterEqual(process.wait_calls, 1)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+                self.assertTrue(all(not thread.is_alive() for thread in started_threads))
+                self.assertEqual(len(duplicated_fds), 1)
+                with self.assertRaises(OSError):
+                    os.fstat(duplicated_fds[0])
 
     def test_original_stdin_close_failure_is_sanitized_and_cleans_group(self):
         class CloseFailingStream:
