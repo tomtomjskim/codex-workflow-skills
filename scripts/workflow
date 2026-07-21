@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Prepare and validate coordination artifacts as canonical JSON."""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = SCRIPT_DIR.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from scripts.workflow_coordination.canonical_json import (  # noqa: E402
+    CanonicalJSONError,
+    canonical_bytes,
+    load_canonical_input,
+)
+from scripts.workflow_coordination.prepare import (  # noqa: E402
+    PreparationError,
+    prepare_coordination,
+)
+from scripts.workflow_coordination.receipts import ValidationReceipt  # noqa: E402
+from scripts.workflow_coordination.validate import (  # noqa: E402
+    ValidationError,
+    validate_coordination,
+    validate_handoff,
+)
+
+
+CLI_VERSION = 1
+CANONICAL_TRIGGER_MATRIX = {
+    "schema_version": 1,
+    "profile_reviewers": {
+        "shared_interface": ["api-reviewer"],
+    },
+    "changed_surface_reviewers": {
+        "auth": ["security-reviewer"],
+        "authorization": ["security-reviewer"],
+        "roles": ["security-reviewer"],
+        "tenant-boundary": ["security-reviewer"],
+        "secrets": ["security-reviewer"],
+        "file-io": ["security-reviewer"],
+        "shell": ["security-reviewer"],
+        "network": ["security-reviewer"],
+        "data-mutation": ["security-reviewer", "qa-engineer"],
+        "database": ["security-reviewer", "qa-engineer", "dba"],
+        "migration": ["security-reviewer", "qa-engineer", "dba"],
+        "public-api": ["code-reviewer", "api-reviewer"],
+        "api": ["code-reviewer", "api-reviewer"],
+        "sdk": ["code-reviewer", "api-reviewer"],
+        "integration-contract": ["code-reviewer", "api-reviewer"],
+        "ai-llm": ["qa-engineer", "test-coverage-reviewer"],
+        "tests": ["qa-engineer", "test-coverage-reviewer"],
+        "ci": ["qa-engineer", "test-coverage-reviewer"],
+        "ui": ["ux-reviewer", "accessibility-reviewer", "qa-engineer"],
+        "user-flow": ["ux-reviewer", "accessibility-reviewer", "qa-engineer"],
+        "performance": ["performance-reviewer"],
+        "concurrency": ["performance-reviewer", "code-reviewer"],
+        "architecture": ["architect", "code-reviewer"],
+    },
+}
+
+
+class ArgumentError(ValueError):
+    """Raised for command-line usage errors that must be JSON encoded."""
+
+
+class JSONArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ArgumentError(message)
+
+
+def _read_json(path: Optional[Path]) -> object:
+    if path is None:
+        return None
+    return load_canonical_input(path.read_bytes())
+
+
+def _emit(payload: object) -> None:
+    sys.stdout.buffer.write(canonical_bytes(payload) + b"\n")
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.write_bytes(canonical_bytes(payload) + b"\n")
+
+
+def _checkout_tree_hash(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValidationError(
+            "cannot resolve checkout tree hash: {}".format(result.stderr.strip())
+        )
+    return result.stdout.strip()
+
+
+def _require_repo_root(value: Path) -> Path:
+    root = value.resolve()
+    if not root.is_dir():
+        raise ValidationError("repository root must be an existing directory")
+    return root
+
+
+def handle_prepare(args: argparse.Namespace) -> int:
+    repo_root = _require_repo_root(args.repo_root)
+    plan = _read_json(args.plan)
+    catalog = _read_json(args.catalog)
+    prepared = prepare_coordination(plan, catalog)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(args.out_dir / "manifest.json", prepared.manifest)
+    _write_json(args.out_dir / "inventory.json", prepared.inventory)
+    _emit(
+        {
+            "cli_version": CLI_VERSION,
+            "schema_version": 1,
+            "repo_root": str(repo_root),
+            "manifest": prepared.manifest,
+            "inventory": prepared.inventory,
+            "manifest_hash": prepared.manifest_hash,
+            "inventory_hash": prepared.inventory_hash,
+            "manifest_path": str(args.out_dir / "manifest.json"),
+            "inventory_path": str(args.out_dir / "inventory.json"),
+        }
+    )
+    return 0
+
+
+def handle_validate_coordination(args: argparse.Namespace) -> int:
+    repo_root = _require_repo_root(args.repo_root)
+    manifest = _read_json(args.manifest)
+    inventory = _read_json(args.inventory)
+    contract = _read_json(args.contract)
+    tree_hash = args.checkout_tree_hash or _checkout_tree_hash(repo_root)
+    receipt = validate_coordination(
+        repo_root,
+        manifest,
+        inventory,
+        contract,
+        trigger_matrix=CANONICAL_TRIGGER_MATRIX,
+        checkout_tree_hash=tree_hash,
+    )
+    payload = receipt.to_dict()
+    payload["cli_version"] = CLI_VERSION
+    _emit(payload)
+    return 0
+
+
+def _receipt_from_payload(payload: object) -> ValidationReceipt:
+    if not isinstance(payload, dict):
+        raise ValidationError("receipt must be an object")
+    if payload.get("cli_version") != CLI_VERSION:
+        raise ValidationError("receipt CLI version is incompatible")
+    required = (
+        "schema_version",
+        "manifest_hash",
+        "inventory_hash",
+        "contract_core_hash",
+        "checkout_tree_hash",
+        "derived_route",
+        "required_sets",
+        "normalized_paths",
+        "run_id",
+        "recorded_at",
+    )
+    missing = [field for field in required if field not in payload]
+    if missing:
+        raise ValidationError("receipt missing field: {}".format(missing[0]))
+    return ValidationReceipt(
+        schema_version=payload["schema_version"],
+        manifest_hash=payload["manifest_hash"],
+        inventory_hash=payload["inventory_hash"],
+        contract_core_hash=payload["contract_core_hash"],
+        checkout_tree_hash=payload["checkout_tree_hash"],
+        derived_route=payload["derived_route"],
+        required_sets=payload["required_sets"],
+        normalized_paths=payload["normalized_paths"],
+        run_id=payload["run_id"],
+        recorded_at=payload["recorded_at"],
+        derived_profiles=payload.get("derived_profiles"),
+    )
+
+
+def handle_validate_handoff(args: argparse.Namespace) -> int:
+    repo_root = _require_repo_root(args.repo_root)
+    receipt = _receipt_from_payload(_read_json(args.receipt))
+    current_tree_hash = _checkout_tree_hash(repo_root)
+    if receipt.checkout_tree_hash != current_tree_hash:
+        raise ValidationError("receipt checkout tree hash is stale")
+    validate_handoff(repo_root, receipt, args.workstream_id, args.changed_path)
+    _emit(
+        {
+            "cli_version": CLI_VERSION,
+            "schema_version": 1,
+            "status": "valid",
+            "run_id": receipt.run_id,
+            "workstream_id": args.workstream_id,
+            "changed_paths": args.changed_path,
+        }
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = JSONArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=str(CLI_VERSION))
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    prepare = commands.add_parser("prepare-coordination")
+    prepare.add_argument("--repo-root", required=True, type=Path)
+    prepare.add_argument("--plan", required=True, type=Path)
+    prepare.add_argument("--catalog", type=Path)
+    prepare.add_argument("--out-dir", required=True, type=Path)
+    prepare.add_argument("--json", action="store_true")
+    prepare.set_defaults(handler=handle_prepare)
+
+    validate = commands.add_parser("validate-coordination")
+    validate.add_argument("--repo-root", required=True, type=Path)
+    validate.add_argument("--manifest", required=True, type=Path)
+    validate.add_argument("--inventory", required=True, type=Path)
+    validate.add_argument("--contract", type=Path)
+    validate.add_argument("--checkout-tree-hash")
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(handler=handle_validate_coordination)
+
+    handoff = commands.add_parser("validate-handoff")
+    handoff.add_argument("--repo-root", required=True, type=Path)
+    handoff.add_argument("--receipt", required=True, type=Path)
+    handoff.add_argument("--workstream-id", required=True)
+    handoff.add_argument("--changed-path", action="append", default=[])
+    handoff.add_argument("--json", action="store_true")
+    handoff.set_defaults(handler=handle_validate_handoff)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        return args.handler(args)
+    except (
+        ArgumentError,
+        CanonicalJSONError,
+        PreparationError,
+        ValidationError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        payload = {
+            "cli_version": CLI_VERSION,
+            "schema_version": 1,
+            "command": getattr(locals().get("args"), "command", None),
+            "error": {"type": type(error).__name__, "message": str(error)},
+            "fallback": {
+                "parallel_validation": "blocked",
+                "execution": "sequential",
+            },
+        }
+        sys.stderr.buffer.write(canonical_bytes(payload) + b"\n")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

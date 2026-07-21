@@ -7,6 +7,7 @@ This repository is plugin-ready. It contains:
 - `workflow`: route-only wrapper for choosing intake or review when explicitly requested.
 - `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, E2E decisions, and AI eval handoffs after intake activates.
 - `adversarial-review-loop`: reviews plans, diffs, and implementations with evidence, reviewer routing, finding disposition, loop limits, and verification gates.
+- `scripts/workflow`: prepares canonical coordination artifacts and validates concurrent dispatches and handoffs without third-party Python packages.
 
 ## Why This Exists
 
@@ -73,6 +74,9 @@ Common design artifacts:
 ├── .codex-plugin/plugin.json
 ├── CHANGELOG.md
 ├── scripts/
+│   ├── workflow
+│   ├── workflow_coordination/
+│   ├── validate_policy_contracts.py
 │   └── validate_repo.sh
 ├── skills/
 │   ├── workflow/
@@ -153,6 +157,42 @@ Run adversarial review when a plan, diff, or implementation exists:
 Use $adversarial-review-loop to review this diff and classify findings.
 ```
 
+### Validated Coordination CLI
+
+For covered concurrent work, prepare a manifest and inventory together from one approved UTF-8 JSON plan:
+
+```bash
+./scripts/workflow prepare-coordination \
+  --repo-root /path/to/approved-repo \
+  --plan /path/to/approved-plan.json \
+  --out-dir /path/to/temporary-coordination \
+  --json
+```
+
+Validate the generated artifacts before every concurrent dispatch. A contracted route also requires the current frozen contract:
+
+```bash
+./scripts/workflow validate-coordination \
+  --repo-root /path/to/approved-repo \
+  --manifest /path/to/temporary-coordination/manifest.json \
+  --inventory /path/to/temporary-coordination/inventory.json \
+  --contract /path/to/temporary-coordination/contract.json \
+  --json
+```
+
+Validate each workstream handoff against the current receipt and its derived write ownership:
+
+```bash
+./scripts/workflow validate-handoff \
+  --repo-root /path/to/approved-repo \
+  --receipt /path/to/temporary-coordination/receipt.json \
+  --workstream-id frontend \
+  --changed-path src/ui/settings.py \
+  --json
+```
+
+All three commands emit JSON and return nonzero with a structured error when validation fails. Covered parallel dispatch requires a current CLI version 1 receipt. If the CLI is missing or incompatible, validation fails, the receipt is stale, or changes cannot be attributed to a workstream, use the single-owner sequential fallback and record `parallel_validation: blocked`; do not continue with unvalidated parallel writers.
+
 ## Examples
 
 Route a broad task:
@@ -210,7 +250,7 @@ Run the repository validation script for the standard public-release checks:
 ./scripts/validate_repo.sh
 ```
 
-The script checks required files, skill structure when Codex system validators are available, plugin structure, README links, manifest/changelog version alignment, `git diff --check`, and a basic public hygiene scan.
+The script checks required files, coordination CLI and policy contracts, focused CLI/coordination tests, skill structure when Codex system validators are available, plugin structure, README links, manifest/changelog version alignment, `git diff --check`, and every tracked text file for public hygiene. Binary tracked files are skipped.
 
 Validate skill structure when the Codex system validation scripts are available:
 

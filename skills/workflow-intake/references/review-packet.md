@@ -25,6 +25,16 @@ review_packet:
     serena:
     external_untrusted:
   reviewers_required:
+  coordination:
+    parallel_validation: validated | blocked | not_applicable
+    execution: parallel | sequential | single_owner
+    coordination_receipt:
+      cli_version:
+      schema_version:
+      run_id:
+      checkout_tree_hash:
+      manifest_hash:
+      contract_core_hash:
   validation_plan:
     validation_level:
     e2e_decision:
@@ -42,3 +52,4 @@ Rules:
 - `adversarial-review-loop` may narrow review scope, but may not expand autonomy or remove hard stops.
 - If a mid-task change modifies scope, autonomy, hard stops, validation requirements, or side effects, ask first when approval is required; if review is active or expected, also create a packet revision.
 - If required fields are absent and cannot be inferred safely, stop and ask.
+- When the packet covers concurrent dispatch, `coordination_receipt` must be current and must bind the active checkout and contract state. Missing or incompatible receipt evidence sets `parallel_validation: blocked` and uses the sequential fallback.

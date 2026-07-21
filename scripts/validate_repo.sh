@@ -44,6 +44,18 @@ require_file skills/adversarial-review-loop/SKILL.md
 require_file docs/sample-workflow-intake.md
 require_file docs/sample-adversarial-review.md
 require_file tests/acceptance-scenarios.md
+require_file scripts/workflow
+require_file scripts/validate_policy_contracts.py
+require_file scripts/workflow_coordination/canonical_json.py
+require_file tests/test_canonical_json.py
+require_file tests/test_policy_contracts.py
+require_file tests/test_workflow_cli.py
+require_file skills/workflow-intake/references/parallel-coordination.md
+
+if [ ! -x scripts/workflow ]; then
+  printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2
+  exit 1
+fi
 
 if [ -f "$SKILL_VALIDATOR" ]; then
   run python3 "$SKILL_VALIDATOR" skills/workflow
@@ -60,6 +72,10 @@ else
 fi
 
 run git diff --check
+run python3 scripts/validate_policy_contracts.py --repo-root .
+run python3 -m unittest tests.test_policy_contracts -v
+run python3 -m unittest discover -s tests -p 'test_*coordination*.py' -v
+run python3 -m unittest tests.test_workflow_cli -v
 
 require_match '\[sample-workflow-intake\.md\]\(docs/sample-workflow-intake\.md\)' README.md 'workflow intake sample link'
 require_match '\[sample-adversarial-review\.md\]\(docs/sample-adversarial-review\.md\)' README.md 'adversarial review sample link'
