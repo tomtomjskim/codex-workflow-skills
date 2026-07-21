@@ -17,6 +17,25 @@ REVIEWER_ROLES = (
     "ux-reviewer",
 )
 
+CANONICAL_AGENT_NAMES = {
+    "accessibility-reviewer",
+    "api-reviewer",
+    "architect",
+    "code-reviewer",
+    "dba",
+    "designer",
+    "developer",
+    "documenter",
+    "explorer",
+    "performance-reviewer",
+    "pm",
+    "publisher",
+    "qa-engineer",
+    "security-reviewer",
+    "test-coverage-reviewer",
+    "ux-reviewer",
+}
+
 READ_ONLY_BOUNDARY = "- Read-only. Do not edit files."
 HANDOFF_BOUNDARY = (
     "- When TOM asks for a fix, return a concrete handoff to the applicable "
@@ -293,19 +312,20 @@ class SharedAdapterAuditTests(unittest.TestCase):
         common_names = {path.stem for path in self.common.glob("*.md")}
         claude_adapter_names = {path.stem for path in self.claude.glob("*.md")}
         codex_adapter_names = {path.stem for path in self.codex.glob("*.toml")}
-        self.assertGreater(len(common_names), 0)
-        self.assertGreater(len(claude_adapter_names), 0)
-        self.assertGreater(len(codex_adapter_names), 0)
-        self.assertEqual(common_names, claude_adapter_names)
-        self.assertEqual(common_names, codex_adapter_names)
+        self.assertEqual(CANONICAL_AGENT_NAMES, common_names)
+        self.assertEqual(CANONICAL_AGENT_NAMES, claude_adapter_names)
+        self.assertEqual(CANONICAL_AGENT_NAMES, codex_adapter_names)
 
     def test_adapter_declared_names_match_canonical_filenames(self):
+        claude_declared_names = []
         for path in sorted(self.claude.glob("*.md")):
             with self.subTest(adapter="claude", name=path.stem):
                 text = path.read_text(encoding="utf-8")
                 declared = re.search(r"(?m)^name:\s*([^\s]+)\s*$", text)
                 self.assertIsNotNone(declared)
                 self.assertEqual(path.stem, declared.group(1))
+                claude_declared_names.append(declared.group(1))
+        self.assertEqual(16, len(claude_declared_names))
 
         interpreter_name = shutil.which("python3.12")
         if interpreter_name is None:
@@ -334,9 +354,12 @@ class SharedAdapterAuditTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         parsed = json.loads(result.stdout)
+        codex_declared_names = []
         for path in paths:
             with self.subTest(adapter="codex", name=path.stem):
                 self.assertEqual(path.stem, parsed[path.name]["name"])
+                codex_declared_names.append(parsed[path.name]["name"])
+        self.assertEqual(16, len(codex_declared_names))
 
     def test_active_codex_agent_links_are_not_broken(self):
         active = Path.home() / ".codex" / "agents"

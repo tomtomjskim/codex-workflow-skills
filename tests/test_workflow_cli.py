@@ -1,13 +1,16 @@
 import json
 import importlib.machinery
+import io
 import errno
 import subprocess
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
 from scripts.workflow_coordination.canonical_json import sha256_id
+from scripts.workflow_coordination import reviewer_routing
 
 
 ROOT = Path(__file__).parents[1]
@@ -401,6 +404,94 @@ class WorkflowCLITests(unittest.TestCase):
         error = json.loads(result.stderr)
         self.assertEqual(error["error"]["type"], "ArgumentError")
         self.assertEqual(error["fallback"]["execution"], "sequential")
+
+    def test_import_does_not_load_reviewer_routing(self):
+        module_name = "workflow_cli_lazy_import_{}".format(uuid.uuid4().hex)
+        with mock.patch.object(
+            reviewer_routing,
+            "load_reviewer_routing",
+            side_effect=reviewer_routing.ReviewerRoutingError("injected routing failure"),
+        ) as loader:
+            imported = importlib.machinery.SourceFileLoader(
+                module_name, str(CLI)
+            ).load_module()
+
+        self.assertEqual(imported.CLI_VERSION, 1)
+        loader.assert_not_called()
+
+    def test_routing_failure_is_canonical_json_with_sequential_fallback(self):
+        commands = {
+            "validate-coordination": [
+                "validate-coordination",
+                "--repo-root",
+                str(self.repo_root),
+                "--manifest",
+                "missing-manifest.json",
+                "--inventory",
+                "missing-inventory.json",
+                "--json",
+            ],
+            "validate-handoff": [
+                "validate-handoff",
+                "--repo-root",
+                str(self.repo_root),
+                "--manifest",
+                "missing-manifest.json",
+                "--inventory",
+                "missing-inventory.json",
+                "--receipt",
+                "missing-receipt.json",
+                "--workstream-id",
+                "frontend",
+                "--json",
+            ],
+        }
+        failures = (
+            "cannot load reviewer routing: file is missing",
+            "cannot load reviewer routing: corrupt JSON",
+            "reviewer routing schema_version must be 1",
+        )
+        for failure in failures:
+            for command, arguments in commands.items():
+                with self.subTest(failure=failure, command=command):
+                    stderr = mock.Mock(buffer=io.BytesIO())
+                    with mock.patch.object(
+                        WORKFLOW_MODULE,
+                        "load_reviewer_routing",
+                        side_effect=WORKFLOW_MODULE.ReviewerRoutingError(failure),
+                    ):
+                        with mock.patch.object(WORKFLOW_MODULE.sys, "stderr", stderr):
+                            result = WORKFLOW_MODULE.main(arguments)
+
+                    raw = stderr.buffer.getvalue()
+                    payload = json.loads(raw)
+                    self.assertEqual(result, 2)
+                    self.assertEqual(payload["command"], command)
+                    self.assertEqual(payload["error"]["type"], "ReviewerRoutingError")
+                    self.assertEqual(payload["error"]["message"], failure)
+                    self.assertEqual(payload["fallback"]["execution"], "sequential")
+                    self.assertEqual(
+                        raw,
+                        WORKFLOW_MODULE.canonical_bytes(payload) + b"\n",
+                    )
+
+    def test_prepare_argument_error_and_version_do_not_load_routing(self):
+        loader = mock.Mock(
+            side_effect=WORKFLOW_MODULE.ReviewerRoutingError("must not load")
+        )
+        stderr = mock.Mock(buffer=io.BytesIO())
+        with mock.patch.object(WORKFLOW_MODULE, "load_reviewer_routing", loader):
+            with mock.patch.object(WORKFLOW_MODULE.sys, "stderr", stderr):
+                self.assertEqual(
+                    WORKFLOW_MODULE.main(["prepare-coordination", "--json"]),
+                    2,
+                )
+            with mock.patch.object(WORKFLOW_MODULE.sys, "stdout", io.StringIO()):
+                with self.assertRaises(SystemExit) as exit_context:
+                    WORKFLOW_MODULE.main(["--version"])
+
+        self.assertEqual(exit_context.exception.code, 0)
+        loader.assert_not_called()
 
 
 if __name__ == "__main__":

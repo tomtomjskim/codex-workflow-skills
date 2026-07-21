@@ -32,6 +32,7 @@ from scripts.workflow_coordination.prepare import (  # noqa: E402
 )
 from scripts.workflow_coordination.receipts import ValidationReceipt  # noqa: E402
 from scripts.workflow_coordination.reviewer_routing import (  # noqa: E402
+    ReviewerRoutingError,
     build_trigger_matrix,
     load_reviewer_routing,
 )
@@ -43,7 +44,6 @@ from scripts.workflow_coordination.validate import (  # noqa: E402
 
 
 CLI_VERSION = 1
-CANONICAL_TRIGGER_MATRIX = build_trigger_matrix(load_reviewer_routing())
 
 
 class ArgumentError(ValueError):
@@ -232,7 +232,7 @@ def handle_validate_coordination(args: argparse.Namespace) -> int:
         manifest,
         inventory,
         contract,
-        trigger_matrix=CANONICAL_TRIGGER_MATRIX,
+        trigger_matrix=args.trigger_matrix,
         checkout_tree_hash=tree_hash,
     )
     payload = receipt.to_dict()
@@ -325,7 +325,7 @@ def handle_validate_handoff(args: argparse.Namespace) -> int:
         _read_json(args.manifest),
         _read_json(args.inventory),
         _read_json(args.contract),
-        trigger_matrix=CANONICAL_TRIGGER_MATRIX,
+        trigger_matrix=args.trigger_matrix,
         checkout_tree_hash=receipt.checkout_tree_hash,
         run_id_factory=lambda: receipt.run_id,
         clock=lambda: receipt.recorded_at,
@@ -389,11 +389,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
+        if args.command in ("validate-coordination", "validate-handoff"):
+            args.trigger_matrix = build_trigger_matrix(load_reviewer_routing())
         return args.handler(args)
     except (
         ArgumentError,
         CanonicalJSONError,
         PreparationError,
+        ReviewerRoutingError,
         ValidationError,
         OSError,
         ValueError,

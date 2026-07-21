@@ -47,10 +47,12 @@ require_file tests/acceptance-scenarios.md
 require_file scripts/workflow
 require_file scripts/validate_policy_contracts.py
 require_file scripts/workflow_coordination/canonical_json.py
+require_file scripts/workflow_coordination/reviewer_routing.py
 require_file tests/test_canonical_json.py
 require_file tests/test_policy_contracts.py
 require_file tests/test_workflow_cli.py
 require_file skills/workflow-intake/references/parallel-coordination.md
+require_file skills/adversarial-review-loop/references/reviewer-routing.json
 require_file scripts/run_live_eval.py
 require_file tests/live-eval-scenarios.json
 require_file tests/test_live_eval_runner.py

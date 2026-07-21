@@ -101,7 +101,7 @@ class ReviewerRoutingTests(unittest.TestCase):
         )
         self.assertEqual(
             build_trigger_matrix(self.routing),
-            self.cli.CANONICAL_TRIGGER_MATRIX,
+            self.cli.build_trigger_matrix(self.cli.load_reviewer_routing()),
         )
         self.assertEqual(1, self.cli.CLI_VERSION)
         self.assertIn("reviewer-routing.json` is authoritative", self.matrix)
