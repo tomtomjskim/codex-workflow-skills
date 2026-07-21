@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.workflow_coordination.canonical_json import sha256_id
+from scripts.workflow_coordination.derive import derive_coordination
 from scripts.workflow_coordination import reviewer_routing
 
 
@@ -76,20 +77,113 @@ class WorkflowCLITests(unittest.TestCase):
         )
 
     def _write_contract(self, prepared):
+        matrix = WORKFLOW_MODULE.build_trigger_matrix(
+            WORKFLOW_MODULE.load_reviewer_routing()
+        )
+        derived = derive_coordination(
+            prepared["manifest"],
+            prepared["inventory"],
+            matrix,
+            normalized_paths={
+                workstream["id"]: workstream["exclusive_write_paths"]
+                for workstream in prepared["manifest"]["workstreams"]
+            },
+        )
+        tree_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=self.repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        profile = {
+            "shared_interface": derived.profiles.shared_interface,
+            "path_overlap": derived.profiles.path_overlap,
+            "integration_dependency": derived.profiles.integration_dependency,
+        }
         core = {
             "schema_version": 1,
             "manifest_hash": prepared["manifest_hash"],
             "inventory_hash": prepared["inventory_hash"],
             "revision": 1,
+            "parent_contract_core_hash": None,
+            "contract_owner": "architect",
+            "integration_owner": "integration-owner",
+            "derived_profile": profile,
+            "extension_requirements": {
+                "interface_contract": (
+                    {"status": "approved"} if profile["shared_interface"] else {}
+                ),
+                "path_ownership": (
+                    {"status": "approved"} if profile["path_overlap"] else {}
+                ),
+                "integration": (
+                    {"status": "approved"}
+                    if profile["integration_dependency"]
+                    else {}
+                ),
+            },
         }
+        core_hash = sha256_id(core)
+        records = []
+        records.extend(
+            ("handoff", list(edge), edge[0])
+            for edge in derived.required_handoffs
+        )
+        records.extend(
+            ("checkpoint", list(edge), edge[0])
+            for edge in derived.required_checkpoints
+        )
+        records.extend(
+            ("acknowledgement", workstream_id, workstream_id)
+            for workstream_id in derived.required_acknowledgements
+        )
+        entries = []
+        previous_hash = sha256_id(None)
+        for index, (record_type, subject_id, producer_id) in enumerate(records):
+            body = {
+                "contract_core_hash": core_hash,
+                "previous_entry_hash": previous_hash,
+                "checkout_tree_hash": tree_hash,
+                "producer_id": producer_id,
+                "command_or_scenario_id": "workflow-cli-record-{}".format(index),
+                "artifact_digest": "sha256:" + format(index + 1, "064x"),
+                "run_id": "workflow-cli-entry-{}".format(index),
+                "recorded_at": "2026-07-21T00:00:00Z",
+                "record_type": record_type,
+                "subject_id": subject_id,
+                "status": "completed",
+            }
+            entry = dict(body, entry_hash=sha256_id(body))
+            entries.append(entry)
+            previous_hash = entry["entry_hash"]
         contract = {
             "contract_core": core,
             "execution_ledger": {
-                "contract_core_hash": sha256_id(core),
+                "contract_core_hash": core_hash,
                 "status": "frozen",
-                "entries": [],
-                "ledger_hash": sha256_id([]),
+                "entries": entries,
+                "ledger_hash": sha256_id(
+                    [entry["entry_hash"] for entry in entries]
+                ),
                 "integration_gate": {"status": "open"},
+                "reviewer_registry": [
+                    {
+                        "lens": reviewer,
+                        "canonical_agent": reviewer,
+                        "required": True,
+                        "contract_core_hash": core_hash,
+                        "status": "completed",
+                        "dispatch_evidence": {
+                            "run_id": "dispatch-{}".format(reviewer)
+                        },
+                        "completion_evidence": {
+                            "run_id": "complete-{}".format(reviewer)
+                        },
+                        "defer_receipt": None,
+                    }
+                    for reviewer in derived.required_reviewers
+                ],
             },
         }
         path = self.out_dir / "contract.json"

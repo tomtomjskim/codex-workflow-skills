@@ -20,10 +20,62 @@ class ValidationError(ValueError):
 _SUBMITTED_SET_FIELDS = (
     "affected_consumers",
     "required_handoffs",
+    "required_checkpoints",
     "required_acknowledgements",
     "required_reviewers",
 )
 _GLOB_METACHARACTERS = frozenset("*?[]")
+_CONTRACT_KEYS = {"contract_core", "execution_ledger"}
+_CORE_KEYS = {
+    "schema_version",
+    "manifest_hash",
+    "inventory_hash",
+    "revision",
+    "parent_contract_core_hash",
+    "contract_owner",
+    "integration_owner",
+    "derived_profile",
+    "extension_requirements",
+}
+_PROFILE_KEYS = {
+    "shared_interface",
+    "path_overlap",
+    "integration_dependency",
+}
+_EXTENSION_KEYS = {"interface_contract", "path_ownership", "integration"}
+_LEDGER_KEYS = {
+    "contract_core_hash",
+    "status",
+    "entries",
+    "ledger_hash",
+    "integration_gate",
+    "reviewer_registry",
+}
+_ENTRY_KEYS = {
+    "contract_core_hash",
+    "previous_entry_hash",
+    "checkout_tree_hash",
+    "producer_id",
+    "command_or_scenario_id",
+    "artifact_digest",
+    "run_id",
+    "recorded_at",
+    "record_type",
+    "subject_id",
+    "status",
+    "entry_hash",
+}
+_REVIEWER_KEYS = {
+    "lens",
+    "canonical_agent",
+    "required",
+    "contract_core_hash",
+    "status",
+    "dispatch_evidence",
+    "completion_evidence",
+    "defer_receipt",
+}
+_SHA256_ID = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def _canonical_hash(value: object) -> str:
@@ -210,6 +262,9 @@ def _required_sets(derived: object) -> dict:
     return {
         "affected_consumers": list(derived.affected_consumers),
         "required_handoffs": [list(handoff) for handoff in derived.required_handoffs],
+        "required_checkpoints": [
+            list(checkpoint) for checkpoint in derived.required_checkpoints
+        ],
         "required_acknowledgements": list(derived.required_acknowledgements),
         "required_reviewers": list(derived.required_reviewers),
     }
@@ -224,36 +279,151 @@ def _validate_submitted_derivation(manifest: dict, derived: object) -> None:
         raise ValidationError("submitted route differs from derivation")
 
 
+def _exact_object(value: object, keys: Set[str], label: str) -> dict:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValidationError("{} schema is invalid".format(label))
+    return value
+
+
+def _nonempty_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValidationError("{} must be a non-empty string".format(label))
+    return value
+
+
+def _sha256_identifier(value: object, label: str) -> str:
+    if not isinstance(value, str) or _SHA256_ID.fullmatch(value) is None:
+        raise ValidationError("{} must be a sha256 identifier".format(label))
+    return value
+
+
+def _entry_subject(entry: dict) -> object:
+    record_type = entry["record_type"]
+    subject = entry["subject_id"]
+    if record_type in ("handoff", "checkpoint"):
+        if (
+            not isinstance(subject, list)
+            or len(subject) != 2
+            or any(not isinstance(item, str) or not item for item in subject)
+        ):
+            raise ValidationError("edge ledger subject_id must contain two workstreams")
+        return tuple(subject)
+    if record_type == "acknowledgement":
+        return _nonempty_string(subject, "acknowledgement subject_id")
+    raise ValidationError("ledger record_type is invalid")
+
+
+def _required_ledger_records(derived: object) -> Set[object]:
+    records = {
+        ("handoff", tuple(edge)) for edge in derived.required_handoffs
+    }
+    records.update(
+        ("checkpoint", tuple(edge)) for edge in derived.required_checkpoints
+    )
+    records.update(
+        ("acknowledgement", workstream_id)
+        for workstream_id in derived.required_acknowledgements
+    )
+    return records
+
+
 def _validate_contract(
-    contract: object, manifest_hash: str, inventory_hash: str
+    contract: object,
+    manifest_hash: str,
+    inventory_hash: str,
+    derived: object,
+    checkout_tree_hash: str,
 ) -> str:
-    if not isinstance(contract, dict):
-        raise ValidationError("contract must be an object")
+    contract = _exact_object(contract, _CONTRACT_KEYS, "contract")
     core = contract.get("contract_core")
     ledger = contract.get("execution_ledger")
-    if not isinstance(core, dict) or not isinstance(ledger, dict):
-        raise ValidationError("contract core and execution ledger are required")
+    core = _exact_object(core, _CORE_KEYS, "contract core")
+    ledger = _exact_object(ledger, _LEDGER_KEYS, "execution ledger")
+
+    if core.get("schema_version") != 1:
+        raise ValidationError("contract core schema_version must be 1")
+    revision = core.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValidationError("contract core revision must be a positive integer")
+    parent_hash = core.get("parent_contract_core_hash")
+    if revision == 1 and parent_hash is not None:
+        raise ValidationError("initial contract core parent hash must be null")
+    if revision > 1:
+        _sha256_identifier(parent_hash, "parent contract core hash")
+    _nonempty_string(core.get("contract_owner"), "contract owner")
+    _nonempty_string(core.get("integration_owner"), "integration owner")
 
     core_hash = _canonical_hash(core)
     if core.get("manifest_hash") != manifest_hash:
         raise ValidationError("contract core manifest hash mismatch")
     if core.get("inventory_hash") != inventory_hash:
         raise ValidationError("contract core inventory hash mismatch")
+    expected_profile = {
+        "shared_interface": derived.profiles.shared_interface,
+        "path_overlap": derived.profiles.path_overlap,
+        "integration_dependency": derived.profiles.integration_dependency,
+    }
+    profile = _exact_object(
+        core.get("derived_profile"), _PROFILE_KEYS, "contract derived profile"
+    )
+    if any(type(value) is not bool for value in profile.values()):
+        raise ValidationError("contract derived profile values must be booleans")
+    if profile != expected_profile:
+        raise ValidationError("contract derived profile differs from derivation")
+
+    extensions = _exact_object(
+        core.get("extension_requirements"),
+        _EXTENSION_KEYS,
+        "contract extension requirements",
+    )
+    for name, value in extensions.items():
+        if not isinstance(value, dict):
+            raise ValidationError("contract extension {} must be an object".format(name))
+        _canonical_hash(value)
+    active_extensions = {
+        "shared_interface": "interface_contract",
+        "path_overlap": "path_ownership",
+        "integration_dependency": "integration",
+    }
+    for profile_name, extension_name in active_extensions.items():
+        if expected_profile[profile_name] and not extensions[extension_name]:
+            raise ValidationError(
+                "active profile requires non-empty {} extension".format(extension_name)
+            )
+
     if ledger.get("contract_core_hash") != core_hash:
         raise ValidationError("contract core hash mismatch")
+
+    if ledger.get("status") not in ("draft", "frozen", "changed"):
+        raise ValidationError("execution ledger status is invalid")
 
     entries = ledger.get("entries")
     if not isinstance(entries, list):
         raise ValidationError("execution ledger entries must be a list")
     previous_hash = _canonical_hash(None)
     entry_hashes = []
+    completed_records = set()
     for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            raise ValidationError("ledger entry must be an object")
+        entry = _exact_object(entry, _ENTRY_KEYS, "ledger entry")
         if entry.get("contract_core_hash") != core_hash:
             raise ValidationError("contract core hash mismatch in ledger entry")
         if entry.get("previous_entry_hash") != previous_hash:
             raise ValidationError("ledger chain mismatch at entry {}".format(index))
+        if entry.get("checkout_tree_hash") != checkout_tree_hash:
+            raise ValidationError("ledger entry checkout tree hash mismatch")
+        for field in ("producer_id", "command_or_scenario_id", "run_id"):
+            _nonempty_string(entry.get(field), "ledger entry {}".format(field))
+        _sha256_identifier(entry.get("artifact_digest"), "artifact digest")
+        _recorded_at(lambda: entry.get("recorded_at"))
+        if entry.get("status") not in ("completed", "failed", "stale"):
+            raise ValidationError("ledger entry status is invalid")
+        record = (entry.get("record_type"), _entry_subject(entry))
+        if record not in _required_ledger_records(derived):
+            raise ValidationError("unexpected ledger evidence record")
+        if record in completed_records:
+            raise ValidationError("duplicate ledger evidence record")
+        if entry["status"] == "completed":
+            completed_records.add(record)
         entry_hash = entry.get("entry_hash")
         body = {key: copy.deepcopy(value) for key, value in entry.items() if key != "entry_hash"}
         if entry_hash != _canonical_hash(body):
@@ -263,6 +433,55 @@ def _validate_contract(
 
     if ledger.get("ledger_hash") != _canonical_hash(entry_hashes):
         raise ValidationError("ledger hash mismatch")
+
+    missing_records = _required_ledger_records(derived).difference(completed_records)
+    if missing_records:
+        raise ValidationError("required ledger evidence is missing or incomplete")
+
+    gate = _exact_object(
+        ledger.get("integration_gate"), {"status"}, "integration gate"
+    )
+    if gate.get("status") != "open":
+        raise ValidationError("integration gate cannot be self-declared closed")
+
+    registry = ledger.get("reviewer_registry")
+    if not isinstance(registry, list):
+        raise ValidationError("reviewer registry must be a list")
+    completed_reviewers = set()
+    seen_reviewers = set()
+    expected_reviewers = set(derived.required_reviewers)
+    for reviewer in registry:
+        reviewer = _exact_object(reviewer, _REVIEWER_KEYS, "reviewer registry entry")
+        canonical_agent = _nonempty_string(
+            reviewer.get("canonical_agent"), "reviewer canonical agent"
+        )
+        _nonempty_string(reviewer.get("lens"), "reviewer lens")
+        if canonical_agent not in expected_reviewers:
+            raise ValidationError("unexpected reviewer registry entry")
+        if canonical_agent in seen_reviewers:
+            raise ValidationError("duplicate reviewer registry entry")
+        seen_reviewers.add(canonical_agent)
+        if reviewer.get("required") is not True:
+            raise ValidationError("required reviewer registry entry must be required")
+        if reviewer.get("contract_core_hash") != core_hash:
+            raise ValidationError("reviewer registry contract core hash mismatch")
+        if reviewer.get("defer_receipt") is not None:
+            raise ValidationError("reviewer defer receipts require a separate validator")
+        if reviewer.get("status") != "completed":
+            raise ValidationError("required reviewer is not completed")
+        if not isinstance(reviewer.get("dispatch_evidence"), dict) or not reviewer[
+            "dispatch_evidence"
+        ]:
+            raise ValidationError("required reviewer dispatch evidence is missing")
+        if not isinstance(reviewer.get("completion_evidence"), dict) or not reviewer[
+            "completion_evidence"
+        ]:
+            raise ValidationError("required reviewer completion evidence is missing")
+        _canonical_hash(reviewer["dispatch_evidence"])
+        _canonical_hash(reviewer["completion_evidence"])
+        completed_reviewers.add(canonical_agent)
+    if completed_reviewers != expected_reviewers:
+        raise ValidationError("required reviewer registry is incomplete")
     return core_hash
 
 
@@ -315,13 +534,13 @@ def validate_coordination(
 
     manifest_hash = _canonical_hash(manifest)
     inventory_hash = _canonical_hash(inventory)
-    contract_core_hash = None
-    if contract is not None:
-        contract_core_hash = _validate_contract(
-            contract, manifest_hash, inventory_hash
-        )
-
-    derived = derive_coordination(manifest, inventory, trigger_matrix)
+    tree_hash = _validate_checkout_tree_hash(checkout_tree_hash)
+    derived = derive_coordination(
+        manifest,
+        inventory,
+        trigger_matrix,
+        normalized_paths=normalized_paths,
+    )
     if derived.route == "blocked":
         if trigger_matrix is None:
             raise ValidationError("trigger matrix is required")
@@ -329,6 +548,16 @@ def validate_coordination(
             "coordination derivation blocked: {}".format(derived.completeness)
         )
     _validate_submitted_derivation(manifest, derived)
+
+    contract_core_hash = None
+    if contract is not None:
+        contract_core_hash = _validate_contract(
+            contract,
+            manifest_hash,
+            inventory_hash,
+            derived,
+            tree_hash,
+        )
 
     if contract is None and derived.route == "contracted":
         raise ValidationError("current contract required for contracted route")
@@ -338,8 +567,6 @@ def validate_coordination(
         and contract["execution_ledger"].get("status") != "frozen"
     ):
         raise ValidationError("contracted route execution ledger must be frozen")
-
-    tree_hash = _validate_checkout_tree_hash(checkout_tree_hash)
 
     run_factory = run_id_factory or (lambda: str(uuid.uuid4()))
     run_id = run_factory()
@@ -360,6 +587,8 @@ def validate_coordination(
         recorded_at=_recorded_at(time_source),
         derived_profiles={
             "shared_interface": derived.profiles.shared_interface,
+            "path_overlap": derived.profiles.path_overlap,
+            "integration_dependency": derived.profiles.integration_dependency,
         },
     )
 

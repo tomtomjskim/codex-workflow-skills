@@ -47,15 +47,65 @@ def _contract(prepared=PREPARED):
         "manifest_hash": prepared.manifest_hash,
         "inventory_hash": prepared.inventory_hash,
         "revision": 1,
+        "parent_contract_core_hash": None,
+        "contract_owner": "architect",
+        "integration_owner": "integration-owner",
+        "derived_profile": {
+            "shared_interface": True,
+            "path_overlap": False,
+            "integration_dependency": True,
+        },
+        "extension_requirements": {
+            "interface_contract": {"status": "approved"},
+            "path_ownership": {},
+            "integration": {"status": "approved"},
+        },
     }
+    core_hash = sha256_id(core)
+    records = (
+        ("handoff", ["backend", "frontend"], "backend"),
+        ("checkpoint", ["backend", "frontend"], "backend"),
+        ("acknowledgement", "frontend", "frontend"),
+    )
+    entries = []
+    previous_hash = sha256_id(None)
+    for index, (record_type, subject_id, producer_id) in enumerate(records):
+        body = {
+            "contract_core_hash": core_hash,
+            "previous_entry_hash": previous_hash,
+            "checkout_tree_hash": TREE_HASH,
+            "producer_id": producer_id,
+            "command_or_scenario_id": "coordination-record-{}".format(index),
+            "artifact_digest": "sha256:" + format(index + 1, "064x"),
+            "run_id": "entry-run-{}".format(index),
+            "recorded_at": "2026-07-21T00:00:00Z",
+            "record_type": record_type,
+            "subject_id": subject_id,
+            "status": "completed",
+        }
+        entry = dict(body, entry_hash=sha256_id(body))
+        entries.append(entry)
+        previous_hash = entry["entry_hash"]
     return {
         "contract_core": core,
         "execution_ledger": {
-            "contract_core_hash": sha256_id(core),
+            "contract_core_hash": core_hash,
             "status": "frozen",
-            "entries": [],
-            "ledger_hash": sha256_id([]),
+            "entries": entries,
+            "ledger_hash": sha256_id([entry["entry_hash"] for entry in entries]),
             "integration_gate": {"status": "open"},
+            "reviewer_registry": [
+                {
+                    "lens": "api",
+                    "canonical_agent": "api-reviewer",
+                    "required": True,
+                    "contract_core_hash": core_hash,
+                    "status": "completed",
+                    "dispatch_evidence": {"run_id": "dispatch-api"},
+                    "completion_evidence": {"run_id": "complete-api"},
+                    "defer_receipt": None,
+                }
+            ],
         },
     }
 
@@ -95,6 +145,8 @@ class CoordinationValidationTests(unittest.TestCase):
                 PREPARED.manifest,
                 PREPARED.inventory,
                 stale_contract,
+                trigger_matrix=TRIGGER_MATRIX,
+                checkout_tree_hash=TREE_HASH,
             )
 
     def test_rejects_unsafe_paths_missing_dependencies_and_duplicate_owners(self):
@@ -155,7 +207,14 @@ class CoordinationValidationTests(unittest.TestCase):
         self.assertEqual(receipt.manifest_hash, sha256_id(PREPARED.manifest))
         self.assertEqual(receipt.inventory_hash, sha256_id(PREPARED.inventory))
         self.assertEqual(receipt.derived_route, "contracted")
-        self.assertEqual(dict(receipt.derived_profiles), {"shared_interface": True})
+        self.assertEqual(
+            dict(receipt.derived_profiles),
+            {
+                "shared_interface": True,
+                "path_overlap": False,
+                "integration_dependency": True,
+            },
+        )
         self.assertEqual(
             receipt.required_sets["required_handoffs"],
             (("backend", "frontend"),),
@@ -189,22 +248,6 @@ class CoordinationValidationTests(unittest.TestCase):
 
     def test_rejects_broken_ledger_chain_and_hash_domain(self):
         contract = _contract()
-        core_hash = contract["execution_ledger"]["contract_core_hash"]
-        entry_body = {
-            "contract_core_hash": core_hash,
-            "previous_entry_hash": sha256_id(None),
-            "checkout_tree_hash": TREE_HASH,
-            "producer_id": "frontend",
-            "command_or_scenario_id": "unit-test",
-            "artifact_digest": "sha256:" + "b" * 64,
-            "run_id": "entry-run",
-            "recorded_at": "2026-07-21T00:00:00Z",
-        }
-        entry = dict(entry_body, entry_hash=sha256_id(entry_body))
-        contract["execution_ledger"]["entries"] = [entry]
-        contract["execution_ledger"]["ledger_hash"] = sha256_id(
-            [entry["entry_hash"]]
-        )
         validate_coordination(
             self.repo_root,
             PREPARED.manifest,
@@ -240,6 +283,116 @@ class CoordinationValidationTests(unittest.TestCase):
                 trigger_matrix=TRIGGER_MATRIX,
                 checkout_tree_hash=TREE_HASH,
             )
+
+    def test_rejects_frozen_contracted_contract_with_empty_ledger(self):
+        contract = _contract()
+        contract["execution_ledger"]["entries"] = []
+        contract["execution_ledger"]["ledger_hash"] = sha256_id([])
+        with self.assertRaisesRegex(ValidationError, "required ledger evidence"):
+            validate_coordination(
+                self.repo_root,
+                PREPARED.manifest,
+                PREPARED.inventory,
+                contract,
+                trigger_matrix=TRIGGER_MATRIX,
+                checkout_tree_hash=TREE_HASH,
+            )
+
+    def test_rejects_incomplete_core_profile_and_self_closed_gate(self):
+        cases = []
+        missing_owner = _contract()
+        del missing_owner["contract_core"]["contract_owner"]
+        cases.append((missing_owner, "contract core schema"))
+        wrong_profile = _contract()
+        wrong_profile["contract_core"]["derived_profile"][
+            "integration_dependency"
+        ] = False
+        cases.append((wrong_profile, "derived profile"))
+        closed_gate = _contract()
+        closed_gate["execution_ledger"]["integration_gate"]["status"] = "closed"
+        cases.append((closed_gate, "integration gate"))
+
+        for contract, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValidationError, message):
+                    validate_coordination(
+                        self.repo_root,
+                        PREPARED.manifest,
+                        PREPARED.inventory,
+                        contract,
+                        trigger_matrix=TRIGGER_MATRIX,
+                        checkout_tree_hash=TREE_HASH,
+                    )
+
+    def test_rejects_missing_required_edge_and_reviewer_records(self):
+        missing_edge = _contract()
+        missing_edge["execution_ledger"]["entries"] = missing_edge[
+            "execution_ledger"
+        ]["entries"][1:]
+        first = missing_edge["execution_ledger"]["entries"][0]
+        first["previous_entry_hash"] = sha256_id(None)
+        first_body = {key: value for key, value in first.items() if key != "entry_hash"}
+        first["entry_hash"] = sha256_id(first_body)
+        second = missing_edge["execution_ledger"]["entries"][1]
+        second["previous_entry_hash"] = first["entry_hash"]
+        second_body = {key: value for key, value in second.items() if key != "entry_hash"}
+        second["entry_hash"] = sha256_id(second_body)
+        missing_edge["execution_ledger"]["ledger_hash"] = sha256_id(
+            [first["entry_hash"], second["entry_hash"]]
+        )
+
+        missing_reviewer = _contract()
+        missing_reviewer["execution_ledger"]["reviewer_registry"] = []
+        cases = (
+            (missing_edge, "required ledger evidence"),
+            (missing_reviewer, "required reviewer"),
+        )
+        for contract, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValidationError, message):
+                    validate_coordination(
+                        self.repo_root,
+                        PREPARED.manifest,
+                        PREPARED.inventory,
+                        contract,
+                        trigger_matrix=TRIGGER_MATRIX,
+                        checkout_tree_hash=TREE_HASH,
+                    )
+
+    def test_rejects_invalid_extensions_revision_and_current_core_evidence(self):
+        empty_extension = _contract()
+        empty_extension["contract_core"]["extension_requirements"][
+            "interface_contract"
+        ] = {}
+
+        missing_parent = _contract()
+        missing_parent["contract_core"]["revision"] = 2
+
+        stale_reviewer = _contract()
+        stale_reviewer["execution_ledger"]["reviewer_registry"][0][
+            "contract_core_hash"
+        ] = "sha256:" + "0" * 64
+
+        malformed_entry = _contract()
+        del malformed_entry["execution_ledger"]["entries"][0]["record_type"]
+
+        cases = (
+            (empty_extension, "non-empty interface_contract extension"),
+            (missing_parent, "parent contract core hash"),
+            (stale_reviewer, "reviewer registry contract core hash"),
+            (malformed_entry, "ledger entry schema"),
+        )
+        for contract, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValidationError, message):
+                    validate_coordination(
+                        self.repo_root,
+                        PREPARED.manifest,
+                        PREPARED.inventory,
+                        contract,
+                        trigger_matrix=TRIGGER_MATRIX,
+                        checkout_tree_hash=TREE_HASH,
+                    )
 
     def test_wraps_noncanonical_artifact_as_validation_error(self):
         invalid_inventory = copy.deepcopy(PREPARED.inventory)

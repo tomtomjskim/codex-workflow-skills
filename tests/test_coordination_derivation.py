@@ -51,6 +51,48 @@ def _external_prepared(catalog):
 
 
 class DerivationTests(unittest.TestCase):
+    def test_dependency_edge_requires_contracted_integration_evidence(self):
+        plan = copy.deepcopy(PLAN)
+        plan["workstreams"][0]["consumes"] = []
+        plan["workstreams"][1]["produces"] = []
+        prepared = prepare_coordination(plan, None)
+
+        result = derive_coordination(
+            prepared.manifest,
+            prepared.inventory,
+            TRIGGER_MATRIX,
+        )
+
+        self.assertEqual(result.route, "contracted")
+        self.assertFalse(result.profiles.shared_interface)
+        self.assertFalse(result.profiles.path_overlap)
+        self.assertTrue(result.profiles.integration_dependency)
+        self.assertEqual(result.required_handoffs, (("backend", "frontend"),))
+        self.assertEqual(result.required_checkpoints, (("backend", "frontend"),))
+        self.assertEqual(result.required_acknowledgements, ("frontend",))
+
+    def test_normalized_path_overlap_activates_path_overlap_profile(self):
+        plan = copy.deepcopy(PLAN)
+        plan["workstreams"][0]["depends_on"] = []
+        plan["workstreams"][0]["consumes"] = []
+        plan["workstreams"][1]["produces"] = []
+        prepared = prepare_coordination(plan, None)
+
+        result = derive_coordination(
+            prepared.manifest,
+            prepared.inventory,
+            TRIGGER_MATRIX,
+            normalized_paths={
+                "backend": ["api/settings"],
+                "frontend": ["api"],
+            },
+        )
+
+        self.assertEqual(result.route, "contracted")
+        self.assertFalse(result.profiles.shared_interface)
+        self.assertTrue(result.profiles.path_overlap)
+        self.assertFalse(result.profiles.integration_dependency)
+
     def test_derives_object_ref_shared_api_and_reviewer_union(self):
         result = derive_coordination(MANIFEST, INVENTORY, TRIGGER_MATRIX)
 
@@ -108,7 +150,7 @@ class DerivationTests(unittest.TestCase):
         self.assertEqual(result.completeness, "unverified")
         self.assertEqual(result.route, "blocked")
 
-    def test_known_external_consume_is_verified_and_independent(self):
+    def test_known_external_consume_with_dependency_is_contracted(self):
         prepared = _external_prepared({"known_interface_ids": ["external-v1"]})
 
         result = derive_coordination(
@@ -116,7 +158,9 @@ class DerivationTests(unittest.TestCase):
         )
 
         self.assertEqual(result.completeness, "verified")
-        self.assertEqual(result.route, "independent")
+        self.assertEqual(result.route, "contracted")
+        self.assertTrue(result.profiles.integration_dependency)
+        self.assertEqual(result.required_handoffs, (("backend", "frontend"),))
 
     def test_explicit_catalog_omission_is_inventory_mismatch(self):
         prepared = _external_prepared({"known_interface_ids": ["different-v1"]})
@@ -180,6 +224,10 @@ class DerivationTests(unittest.TestCase):
         self.assertEqual(result.affected_consumers, ("admin", "frontend"))
         self.assertEqual(
             result.required_handoffs,
+            (("backend", "admin"), ("backend", "frontend")),
+        )
+        self.assertEqual(
+            result.required_checkpoints,
             (("backend", "admin"), ("backend", "frontend")),
         )
         self.assertEqual(result.required_acknowledgements, ("admin", "frontend"))

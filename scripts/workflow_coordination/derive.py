@@ -1,6 +1,7 @@
 """Derive coordination requirements from prepared artifacts."""
 
-from typing import Dict, Set, Tuple
+from pathlib import PurePosixPath
+from typing import Dict, List, Optional, Set, Tuple
 
 from .canonical_json import sha256_id
 from .models import DerivedCoordination, DerivedProfiles
@@ -141,16 +142,46 @@ def _blocked(completeness: str) -> DerivedCoordination:
     return DerivedCoordination(
         completeness=completeness,
         route="blocked",
-        profiles=DerivedProfiles(shared_interface=False),
+        profiles=DerivedProfiles(
+            shared_interface=False,
+            path_overlap=False,
+            integration_dependency=False,
+        ),
         affected_consumers=(),
         required_handoffs=(),
+        required_checkpoints=(),
         required_acknowledgements=(),
         required_reviewers=(),
     )
 
 
+def _has_path_overlap(normalized_paths: Optional[Dict[str, List[str]]]) -> bool:
+    if normalized_paths is None:
+        return False
+    owned = [
+        (PurePosixPath(path), workstream_id)
+        for workstream_id, paths in normalized_paths.items()
+        for path in paths
+    ]
+    for index, (path, workstream_id) in enumerate(owned):
+        for other_path, other_workstream_id in owned[index + 1 :]:
+            if workstream_id == other_workstream_id:
+                continue
+            if (
+                path == other_path
+                or path in other_path.parents
+                or other_path in path.parents
+            ):
+                return True
+    return False
+
+
 def derive_coordination(
-    manifest: dict, inventory: dict, trigger_matrix: dict
+    manifest: dict,
+    inventory: dict,
+    trigger_matrix: dict,
+    *,
+    normalized_paths: Optional[Dict[str, List[str]]] = None,
 ) -> DerivedCoordination:
     """Derive all gate inputs; never accept submitted route or required sets."""
     completeness = _artifact_status(manifest, inventory)
@@ -179,34 +210,57 @@ def derive_coordination(
     if any(ref_id not in known_interface_ids for _, ref_id in external_refs):
         return _blocked("mismatch" if known_interface_ids else "unverified")
 
-    consumers: Set[str] = set()
-    handoffs = set()
+    interface_consumers: Set[str] = set()
+    interface_handoffs = set()
     for workstream in manifest["workstreams"]:
         consumer_id = workstream["id"]
         for ref in workstream["consumes"]:
             for producer_id in producers.get(_identity(ref), ()):
                 if producer_id != consumer_id:
-                    consumers.add(consumer_id)
-                    handoffs.add((producer_id, consumer_id))
+                    interface_consumers.add(consumer_id)
+                    interface_handoffs.add((producer_id, consumer_id))
 
-    shared_interface = bool(handoffs)
+    dependency_edges = {
+        (dependency, workstream["id"])
+        for workstream in manifest["workstreams"]
+        for dependency in workstream["depends_on"]
+    }
+    integration_edges = interface_handoffs.union(dependency_edges)
+    shared_interface = bool(interface_handoffs)
+    path_overlap = _has_path_overlap(normalized_paths)
+    integration_dependency = bool(dependency_edges)
     reviewers = set()
-    if shared_interface:
+    profiles = {
+        "shared_interface": shared_interface,
+        "path_overlap": path_overlap,
+        "integration_dependency": integration_dependency,
+    }
+    for profile, active in profiles.items():
+        if not active:
+            continue
         reviewers.update(
-            trigger_matrix["profile_reviewers"].get("shared_interface", [])
+            trigger_matrix["profile_reviewers"].get(profile, [])
         )
     for surface in manifest["changed_surfaces"]:
         reviewers.update(
             trigger_matrix["changed_surface_reviewers"].get(surface, [])
         )
 
-    sorted_consumers = tuple(sorted(consumers))
+    affected_consumers = interface_consumers.union(
+        dependent for _, dependent in dependency_edges
+    )
+    sorted_consumers = tuple(sorted(affected_consumers))
     return DerivedCoordination(
         completeness="verified",
-        route="contracted" if shared_interface else "independent",
-        profiles=DerivedProfiles(shared_interface=shared_interface),
+        route="contracted" if any(profiles.values()) else "independent",
+        profiles=DerivedProfiles(
+            shared_interface=shared_interface,
+            path_overlap=path_overlap,
+            integration_dependency=integration_dependency,
+        ),
         affected_consumers=sorted_consumers,
-        required_handoffs=tuple(sorted(handoffs)),
+        required_handoffs=tuple(sorted(integration_edges)),
+        required_checkpoints=tuple(sorted(integration_edges)),
         required_acknowledgements=sorted_consumers,
         required_reviewers=tuple(sorted(reviewers)),
     )

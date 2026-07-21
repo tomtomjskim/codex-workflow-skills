@@ -6,6 +6,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class DerivedProfiles:
     shared_interface: bool
+    path_overlap: bool
+    integration_dependency: bool
 
 
 @dataclass(frozen=True)
@@ -15,5 +17,6 @@ class DerivedCoordination:
     profiles: DerivedProfiles
     affected_consumers: tuple[str, ...]
     required_handoffs: tuple[tuple[str, str], ...]
+    required_checkpoints: tuple[tuple[str, str], ...]
     required_acknowledgements: tuple[str, ...]
     required_reviewers: tuple[str, ...]
