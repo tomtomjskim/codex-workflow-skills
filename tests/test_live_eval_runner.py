@@ -6,10 +6,12 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+import scripts.run_live_eval as live_runner
 from scripts.live_eval.isolation import CliCapabilities
 from scripts.live_eval.isolation import EvalConfig, build_invocation
 from scripts.run_live_eval import (
@@ -43,15 +45,23 @@ REQUIRED_FLAGS = frozenset(
 
 
 class FakeCodex:
-    def __init__(self, outcomes=(), mutate_after_probe=False, mutate_on_failure=None):
+    def __init__(
+        self,
+        outcomes=(),
+        mutate_after_probe=False,
+        mutate_on_failure=None,
+        probe_readiness=(),
+    ):
         self.outcomes = list(outcomes)
         self.mutate_after_probe = mutate_after_probe
         self.mutate_on_failure = mutate_on_failure
+        self.probe_readiness = list(probe_readiness)
         self.probed = []
         self.invoked = []
 
     def probe(self, invocation):
         self.probed.append(invocation)
+        ready = self.probe_readiness.pop(0) if self.probe_readiness else True
         capabilities = CliCapabilities(
             selected_executable=invocation.executable,
             selected_executable_identity=invocation.executable_identity,
@@ -61,11 +71,11 @@ class FakeCodex:
             child_env_policy_id=invocation.child_env_policy_id,
             child_env_policy_digest=invocation.child_env_policy_digest,
             non_profile_child_env=True,
-            network_disabled=True,
-            mcp_disabled=True,
-            plugins_disabled=True,
-            hooks_disabled=True,
-            unexpected_skills_absent=True,
+            network_disabled=ready,
+            mcp_disabled=ready,
+            plugins_disabled=ready,
+            hooks_disabled=ready,
+            unexpected_skills_absent=ready,
         )
         if self.mutate_after_probe:
             target = invocation.codex_home / "skills" / "workflow" / "SKILL.md"
@@ -79,6 +89,7 @@ class FakeCodex:
         prompt,
         timeout_seconds,
         *,
+        max_stdin_bytes,
         max_stdout_bytes,
         max_stderr_bytes,
     ):
@@ -87,6 +98,7 @@ class FakeCodex:
                 invocation,
                 prompt,
                 timeout_seconds,
+                max_stdin_bytes,
                 max_stdout_bytes,
                 max_stderr_bytes,
             )
@@ -110,7 +122,7 @@ class FakePopen:
         self.kwargs = kwargs
         self.stdout = io.BytesIO(specification.get("stdout", b""))
         self.stderr = io.BytesIO(specification.get("stderr", b""))
-        self.stdin = io.BytesIO()
+        self.stdin = specification.get("stdin", io.BytesIO())
         self.returncode = specification.get("returncode", 0)
         self.pid = self.next_pid
         type(self).next_pid += 1
@@ -423,6 +435,37 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.model_calls, 0)
         self.assertEqual(fake.invoked, [])
 
+    def test_lease_time_probe_must_return_new_ready_capabilities(self):
+        fake = FakeCodex(
+            [final_output({"next_step": "ask", "autonomy_level": "L0"})],
+            probe_readiness=(True, False),
+        )
+
+        result = run_eval(self.request(), fake)
+
+        self.assertEqual(result.status, "blocked_isolation")
+        self.assertEqual(result.attempts, 0)
+        self.assertEqual(result.model_calls, 0)
+        self.assertEqual(fake.invoked, [])
+        self.assertEqual(len(fake.probed), 2)
+
+    def test_retry_time_probe_failure_blocks_second_invoke(self):
+        fake = FakeCodex(
+            [
+                RetryableTransportFailure(),
+                final_output({"next_step": "ask", "autonomy_level": "L0"}),
+            ],
+            probe_readiness=(True, True, False),
+        )
+
+        result = run_eval(self.request(), fake)
+
+        self.assertEqual(result.status, "blocked_isolation")
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(result.model_calls, 1)
+        self.assertEqual(len(fake.invoked), 1)
+        self.assertEqual(len(fake.probed), 3)
+
     def test_timeout_blocks_without_retry(self):
         fake = FakeCodex([InvocationTimeout()])
 
@@ -446,6 +489,70 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result.status, status)
                 self.assertEqual(result.attempts, 1)
                 self.assertEqual(len(fake.invoked), 1)
+
+    def test_completed_nonzero_process_exit_is_nonretryable(self):
+        invocation = self.invocation()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"returncode": 1, "stderr": b"secret-auth-error"}]
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen):
+            with self.assertRaisesRegex(RuntimeError, "process execution failed") as raised:
+                SubprocessCodex().invoke(
+                    invocation,
+                    "prompt",
+                    10,
+                    max_stdin_bytes=32,
+                    max_stdout_bytes=32,
+                    max_stderr_bytes=32,
+                )
+
+        self.assertNotIn("secret-auth-error", repr(raised.exception))
+        self.assertNotIsInstance(raised.exception, RetryableTransportFailure)
+
+    def test_process_execution_failure_blocks_after_one_attempt(self):
+        failure_type = getattr(live_runner, "ProcessExecutionFailure", RuntimeError)
+        fake = FakeCodex(
+            [
+                failure_type(),
+                final_output({"next_step": "ask", "autonomy_level": "L0"}),
+            ]
+        )
+
+        result = run_eval(self.request(), fake)
+
+        self.assertEqual(result.status, "blocked_process")
+        self.assertEqual(result.attempts, 1)
+        self.assertEqual(result.model_calls, 1)
+        self.assertEqual(len(fake.invoked), 1)
+
+    def test_popen_spawn_oserror_is_sanitized_retryable_transport_failure(self):
+        invocation = self.invocation()
+        with mock.patch(
+            "scripts.run_live_eval.subprocess.Popen",
+            side_effect=OSError("secret-spawn-detail"),
+        ):
+            with self.assertRaises(RetryableTransportFailure) as raised:
+                SubprocessCodex().invoke(
+                    invocation,
+                    "prompt",
+                    10,
+                    max_stdin_bytes=32,
+                    max_stdout_bytes=32,
+                    max_stderr_bytes=32,
+                )
+
+        self.assertNotIn("secret-spawn-detail", repr(raised.exception))
+
+    def test_probe_parse_failure_is_not_retryable_transport_failure(self):
+        invocation = self.invocation()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"stdout": b"not-a-version"}]
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen):
+            with self.assertRaises(live_runner.ProcessExecutionFailure) as raised:
+                SubprocessCodex().probe(invocation)
+
+        self.assertNotIsInstance(raised.exception, RetryableTransportFailure)
 
     def test_duplicate_or_malformed_terminal_response_is_protocol_block(self):
         duplicate = ProcessOutput(
@@ -515,6 +622,7 @@ class RunnerTests(unittest.TestCase):
                     invocation,
                     "prompt",
                     10,
+                    max_stdin_bytes=32,
                     max_stdout_bytes=32,
                     max_stderr_bytes=32,
                 )
@@ -536,11 +644,94 @@ class RunnerTests(unittest.TestCase):
                     invocation,
                     "prompt",
                     10,
+                    max_stdin_bytes=32,
                     max_stdout_bytes=32,
                     max_stderr_bytes=32,
                 )
 
         kill_group.assert_called_once_with(FakePopen.calls[0].pid, signal.SIGTERM)
+
+    def test_stdin_policy_rejects_zero_and_oversized_limits(self):
+        for limit in (0, 1024 * 1024 + 1):
+            with self.subTest(limit=limit):
+                with self.assertRaisesRegex(ValueError, "stdin"):
+                    run_eval(self.request(max_stdin_bytes=limit), FakeCodex())
+
+    def test_timeout_starts_before_large_stdin_write_and_kills_group(self):
+        class NeverReadStdin:
+            def __init__(self):
+                self.started = threading.Event()
+                self.released = threading.Event()
+
+            def write(self, value):
+                self.started.set()
+                self.released.wait(2)
+                return len(value)
+
+            def close(self):
+                self.released.set()
+
+        invocation = self.invocation()
+        blocked_stdin = NeverReadStdin()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"stdin": blocked_stdin, "returncode": None}]
+        raised = []
+
+        def invoke():
+            try:
+                SubprocessCodex().invoke(
+                    invocation,
+                    "x" * 65536,
+                    0.05,
+                    max_stdin_bytes=65536,
+                    max_stdout_bytes=32,
+                    max_stderr_bytes=32,
+                )
+            except BaseException as error:
+                raised.append(error)
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen), mock.patch(
+            "scripts.run_live_eval.os.killpg"
+        ) as kill_group:
+            worker = threading.Thread(target=invoke, daemon=True)
+            worker.start()
+            worker.join(timeout=0.5)
+            was_still_blocked = worker.is_alive()
+            if was_still_blocked:
+                blocked_stdin.close()
+                worker.join(timeout=1)
+
+        self.assertFalse(was_still_blocked)
+        self.assertEqual(len(raised), 1)
+        self.assertIsInstance(raised[0], InvocationTimeout)
+        kill_group.assert_called_once_with(FakePopen.calls[0].pid, signal.SIGTERM)
+
+    def test_stdin_writer_error_is_sanitized_nonretryable_process_failure(self):
+        class FailingStdin:
+            def write(self, _value):
+                raise RuntimeError("secret-writer-detail")
+
+            def close(self):
+                return None
+
+        invocation = self.invocation()
+        FakePopen.calls = []
+        FakePopen.outputs = [{"stdin": FailingStdin(), "returncode": None}]
+
+        with mock.patch("scripts.run_live_eval.subprocess.Popen", FakePopen), mock.patch(
+            "scripts.run_live_eval.os.killpg"
+        ):
+            with self.assertRaises(live_runner.ProcessExecutionFailure) as raised:
+                SubprocessCodex().invoke(
+                    invocation,
+                    "prompt",
+                    1,
+                    max_stdin_bytes=32,
+                    max_stdout_bytes=32,
+                    max_stderr_bytes=32,
+                )
+
+        self.assertNotIn("secret-writer-detail", repr(raised.exception))
 
     def test_results_and_errors_never_repr_secret_values(self):
         secret = "must-not-appear-secret"
@@ -597,6 +788,72 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertFalse(cli_temp_root.exists())
+
+    def test_setup_cleanup_failure_is_reported_with_safe_residual_path(self):
+        with mock.patch(
+            "scripts.run_live_eval.install_checkout_skills",
+            side_effect=ValueError("setup failed"),
+        ), mock.patch(
+            "scripts.run_live_eval._cleanup_invocation_run",
+            side_effect=lambda invocation: (invocation.run_dir,),
+        ):
+            result = run_eval(self.request(), FakeCodex())
+
+        scenario = result.scenarios[0]
+        self.assertEqual(scenario.status, "blocked_isolation")
+        self.assertEqual(scenario.retention, "cleanup_required")
+        self.assertTrue(scenario.manual_cleanup_required)
+        self.assertEqual(scenario.retained_paths, (scenario.retained_paths[0].resolve(),))
+        self.assertTrue(scenario.retained_paths[0].is_relative_to(self.runtime))
+        self.assertEqual(result.retention, "cleanup_required")
+        self.assertTrue(result.manual_cleanup_required)
+
+    def test_blocked_no_artifact_cleanup_failure_is_reported(self):
+        fake = FakeCodex([InvocationTimeout()])
+        with mock.patch(
+            "scripts.run_live_eval._cleanup_invocation_run",
+            side_effect=lambda invocation: (invocation.run_dir,),
+        ):
+            result = run_eval(self.request(), fake)
+
+        scenario = result.scenarios[0]
+        self.assertEqual(scenario.status, "blocked_timeout")
+        self.assertIsNone(scenario.artifact_path)
+        self.assertEqual(scenario.retention, "cleanup_required")
+        self.assertTrue(scenario.manual_cleanup_required)
+        self.assertEqual(len(scenario.retained_paths), 1)
+
+    def test_cli_root_cleanup_failure_adjusts_serialized_result(self):
+        cli_temp_root = self.runtime / "cli-residual-root"
+
+        def make_temp_root(**_kwargs):
+            cli_temp_root.mkdir(mode=0o700)
+            return str(cli_temp_root)
+
+        blocked = EvalResult(
+            "blocked_isolation",
+            "blocked",
+            0,
+            0,
+            RunManifest(("intake-ambiguous-safe",), "gpt-5.6-sol", False, None),
+        )
+        output = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {"OPENAI_API_KEY": "process-local-secret"}, clear=True
+        ), mock.patch("scripts.run_live_eval.shutil.which", return_value=str(self.executable)), mock.patch(
+            "scripts.run_live_eval.tempfile.mkdtemp", side_effect=make_temp_root
+        ), mock.patch("scripts.run_live_eval.run_eval", return_value=blocked), mock.patch(
+            "scripts.run_live_eval._cleanup_cli_temp_root",
+            return_value=(cli_temp_root.resolve(),),
+        ):
+            with redirect_stdout(output):
+                exit_code = main(["--scenario", "intake-ambiguous-safe"])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(payload["retention"], "cleanup_required")
+        self.assertTrue(payload["manual_cleanup_required"])
+        self.assertEqual(payload["retained_paths"], [str(cli_temp_root.resolve())])
 
     def test_script_entrypoint_runs_from_repository_root(self):
         root = Path(__file__).resolve().parents[1]

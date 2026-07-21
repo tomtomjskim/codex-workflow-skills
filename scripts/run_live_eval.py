@@ -2,7 +2,7 @@
 """Run isolated workflow live evaluations or deterministic planning preflights."""
 
 import argparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import os
 from pathlib import Path
@@ -82,6 +82,13 @@ class RetryableTransportFailure(RuntimeError):
         super().__init__("live eval invocation failed")
 
 
+class ProcessExecutionFailure(RuntimeError):
+    """A sanitized, non-retryable completed-process failure."""
+
+    def __init__(self) -> None:
+        super().__init__("live eval process execution failed")
+
+
 class InvocationTimeout(RuntimeError):
     """A sanitized, non-retryable process timeout."""
 
@@ -92,6 +99,11 @@ class InvocationTimeout(RuntimeError):
 class OutputLimit(RuntimeError):
     def __init__(self) -> None:
         super().__init__("live eval output limit exceeded")
+
+
+class InputLimit(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("live eval input limit exceeded")
 
 
 class OutputProtocolError(RuntimeError):
@@ -119,6 +131,7 @@ class CodexProcess(Protocol):
         prompt: str,
         timeout_seconds: int,
         *,
+        max_stdin_bytes: int,
         max_stdout_bytes: int,
         max_stderr_bytes: int,
     ) -> ProcessOutput:
@@ -139,6 +152,7 @@ class EvalRequest:
     api_key: Optional[str] = field(default=None, repr=False)
     api_key_env_name: str = DEFAULT_API_KEY_ENV_NAME
     model_allowlist: Tuple[str, ...] = DEFAULT_MODELS
+    max_stdin_bytes: int = Budget.TARGETED_MAX_RAW_BYTES
     max_stdout_bytes: int = 1024 * 1024
     max_stderr_bytes: int = 64 * 1024
 
@@ -194,6 +208,7 @@ class ScenarioEvalResult:
     artifact_path: Optional[Path] = None
     retention: str = "none"
     manual_cleanup_required: bool = False
+    retained_paths: Tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -204,6 +219,9 @@ class EvalResult:
     model_calls: int
     manifest: RunManifest
     scenarios: Tuple[ScenarioEvalResult, ...] = ()
+    retention: str = "none"
+    manual_cleanup_required: bool = False
+    retained_paths: Tuple[Path, ...] = ()
 
 
 def _default_scenario_path() -> Path:
@@ -217,6 +235,12 @@ def _validate_and_select(request: EvalRequest) -> Tuple[Scenario, ...]:
         raise ValueError("model must be a non-empty string")
     if request.model not in request.model_allowlist:
         raise ValueError("model must be present in the model allowlist")
+    if (
+        not isinstance(request.max_stdin_bytes, int)
+        or isinstance(request.max_stdin_bytes, bool)
+        or not 1 <= request.max_stdin_bytes <= Budget.TARGETED_MAX_RAW_BYTES
+    ):
+        raise ValueError("stdin byte limit must be within the targeted policy")
     modes = sum(bool(value) for value in (request.scenario_ids, request.tags, request.release_suite))
     if modes > 1:
         raise ValueError("scenario IDs, tags, and release suite are mutually exclusive")
@@ -313,65 +337,31 @@ def _run_scenario(
         if checkout.classification != "ready" or checkout.manifest != checkout_manifest:
             raise ValueError("exact checkout verification failed")
         seal = seal_codex_home(invocation.codex_home, CHECKOUT_ENTRIES)
-        capabilities = []
-
-        def capture_capabilities(candidate: Invocation) -> CliCapabilities:
-            value = codex.probe(candidate)
-            capabilities.append(value)
-            return value
-
         isolation = preflight_isolation(
             invocation,
-            probe=capture_capabilities,
+            probe=codex.probe,
             expected_codex_home_seal=seal,
         )
     except Exception:
-        if invocation is not None:
-            _cleanup_invocation_run(invocation)
-        return (
-            ScenarioEvalResult(
-                scenario.scenario_id, "blocked_isolation", "blocked", 0, 0
-            ),
-            None,
+        return _blocked_scenario_result(
+            scenario, "blocked_isolation", 0, 0, invocation, None
         )
     if (
         isolation.classification != "ready"
         or isolation.invocation_instance_id != id(invocation)
-        or len(capabilities) != 1
-        or not _consumption_ready(
-            request, invocation, seal, checkout_manifest, capabilities[0]
-        )
     ):
-        _cleanup_invocation_run(invocation)
-        return (
-            ScenarioEvalResult(
-                scenario.scenario_id, "blocked_isolation", "blocked", 0, 0
-            ),
-            checkout_manifest,
+        return _blocked_scenario_result(
+            scenario, "blocked_isolation", 0, 0, invocation, checkout_manifest
         )
 
     attempts = 0
     model_calls = 0
     had_infrastructure_failure = False
     while attempts < 2:
-        if not _consumption_ready(
-            request, invocation, seal, checkout_manifest, capabilities[0]
-        ):
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_isolation",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
-                checkout_manifest,
-            )
         try:
             with budget.acquire_call():
                 if not _consumption_ready(
-                    request, invocation, seal, checkout_manifest, capabilities[0]
+                    request, invocation, seal, checkout_manifest, codex
                 ):
                     raise IsolationChanged()
                 attempts += 1
@@ -380,108 +370,103 @@ def _run_scenario(
                     invocation,
                     scenario.prompt,
                     scenario.timeout_seconds,
+                    max_stdin_bytes=request.max_stdin_bytes,
                     max_stdout_bytes=request.max_stdout_bytes,
                     max_stderr_bytes=request.max_stderr_bytes,
                 )
             artifact = _retain_events(request, invocation, scenario, attempts, output)
             response = _final_response(artifact)
         except IsolationChanged:
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_isolation",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_isolation",
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         except InvocationTimeout:
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_timeout",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_timeout",
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         except OutputLimit:
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_output_limit",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_output_limit",
+                attempts,
+                model_calls,
+                invocation,
+                checkout_manifest,
+            )
+        except InputLimit:
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_input_limit",
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         except OutputProtocolError:
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_output_protocol",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_output_protocol",
+                attempts,
+                model_calls,
+                invocation,
+                checkout_manifest,
+            )
+        except ProcessExecutionFailure:
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_process",
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         except RedactionError:
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_redaction",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_redaction",
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         except BudgetExceeded as error:
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    error.decision.value,
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                error.decision.value,
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         except RetryableTransportFailure:
             if attempts < 2:
                 had_infrastructure_failure = True
                 continue
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_infrastructure",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_infrastructure",
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         except Exception:
-            _cleanup_invocation_run(invocation)
-            return (
-                ScenarioEvalResult(
-                    scenario.scenario_id,
-                    "blocked_internal",
-                    "blocked",
-                    attempts,
-                    model_calls,
-                ),
+            return _blocked_scenario_result(
+                scenario,
+                "blocked_internal",
+                attempts,
+                model_calls,
+                invocation,
                 checkout_manifest,
             )
         report = assert_response(scenario, response)
@@ -532,8 +517,38 @@ def _run_scenario(
     raise AssertionError("unreachable")
 
 
-def _cleanup_invocation_run(invocation: Invocation) -> bool:
+def _blocked_scenario_result(
+    scenario: Scenario,
+    status: str,
+    attempts: int,
+    model_calls: int,
+    invocation: Optional[Invocation],
+    checkout_manifest: Optional[CheckoutManifest],
+) -> Tuple[ScenarioEvalResult, Optional[CheckoutManifest]]:
+    retained_paths = (
+        _cleanup_invocation_run(invocation) if invocation is not None else ()
+    )
+    return (
+        ScenarioEvalResult(
+            scenario.scenario_id,
+            status,
+            "blocked",
+            attempts,
+            model_calls,
+            retention="cleanup_required" if retained_paths else "none",
+            manual_cleanup_required=bool(retained_paths),
+            retained_paths=retained_paths,
+        ),
+        checkout_manifest,
+    )
+
+
+def _cleanup_invocation_run(invocation: Invocation) -> Tuple[Path, ...]:
     run_dir = invocation.run_dir
+    try:
+        residual = Path(invocation.path_identities["run_dir"].resolved)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        residual = Path(run_dir.name)
     try:
         expected = invocation.path_identities["run_dir"]
         metadata = run_dir.lstat()
@@ -542,7 +557,7 @@ def _cleanup_invocation_run(invocation: Invocation) -> bool:
             or metadata.st_ino != expected.inode
             or str(run_dir.resolve(strict=True)) != expected.resolved
         ):
-            return False
+            return (residual,)
         for current, names, files in os.walk(str(run_dir), topdown=False):
             directory = Path(current)
             directory.chmod(0o700)
@@ -561,9 +576,9 @@ def _cleanup_invocation_run(invocation: Invocation) -> bool:
                     candidate.chmod(0o700)
                     candidate.rmdir()
         run_dir.rmdir()
-        return not run_dir.exists()
+        return () if not run_dir.exists() else (residual,)
     except (KeyError, OSError, ValueError):
-        return False
+        return (residual,)
 
 
 def _consumption_ready(
@@ -571,7 +586,7 @@ def _consumption_ready(
     invocation: Invocation,
     seal: object,
     checkout_manifest: CheckoutManifest,
-    capabilities: CliCapabilities,
+    codex: CodexProcess,
 ) -> bool:
     checkout = verify_loaded_checkout(request.repo_root, invocation.codex_home)
     if checkout.classification != "ready" or checkout.manifest != checkout_manifest:
@@ -580,7 +595,7 @@ def _consumption_ready(
         return False
     report = preflight_isolation(
         invocation,
-        probe=lambda candidate: capabilities if candidate is invocation else None,
+        probe=codex.probe,
         expected_codex_home_seal=seal,
     )
     return (
@@ -690,6 +705,22 @@ def _aggregate(
         request.dry_run_only,
         tree_hash,
     )
+    retained_paths = tuple(
+        Path(value)
+        for value in sorted(
+            {
+                str(path)
+                for item in result_values
+                for path in item.retained_paths
+            }
+        )
+    )
+    if any(item.retention == "cleanup_required" for item in result_values):
+        retention = "cleanup_required"
+    elif any(item.retention == "retained_redacted" for item in result_values):
+        retention = "retained_redacted"
+    else:
+        retention = "none"
     return EvalResult(
         status,
         verification,
@@ -697,6 +728,9 @@ def _aggregate(
         sum(item.model_calls for item in result_values),
         manifest,
         result_values,
+        retention,
+        any(item.manual_cleanup_required for item in result_values),
+        retained_paths,
     )
 
 
@@ -713,6 +747,7 @@ class SubprocessCodex:
                 cwd=invocation.cwd,
                 input_bytes=b"",
                 timeout_seconds=10,
+                max_stdin_bytes=1,
                 max_stdout_bytes=128 * 1024,
                 max_stderr_bytes=32 * 1024,
             )
@@ -722,6 +757,7 @@ class SubprocessCodex:
                 cwd=invocation.cwd,
                 input_bytes=b"",
                 timeout_seconds=10,
+                max_stdin_bytes=1,
                 max_stdout_bytes=128 * 1024,
                 max_stderr_bytes=32 * 1024,
             )
@@ -731,6 +767,7 @@ class SubprocessCodex:
                 cwd=invocation.cwd,
                 input_bytes=b"",
                 timeout_seconds=10,
+                max_stdin_bytes=1,
                 max_stdout_bytes=128 * 1024,
                 max_stderr_bytes=32 * 1024,
             )
@@ -744,8 +781,10 @@ class SubprocessCodex:
             supported = frozenset(
                 flag for flag in REQUIRED_FLAGS if flag in combined_help
             )
+        except RetryableTransportFailure:
+            raise
         except Exception:
-            raise RetryableTransportFailure() from None
+            raise ProcessExecutionFailure() from None
         return CliCapabilities(
             selected_executable=invocation.executable,
             selected_executable_identity=invocation.executable_identity,
@@ -768,6 +807,7 @@ class SubprocessCodex:
         prompt: str,
         timeout_seconds: int,
         *,
+        max_stdin_bytes: int,
         max_stdout_bytes: int,
         max_stderr_bytes: int,
     ) -> ProcessOutput:
@@ -778,15 +818,18 @@ class SubprocessCodex:
                 env=dict(invocation.transport_env),
                 input_bytes=prompt.encode("utf-8"),
                 timeout_seconds=timeout_seconds,
+                max_stdin_bytes=max_stdin_bytes,
                 max_stdout_bytes=max_stdout_bytes,
                 max_stderr_bytes=max_stderr_bytes,
             )
-        except (InvocationTimeout, OutputLimit):
+        except (InvocationTimeout, InputLimit, OutputLimit):
+            raise
+        except RetryableTransportFailure:
             raise
         except Exception:
-            raise RetryableTransportFailure() from None
+            raise ProcessExecutionFailure() from None
         if returncode != 0:
-            raise RetryableTransportFailure()
+            raise ProcessExecutionFailure()
         return ProcessOutput(tuple(stdout.splitlines(keepends=True)))
 
 
@@ -797,21 +840,38 @@ def _bounded_process(
     cwd: Path,
     input_bytes: bytes,
     timeout_seconds: float,
+    max_stdin_bytes: int,
     max_stdout_bytes: int,
     max_stderr_bytes: int,
 ) -> Tuple[bytes, int]:
-    process = subprocess.Popen(
-        tuple(argv),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=str(cwd),
-        env=dict(env),
-        start_new_session=True,
-    )
+    if (
+        not isinstance(input_bytes, bytes)
+        or not isinstance(max_stdin_bytes, int)
+        or isinstance(max_stdin_bytes, bool)
+        or max_stdin_bytes < 0
+        or len(input_bytes) > max_stdin_bytes
+    ):
+        raise InputLimit()
+    try:
+        process = subprocess.Popen(
+            tuple(argv),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(cwd),
+            env=dict(env),
+            start_new_session=True,
+            bufsize=0,
+        )
+    except OSError:
+        raise RetryableTransportFailure() from None
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
     exceeded = threading.Event()
+    stdin_failed = threading.Event()
+    stdin_completed = threading.Event()
+    stop_requested = threading.Event()
+    deadline = time.monotonic() + float(timeout_seconds)
 
     def read_stream(stream: object, target: bytearray, limit: int) -> None:
         while True:
@@ -824,6 +884,30 @@ def _bounded_process(
             if len(chunk) > room:
                 exceeded.set()
 
+    def write_stdin() -> None:
+        try:
+            if process.stdin is None:
+                if input_bytes:
+                    stdin_failed.set()
+                else:
+                    stdin_completed.set()
+                return
+            offset = 0
+            while offset < len(input_bytes):
+                written = process.stdin.write(input_bytes[offset:])
+                if not isinstance(written, int) or written <= 0:
+                    stdin_failed.set()
+                    return
+                offset += written
+            stdin_completed.set()
+        except (BrokenPipeError, OSError):
+            if not stop_requested.is_set():
+                stdin_failed.set()
+        except Exception:
+            stdin_failed.set()
+        finally:
+            _close_process_stdin(process)
+
     readers = (
         threading.Thread(
             target=read_stream, args=(process.stdout, stdout_buffer, max_stdout_bytes), daemon=True
@@ -832,39 +916,47 @@ def _bounded_process(
             target=read_stream, args=(process.stderr, stderr_buffer, max_stderr_bytes), daemon=True
         ),
     )
+    stdin_writer = threading.Thread(target=write_stdin, daemon=True)
     for reader in readers:
         reader.start()
-    if process.stdin is not None:
-        try:
-            process.stdin.write(input_bytes)
-            process.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-    deadline = time.monotonic() + float(timeout_seconds)
+    stdin_writer.start()
     timed_out = False
     group_terminated = False
     while process.poll() is None:
-        if exceeded.is_set() or time.monotonic() >= deadline:
-            timed_out = not exceeded.is_set()
+        if exceeded.is_set() or stdin_failed.is_set() or time.monotonic() >= deadline:
+            timed_out = not exceeded.is_set() and not stdin_failed.is_set()
+            stop_requested.set()
             _terminate_process_group(process)
             group_terminated = True
             break
         time.sleep(0.01)
     process.wait()
+    stdin_writer.join(timeout=1)
     for reader in readers:
         reader.join(timeout=1)
-    if (exceeded.is_set() or any(reader.is_alive() for reader in readers)) and not group_terminated:
+    if (
+        exceeded.is_set()
+        or stdin_failed.is_set()
+        or stdin_writer.is_alive()
+        or any(reader.is_alive() for reader in readers)
+    ) and not group_terminated:
+        stop_requested.set()
         _terminate_process_group(process)
         group_terminated = True
+        stdin_writer.join(timeout=1)
         for reader in readers:
             reader.join(timeout=1)
     try:
         if exceeded.is_set():
             raise OutputLimit()
+        if stdin_failed.is_set() or stdin_writer.is_alive():
+            raise ProcessExecutionFailure()
         if any(reader.is_alive() for reader in readers):
-            raise RetryableTransportFailure()
+            raise ProcessExecutionFailure()
         if timed_out:
             raise InvocationTimeout()
+        if input_bytes and not stdin_completed.is_set():
+            raise ProcessExecutionFailure()
         retained_stdout = bytes(stdout_buffer)
         return retained_stdout, int(process.returncode)
     finally:
@@ -875,6 +967,7 @@ def _bounded_process(
 
 
 def _terminate_process_group(process: object) -> None:
+    _close_process_stdin(process)
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except OSError:
@@ -886,6 +979,24 @@ def _terminate_process_group(process: object) -> None:
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _close_process_stdin(process: object) -> None:
+    stream = getattr(process, "stdin", None)
+    if stream is None:
+        return
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+        return
+    try:
+        os.close(descriptor)
     except OSError:
         pass
 
@@ -947,8 +1058,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         result = run_eval(request, SubprocessCodex())
     except (TypeError, ValueError):
-        if owned_temp_root is not None:
+        retained_paths = (
             _cleanup_cli_temp_root(owned_temp_root)
+            if owned_temp_root is not None
+            else ()
+        )
         print(
             json.dumps(
                 {
@@ -956,26 +1070,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "verification_result": "blocked",
                     "attempts": 0,
                     "model_calls": 0,
+                    "retention": "cleanup_required" if retained_paths else "none",
+                    "manual_cleanup_required": bool(retained_paths),
+                    "retained_paths": [str(path) for path in retained_paths],
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             )
         )
         return 2
-    if owned_temp_root is not None and not any(
-        item.manual_cleanup_required for item in result.scenarios
-    ):
-        _cleanup_cli_temp_root(owned_temp_root)
+    if owned_temp_root is not None and not result.manual_cleanup_required:
+        retained_paths = _cleanup_cli_temp_root(owned_temp_root)
+        if retained_paths:
+            result = _mark_cleanup_required(result, retained_paths)
     print(_result_json(result))
     return 0 if result.verification_result in ("pass", "not_run") else 2
 
 
-def _cleanup_cli_temp_root(temp_root: Path) -> bool:
+def _mark_cleanup_required(
+    result: EvalResult, retained_paths: Sequence[Path]
+) -> EvalResult:
+    combined = tuple(
+        Path(value)
+        for value in sorted(
+            {str(path) for path in result.retained_paths + tuple(retained_paths)}
+        )
+    )
+    return replace(
+        result,
+        retention="cleanup_required",
+        manual_cleanup_required=True,
+        retained_paths=combined,
+    )
+
+
+def _cleanup_cli_temp_root(temp_root: Path) -> Tuple[Path, ...]:
+    residual = Path(temp_root).absolute()
     try:
         temp_root.rmdir()
-        return not temp_root.exists()
+        return () if not temp_root.exists() else (residual,)
     except OSError:
-        return False
+        return (residual,)
 
 
 if __name__ == "__main__":
