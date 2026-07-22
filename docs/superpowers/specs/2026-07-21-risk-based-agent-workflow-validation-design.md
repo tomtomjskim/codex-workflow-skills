@@ -192,10 +192,8 @@ execution evidence is stored separately to avoid circular hashing.
 
 `contract_core_hash` covers only canonical `contract_core` bytes. Each ordered
 ledger entry references that core hash, its artifact digest, and the previous
-entry hash. `ledger_hash` covers the ordered canonical entry hashes. A closure
-receipt binds `contract_core_hash`, `ledger_hash`, derived required sets, and the
-checkout tree hash. Neither evidence nor the closure receipt is included in the
-core hash domain.
+entry hash. `ledger_hash` covers the ordered canonical entry hashes. Evidence is
+not included in the core hash domain.
 
 Every evidence entry binds to immutable context within the declared trust model:
 
@@ -227,8 +225,7 @@ split the paths or serialize the writers, then rerun validation. Every accepted
 version-1 receipt therefore has `path_overlap: false`.
 
 A contract-core change increments `revision`, moves ledger status to `changed`, and marks
-all earlier handoffs, acknowledgements, and checkpoints `stale`. Integration can
-close only when every required record references the current core hash.
+all earlier handoffs, acknowledgements, and checkpoints `stale`.
 
 ### State Transitions And Authority
 
@@ -240,10 +237,9 @@ close only when every required record references the current core hash.
 | integration-dependency `draft → frozen` | contract owner | derived handoffs, checkpoints, and required reviewers defined; affected owners approve; validator passes |
 | `frozen → changed` | contract owner or approved change requester | change reason and derived affected consumers recorded; revision incremented; prior evidence marked stale |
 | `changed → frozen` | contract owner | affected consumers acknowledge the current contract hash; required checks and reviews rerun; validator passes |
-| integration gate open → closed | integration owner through validator | all derived current-contract-hash handoffs, acknowledgements, checkpoints, and reviewers complete; validator issues a closure receipt |
 
 The contract owner controls contract state. The integration owner cannot freeze
-or modify the contract and may only close the integration gate.
+or modify the contract.
 
 Contract extensions are conditionally required to avoid ceremony for narrow
 conflicts:
@@ -361,8 +357,7 @@ concurrent dispatch, PM must run the CLI. No route may dispatch without exit cod
 contract hashes, derived profiles and required sets, normalized path results,
 checkout tree hash, validation timestamp, and a unique run ID.
 
-The validator, not a user-editable contract field, emits the integration-closure
-receipt. If the CLI is missing, incompatible, or cannot produce a valid receipt,
+If the CLI is missing, incompatible, or cannot produce a valid dispatch receipt,
 the workflow falls back to one owner executing the workstreams sequentially and
 records `parallel_validation: blocked`; it never silently skips validation.
 
@@ -615,10 +610,6 @@ conformance remains `not_run` or `partial`.
   accepted receipt always records `path_overlap: false`.
 - Contract changes invalidate affected handoffs until acknowledgement and
   revalidation are recorded.
-- The integration gate accepts only current-core-hash handoffs,
-  acknowledgements, checkpoints, and required reviewer evidence.
-- Reviewer completion from an earlier revision is stale and cannot satisfy the
-  current integration gate.
 - DAG validation rejects duplicate IDs, missing references, cycles, premature
   dependency dispatch, and normalized path overlap or repo-root escape.
 - Handoff validation compares actual tracked and untracked changes from the base
@@ -642,3 +633,37 @@ conformance remains `not_run` or `partial`.
 - Installer tests prove all 16 Claude role entries can resolve to shared adapters
   without overwriting conflicting files; actual global installation remains an
   explicit local approval step and is not a public release criterion.
+
+### Coordination CLI v1 Acceptance Boundary
+
+Coordination CLI v1 ends at `validate-handoff`.
+
+In v1, `integration_gate.status` is open-only; caller-submitted `closed` is rejected.
+
+`close-integration` and its closure receipt are a future v2 milestone and a v1 non-goal.
+
+Until v2 exists, do not claim integration status `verified` or `closed`.
+
+## Future Milestone: Closure v2
+
+Closure v2 is a separate additive API and schema milestone. It does not change
+the v1 dispatch or handoff acceptance boundary.
+
+A closure receipt binds `contract_core_hash`, `ledger_hash`, derived required
+sets, and the checkout tree hash. Neither evidence nor the closure receipt is
+included in the core hash domain.
+
+| Profile and transition | Actor | Prerequisites |
+|---|---|---|
+| integration gate open → closed | integration owner through validator | all derived current-contract-hash handoffs, acknowledgements, checkpoints, and reviewers complete; validator issues a closure receipt |
+
+Closure v2 acceptance requires:
+
+- `close-integration` emits the integration-closure receipt rather than trusting
+  a user-editable contract field.
+- The integration gate accepts only current-core-hash handoffs,
+  acknowledgements, checkpoints, and required reviewer evidence.
+- Reviewer completion from an earlier revision is stale and cannot satisfy the
+  current integration gate.
+- The integration owner cannot freeze or modify the contract and may close the
+  integration gate only through the validator.

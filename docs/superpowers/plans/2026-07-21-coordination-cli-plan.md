@@ -17,6 +17,16 @@
 - Test-first red-green implementation is required for every behavior.
 - Source design: `docs/superpowers/specs/2026-07-21-risk-based-agent-workflow-validation-design.md`.
 
+### Coordination CLI v1 Acceptance Boundary
+
+Coordination CLI v1 ends at `validate-handoff`.
+
+In v1, `integration_gate.status` is open-only; caller-submitted `closed` is rejected.
+
+`close-integration` and its closure receipt are a future v2 milestone and a v1 non-goal.
+
+Until v2 exists, do not claim integration status `verified` or `closed`.
+
 ---
 
 ### Task 1: Canonical JSON and Hash Domains

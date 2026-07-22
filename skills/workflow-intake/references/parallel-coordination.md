@@ -61,7 +61,13 @@ Contracted routes use the complete schema-version-1 contract; the earlier minima
 
 Every required dependency or interface edge has a completed current-core `handoff` and `checkpoint` ledger record, and every derived affected consumer has a completed `acknowledgement`. Ledger records add `record_type`, `subject_id`, and `status` to the hash-bound evidence fields. They bind to the current contract core and checkout tree, form the ordered hash chain, and must exactly cover the derived required record set. Handoff and checkpoint producers are limited to the source workstream owner or current integration owner; acknowledgement producers are limited to the subject workstream owner or contract owner. `unverified` has no authority or defer schema and is rejected. The reviewer registry must exactly cover the canonical `(lens, canonical_agent)` pairs from the loaded reviewer-routing artifact, with current-core completed entries and non-empty dispatch and completion evidence. A custom trigger matrix without an exactly matching routing artifact is incompatible and blocks. A frozen contracted route with missing, failed, stale, duplicate, unexpected, or unauthorized required evidence is blocked.
 
-`integration_gate.status` remains `open` during dispatch validation. The current CLI does not define an integration-closure command or closure-receipt schema, so a submitted `closed` gate is rejected rather than trusted. Closure is a separate additive API/schema design, not an inferred operation of `validate-coordination` or `validate-handoff`.
+Coordination CLI v1 ends at `validate-handoff`.
+
+In v1, `integration_gate.status` is open-only; caller-submitted `closed` is rejected.
+
+`close-integration` and its closure receipt are a future v2 milestone and a v1 non-goal.
+
+Until v2 exists, do not claim integration status `verified` or `closed`.
 
 ## Receipt Lifecycle
 

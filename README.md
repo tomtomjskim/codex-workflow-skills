@@ -214,6 +214,14 @@ Validate each workstream handoff against the current receipt and its derived wri
   --json
 ```
 
+Coordination CLI v1 ends at `validate-handoff`.
+
+In v1, `integration_gate.status` is open-only; caller-submitted `closed` is rejected.
+
+`close-integration` and its closure receipt are a future v2 milestone and a v1 non-goal.
+
+Until v2 exists, do not claim integration status `verified` or `closed`.
+
 Handoff validation requires the authoritative `--manifest` and `--inventory`, plus `--contract` when the route is contracted. It reruns coordination validation with the authoritative manifest, inventory, contract, and shared reviewer routing artifact before requiring exact canonical equality with the submitted receipt. The shared reviewer routing artifact is authoritative for reviewer derivation. `validate-coordination` issues a receipt only from a clean worktree whose actual `HEAD^{tree}` matches any provided `--checkout-tree-hash`. At handoff, the CLI collects tracked, staged, unstaged, deleted, renamed, and non-ignored untracked paths from NUL-delimited Git status. A supplied `--changed-path` is an additional declaration, not the authority: validation checks the union of Git paths and declarations, so an omitted or partial declaration cannot hide a write. CLI receipts use canonical UUID run IDs and expire after five minutes; rerun `validate-coordination` when a receipt is stale.
 
 The handoff check is a repository-state gate, not runtime write prevention. Standard Git-ignored files are not reported, and a concurrent writer can invalidate attribution after collection. Use one isolated worktree or isolated patch artifact per workstream, stop writers before handoff, and use the documented sequential fallback whenever attribution is uncertain. Symlink entries are reported without traversing their targets; writes through a symlink to an external filesystem location remain outside this Git-state claim.
