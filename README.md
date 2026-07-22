@@ -8,6 +8,7 @@ This repository is plugin-ready. It contains:
 - `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, E2E decisions, and AI eval handoffs after intake activates.
 - `adversarial-review-loop`: reviews plans, diffs, and implementations with evidence, reviewer routing, finding disposition, loop limits, and verification gates.
 - `resume-multi-review`: evaluates a concrete resume through independent recruiter, hiring-manager, and future-teammate lenses, reconciles conflicting decisions, rewrites supported claims, and controls repeat review loops.
+- `scripts/workflow`: prepares canonical coordination artifacts and validates concurrent dispatches and handoffs without third-party Python packages.
 
 ## Why This Exists
 
@@ -91,6 +92,9 @@ Common design artifacts:
 ├── .codex-plugin/plugin.json
 ├── CHANGELOG.md
 ├── scripts/
+│   ├── workflow
+│   ├── workflow_coordination/
+│   ├── validate_policy_contracts.py
 │   └── validate_repo.sh
 ├── skills/
 │   ├── workflow/
@@ -133,6 +137,24 @@ ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 ```
 
 If a symlink already exists, remove or update that symlink first.
+
+### Shared Agent Adapter Installer
+
+Validate adapter installation against an isolated target before considering a global change. Use the real shared Claude adapter directory only as the source, and use a private temporary directory with a pre-created private target:
+
+```bash
+tmp_root="$(mktemp -d)"
+chmod 700 "$tmp_root"
+mkdir -m 700 "$tmp_root/agents"
+python3 scripts/install_agent_adapters.py \
+  --source-root "$HOME/.agents/adapters/claude" \
+  --target-root "$tmp_root/agents" \
+  --suffix .md
+```
+
+The temporary result should contain exactly 16 direct symlinks to the expected files under `$HOME/.agents/adapters/claude`; remove the temporary directory after verification.
+
+For the real target, `$HOME/.claude/agents` must already exist as a real, non-symlink directory. If it is absent or a symlink, stop without invoking the installer or creating the directory and request a separate preparation approval. When the precondition passes, run only `--dry-run --json` first. The manifest contains exact local paths and is sensitive; keep it in a mode-0700 temporary directory and report only its hash, create/keep counts, and conflicts. A non-dry-run apply is a separate action requiring explicit approval and must not run in the same approval step.
 
 ### Post-install Check
 
@@ -178,6 +200,59 @@ To receive only a reusable copy-paste prompt:
 ```text
 Use $resume-multi-review and return the standalone prompt template without evaluating a resume.
 ```
+
+### Validated Coordination CLI
+
+For covered concurrent work, prepare a manifest and inventory together from one approved UTF-8 JSON plan:
+
+```bash
+./scripts/workflow prepare-coordination \
+  --repo-root /path/to/approved-repo \
+  --plan /path/to/approved-plan.json \
+  --out-dir /path/to/temporary-coordination \
+  --json
+```
+
+The output directory must not exist before this command. Preparation builds and synchronizes both files in a private sibling staging directory, then publishes the directory as one unit with the platform's atomic no-replace rename primitive. Existing empty/nonempty directories, files, symlinks, and concurrently created targets are never replaced or removed. If atomic no-replace publish is unavailable, preparation returns a structured blocked error; there is no unsafe fallback, so use sequential execution.
+
+Validate the generated artifacts before every concurrent dispatch. A contracted route also requires the current frozen contract:
+
+```bash
+./scripts/workflow validate-coordination \
+  --repo-root /path/to/approved-repo \
+  --manifest /path/to/temporary-coordination/manifest.json \
+  --inventory /path/to/temporary-coordination/inventory.json \
+  --contract /path/to/temporary-coordination/contract.json \
+  --json
+```
+
+Validate each workstream handoff against the current receipt and its derived write ownership:
+
+```bash
+./scripts/workflow validate-handoff \
+  --repo-root /path/to/approved-repo \
+  --manifest /path/to/temporary-coordination/manifest.json \
+  --inventory /path/to/temporary-coordination/inventory.json \
+  --contract /path/to/temporary-coordination/contract.json \
+  --receipt /path/to/temporary-coordination/receipt.json \
+  --workstream-id frontend \
+  --changed-path src/ui/settings.py \
+  --json
+```
+
+Coordination CLI v1 ends at `validate-handoff`.
+
+In v1, `integration_gate.status` is open-only; caller-submitted `closed` is rejected.
+
+`close-integration` and its closure receipt are a future v2 milestone and a v1 non-goal.
+
+Until v2 exists, do not claim integration status `verified` or `closed`.
+
+Handoff validation requires the authoritative `--manifest` and `--inventory`, plus `--contract` when the route is contracted. It reruns coordination validation with the authoritative manifest, inventory, contract, and shared reviewer routing artifact before requiring exact canonical equality with the submitted receipt. The shared reviewer routing artifact is authoritative for reviewer derivation. `validate-coordination` issues a receipt only from a clean worktree whose actual `HEAD^{tree}` matches any provided `--checkout-tree-hash`. At handoff, the CLI collects tracked, staged, unstaged, deleted, renamed, and non-ignored untracked paths from NUL-delimited Git status. A supplied `--changed-path` is an additional declaration, not the authority: validation checks the union of Git paths and declarations, so an omitted or partial declaration cannot hide a write. CLI receipts use canonical UUID run IDs and expire after five minutes; rerun `validate-coordination` when a receipt is stale.
+
+The handoff check is a repository-state gate, not runtime write prevention. Standard Git-ignored files are not reported, and a concurrent writer can invalidate attribution after collection. Use one isolated worktree or isolated patch artifact per workstream, stop writers before handoff, and use the documented sequential fallback whenever attribution is uncertain. Symlink entries are reported without traversing their targets; writes through a symlink to an external filesystem location remain outside this Git-state claim.
+
+All three commands emit JSON and return nonzero with a structured error when validation fails. Covered parallel dispatch requires a current CLI version 1 receipt. If the CLI is missing or incompatible, validation fails, the receipt is stale, or changes cannot be attributed to a workstream, use the single-owner sequential fallback and record `parallel_validation: blocked`; do not continue with unvalidated parallel writers.
 
 ## Examples
 
@@ -247,7 +322,7 @@ Run the repository validation script for the standard public-release checks:
 ./scripts/validate_repo.sh
 ```
 
-The script checks required files, skill structure when Codex system validators are available, plugin structure, README links, manifest/changelog version alignment, `git diff --check`, and a basic public hygiene scan.
+The script checks required files, coordination CLI and policy contracts, focused CLI/coordination tests, skill structure when Codex system validators are available, plugin structure, README links, manifest/changelog version alignment, `git diff --check`, and every tracked text file for public hygiene. Binary tracked files are skipped.
 
 Validate skill structure when the Codex system validation scripts are available:
 
@@ -269,6 +344,28 @@ If those scripts are unavailable, at minimum confirm each skill has valid YAML f
 Forward-test behavior with the scenarios in `tests/acceptance-scenarios.md` before relying on these skills for high-risk work.
 
 See [forward-test-report.md](docs/forward-test-report.md) for the latest recorded forward-test and smoke-test notes.
+
+### Live evaluation runner
+
+The deterministic dry-run validates the scenario corpus and selection plan only. It does not require an API key, Codex executable, temporary runtime directory, capability probe, checkout installation, subprocess, or network access:
+
+```bash
+python3 scripts/run_live_eval.py --tags workflow-intake --model gpt-5.6-sol --dry-run
+```
+
+Successful dry-run output reports `status=preflight_only` and `model_calls=0`. This is planning evidence, not model-quality evidence.
+
+Targeted execution selects at most three scenarios and is bounded to five model calls, 600 seconds, and concurrency one. Release execution selects at most 26 scenarios and is bounded to 30 model calls, 2,700 seconds, and concurrency two. Release planning remains safe without approval because `--dry-run` cannot make a model call:
+
+```bash
+python3 scripts/run_live_eval.py --release-suite --dry-run
+```
+
+A live release suite is a separate operator-approved action and requires both `--release-suite` and `--approve-release-suite`. Omitting the approval flag blocks before credential or executable checks. The flag is invalid without release-suite selection.
+
+Without `--dry-run`, the runner is an explicit live operation. It refuses execution unless `OPENAI_API_KEY` is present and a `codex` executable is available. Live execution creates a private isolated runtime, installs and seals the exact clean-HEAD skill checkout, and performs a final isolation recheck inside every model-call budget lease. Production execution remains blocked when the runtime cannot prove the required network, MCP, plugin, hook, and unexpected-skill isolation capabilities. Blocked runs without retained evidence clean up their owned runtime; assertion or completed runs retain only redacted mode-0600 JSONL output artifacts and report `manual_cleanup_required=true` with the artifact path. Repository tests and `scripts/validate_repo.sh` never perform a live model call.
+
+`scripts/validate_repo.sh` always runs full repository-owned test discovery. External shared-agent contract and adapter audits are reported as `not_run` unless `SHARED_AGENTS_ROOT` is explicitly configured; the environment-independent reviewer mutation tests still run on every validation.
 
 ## Release History
 

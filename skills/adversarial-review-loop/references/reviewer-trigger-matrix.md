@@ -1,18 +1,49 @@
 # Reviewer Trigger Matrix
 
-Select reviewer lenses from changed surfaces. Do not run every reviewer by default.
+Derive reviewer lenses from exact changed-surface tags. Resolve every lens through
+the canonical registry below. `reviewer-routing.json` is authoritative; this
+human-readable matrix must mirror it exactly. Do not duplicate or override these
+mappings in a review packet.
 
-| Changed surface | Required or recommended lens |
+## Canonical Lens Registry
+
+| Reviewer lens | Canonical agent |
 |---|---|
-| auth, authorization, roles, tenant boundary, secrets, file IO, shell, network | security |
-| data mutation, database schema, migration, seed, backfill, retention | security, QA, DBA if available |
-| public API, SDK, routing, integration contract | code, API |
-| AI/LLM output quality, prompt/model/tool/retrieval behavior, eval set, LLM-as-judge rubric | QA, test coverage, domain reviewer when available |
-| tests, fixtures, mocks, assertions, CI failures | QA, test coverage |
-| UI, forms, navigation, loading/error/empty states | UX, accessibility, QA |
-| user-facing flow, form submit, routing, auth/permission path, persistence, checkout/order/payment, upload/download, realtime, cross-page state | QA with Playwright or equivalent browser evidence when available |
-| hot path, query, cache, rendering, concurrency, memory | performance |
-| architecture, module boundaries, multi-layer design | architect, code |
-| docs-only, copy-only, narrow config comments | reviewer optional unless policy requires |
+| `accessibility` | `accessibility-reviewer` |
+| `api` | `api-reviewer` |
+| `architecture` | `architect` |
+| `code` | `code-reviewer` |
+| `database` | `dba` |
+| `performance` | `performance-reviewer` |
+| `qa` | `qa-engineer` |
+| `security` | `security-reviewer` |
+| `test-coverage` | `test-coverage-reviewer` |
+| `ux` | `ux-reviewer` |
 
-For skipped reviewers, record the reason.
+## Changed-Surface Triggers
+
+| Changed-surface tags | Required reviewer lenses |
+|---|---|
+| `auth`, `authorization`, `roles`, `tenant-boundary` | `qa`, `security` |
+| `secrets`, `file-io`, `shell`, `network` | `security` |
+| `data-mutation` | `qa`, `security` |
+| `database`, `migration` | `database`, `qa`, `security` |
+| `public-api`, `api`, `sdk`, `integration-contract` | `api`, `code` |
+| `ai-llm`, `tests`, `ci` | `qa`, `test-coverage` |
+| `ui`, `user-flow` | `accessibility`, `qa`, `ux` |
+| `performance` | `performance` |
+| `concurrency` | `code`, `performance` |
+| `architecture` | `architecture`, `code` |
+
+## Profile Triggers
+
+| Coordination profile | Required reviewer lenses |
+|---|---|
+| `shared_interface` | `api` |
+
+Do not accept packet-authored lens or agent substitutions.
+
+Record an unmapped material surface as a routing gap and execute sequentially
+until the mapping is revised and validated. Record a reason for every skipped
+reviewer. Block integration when a required reviewer is unavailable unless the
+user approves a defer receipt with an owner, reason, and residual risk.

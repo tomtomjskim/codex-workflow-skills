@@ -25,6 +25,20 @@ Update the plan before continuing when:
 
 Do not restart intake for every message. If the change is inside the approved scope, update the plan and continue under the active autonomy level. If it changes scope, autonomy, hard stops, validation requirements, or expected side effects, ask first when approval is required; if review is active or expected, also create a new review packet revision.
 
+## Coordination State
+
+When the plan contains concurrent workstreams, apply `parallel-coordination.md` before dispatch. Record whether the installed CLI produced a current receipt:
+
+```yaml
+coordination:
+  parallel_validation: validated | blocked
+  execution: parallel | sequential
+  receipt_run_id:
+  fallback_reason:
+```
+
+Only `parallel_validation: validated` with a current receipt permits covered parallel dispatch. A missing or incompatible validator, nonzero validation result, stale receipt, or ambiguous change attribution sets `parallel_validation: blocked` and `execution: sequential`. Use one owner for the single-owner sequential route; do not simulate unvalidated concurrency by handing workstreams to multiple writers one after another.
+
 ## Side-Effect Check
 
 Track only material surfaces:
@@ -109,5 +123,6 @@ Examples:
 
 - Missing repo/path: ask one blocking target question.
 - Tool unavailable: use a smaller available validation and record residual risk.
+- Coordination validator unavailable or incompatible: record the blocked state and use single-owner sequential execution.
 - Validation failed: diagnose or stop with the next diagnostic step.
 - User interrupts with new scope: ask first when approval is required, then update plan revision and review packet revision before continuing.

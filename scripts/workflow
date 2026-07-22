@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Prepare and validate coordination artifacts as canonical JSON."""
+
+import argparse
+import ctypes
+import errno
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable, List, Optional
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = SCRIPT_DIR.parent
+if str(REPO_DIR) not in sys.path:
+    sys.path.insert(0, str(REPO_DIR))
+
+from scripts.workflow_coordination.canonical_json import (  # noqa: E402
+    CanonicalJSONError,
+    canonical_bytes,
+    load_canonical_input,
+)
+from scripts.workflow_coordination.git_changes import (  # noqa: E402
+    collect_changed_paths,
+    require_clean_base,
+)
+from scripts.workflow_coordination.prepare import (  # noqa: E402
+    PreparationError,
+    prepare_coordination,
+)
+from scripts.workflow_coordination.receipts import ValidationReceipt  # noqa: E402
+from scripts.workflow_coordination.reviewer_routing import (  # noqa: E402
+    ReviewerRoutingError,
+    build_trigger_matrix,
+    load_reviewer_routing,
+)
+from scripts.workflow_coordination.validate import (  # noqa: E402
+    ValidationError,
+    validate_coordination,
+    validate_handoff,
+)
+
+
+CLI_VERSION = 1
+
+
+class ArgumentError(ValueError):
+    """Raised for command-line usage errors that must be JSON encoded."""
+
+
+class JSONArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ArgumentError(message)
+
+
+def _read_json(path: Optional[Path]) -> object:
+    if path is None:
+        return None
+    return load_canonical_input(path.read_bytes())
+
+
+def _emit(payload: object) -> None:
+    sys.stdout.buffer.write(canonical_bytes(payload) + b"\n")
+
+
+def _write_staged_file(path: Path, data: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _rename_directory_noreplace(staged: Path, target: Path) -> None:
+    """Atomically rename a directory only when target does not exist."""
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(str(staged))
+    target_bytes = os.fsencode(str(target))
+
+    if sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise ValidationError(
+                "atomic no-replace publish is unavailable"
+            ) from error
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, target_bytes, 1)
+    elif sys.platform == "darwin":
+        try:
+            rename = library.renamex_np
+        except AttributeError as error:
+            raise ValidationError(
+                "atomic no-replace publish is unavailable"
+            ) from error
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, target_bytes, 0x00000004)
+    else:
+        raise ValidationError("atomic no-replace publish is unavailable")
+
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(error_number, os.strerror(error_number), str(target))
+    if error_number in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+        raise ValidationError("atomic no-replace publish is unavailable")
+    raise OSError(error_number, os.strerror(error_number), str(target))
+
+
+def _atomic_publish_directory(
+    staged: Path,
+    target: Path,
+    publish: Optional[Callable[[Path, Path], None]] = None,
+) -> None:
+    publisher = publish or _rename_directory_noreplace
+    try:
+        publisher(staged, target)
+    except FileExistsError as error:
+        raise ValidationError("output directory must not already exist") from error
+
+
+def _publish_prepared_output(
+    out_dir: Path,
+    manifest_bytes: bytes,
+    inventory_bytes: bytes,
+    publish: Optional[Callable[[Path, Path], None]] = None,
+) -> None:
+    target = out_dir.absolute()
+    parent = target.parent
+    if not parent.is_dir():
+        raise ValidationError("output directory parent must exist")
+    staged = Path(
+        tempfile.mkdtemp(prefix=".{}.".format(target.name), dir=str(parent))
+    )
+    os.chmod(str(staged), 0o700)
+    try:
+        _write_staged_file(staged / "manifest.json", manifest_bytes)
+        _write_staged_file(staged / "inventory.json", inventory_bytes)
+        directory_fd = os.open(str(staged), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        _atomic_publish_directory(staged, target, publish)
+    except Exception:
+        if staged.exists():
+            shutil.rmtree(str(staged))
+        raise
+
+
+def _checkout_tree_hash(repo_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD^{tree}"],
+        cwd=repo_root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValidationError(
+            "cannot resolve checkout tree hash: {}".format(result.stderr.strip())
+        )
+    return result.stdout.strip()
+
+
+def _require_repo_root(value: Path) -> Path:
+    root = value.resolve()
+    if not root.is_dir():
+        raise ValidationError("repository root must be an existing directory")
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValidationError("repository root must be a Git worktree root")
+    try:
+        git_root = Path(result.stdout.strip()).resolve(strict=True)
+    except OSError as error:
+        raise ValidationError("Git worktree root cannot be resolved") from error
+    if git_root != root:
+        raise ValidationError("repo-root must equal the canonical Git toplevel")
+    return root
+
+
+def handle_prepare(args: argparse.Namespace) -> int:
+    repo_root = _require_repo_root(args.repo_root)
+    plan = _read_json(args.plan)
+    catalog = _read_json(args.catalog)
+    prepared = prepare_coordination(plan, catalog)
+    manifest_bytes = canonical_bytes(prepared.manifest) + b"\n"
+    inventory_bytes = canonical_bytes(prepared.inventory) + b"\n"
+    _publish_prepared_output(args.out_dir, manifest_bytes, inventory_bytes)
+    _emit(
+        {
+            "cli_version": CLI_VERSION,
+            "schema_version": 1,
+            "repo_root": str(repo_root),
+            "manifest": prepared.manifest,
+            "inventory": prepared.inventory,
+            "manifest_hash": prepared.manifest_hash,
+            "inventory_hash": prepared.inventory_hash,
+            "manifest_path": str(args.out_dir / "manifest.json"),
+            "inventory_path": str(args.out_dir / "inventory.json"),
+        }
+    )
+    return 0
+
+
+def handle_validate_coordination(args: argparse.Namespace) -> int:
+    repo_root = _require_repo_root(args.repo_root)
+    manifest = _read_json(args.manifest)
+    inventory = _read_json(args.inventory)
+    contract = _read_json(args.contract)
+    actual_tree_hash = _checkout_tree_hash(repo_root)
+    if (
+        args.checkout_tree_hash is not None
+        and args.checkout_tree_hash != actual_tree_hash
+    ):
+        raise ValidationError(
+            "provided checkout tree hash does not match the actual HEAD tree"
+        )
+    tree_hash = actual_tree_hash
+    require_clean_base(repo_root, tree_hash)
+    receipt = validate_coordination(
+        repo_root,
+        manifest,
+        inventory,
+        contract,
+        trigger_matrix=args.trigger_matrix,
+        reviewer_routing=args.reviewer_routing,
+        checkout_tree_hash=tree_hash,
+    )
+    payload = receipt.to_dict()
+    payload["cli_version"] = CLI_VERSION
+    _emit(payload)
+    return 0
+
+
+def _receipt_from_payload(payload: object) -> ValidationReceipt:
+    if not isinstance(payload, dict):
+        raise ValidationError("receipt must be an object")
+    if payload.get("cli_version") != CLI_VERSION:
+        raise ValidationError("receipt CLI version is incompatible")
+    required = {
+        "cli_version",
+        "schema_version",
+        "manifest_hash",
+        "inventory_hash",
+        "contract_core_hash",
+        "checkout_tree_hash",
+        "derived_route",
+        "required_sets",
+        "normalized_paths",
+        "run_id",
+        "recorded_at",
+        "derived_profiles",
+    }
+    if set(payload) != required:
+        raise ValidationError("receipt schema fields are incompatible")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise ValidationError("receipt schema version is incompatible")
+    for field in (
+        "manifest_hash",
+        "inventory_hash",
+        "checkout_tree_hash",
+        "derived_route",
+        "run_id",
+        "recorded_at",
+    ):
+        if not isinstance(payload[field], str) or not payload[field]:
+            raise ValidationError("receipt field must be a non-empty string: {}".format(field))
+    try:
+        parsed_run_id = uuid.UUID(payload["run_id"])
+    except ValueError as error:
+        raise ValidationError("receipt run_id must be a UUID") from error
+    if str(parsed_run_id) != payload["run_id"]:
+        raise ValidationError("receipt run_id must use canonical UUID form")
+    try:
+        recorded_at = datetime.fromisoformat(
+            payload["recorded_at"][:-1] + "+00:00"
+        )
+    except (ValueError, TypeError) as error:
+        raise ValidationError("receipt recorded_at must be UTC RFC3339") from error
+    now = datetime.now(timezone.utc)
+    if recorded_at.tzinfo is None or recorded_at.utcoffset() != timedelta(0):
+        raise ValidationError("receipt recorded_at must be UTC RFC3339")
+    if recorded_at < now - timedelta(minutes=5) or recorded_at > now + timedelta(minutes=1):
+        raise ValidationError("receipt recorded_at is stale or in the future")
+    if payload["contract_core_hash"] is not None and not isinstance(
+        payload["contract_core_hash"], str
+    ):
+        raise ValidationError("receipt contract_core_hash is invalid")
+    for field in ("required_sets", "normalized_paths", "derived_profiles"):
+        if not isinstance(payload[field], dict):
+            raise ValidationError("receipt field must be an object: {}".format(field))
+    return ValidationReceipt(
+        schema_version=payload["schema_version"],
+        manifest_hash=payload["manifest_hash"],
+        inventory_hash=payload["inventory_hash"],
+        contract_core_hash=payload["contract_core_hash"],
+        checkout_tree_hash=payload["checkout_tree_hash"],
+        derived_route=payload["derived_route"],
+        required_sets=payload["required_sets"],
+        normalized_paths=payload["normalized_paths"],
+        run_id=payload["run_id"],
+        recorded_at=payload["recorded_at"],
+        derived_profiles=payload.get("derived_profiles"),
+    )
+
+
+def handle_validate_handoff(args: argparse.Namespace) -> int:
+    repo_root = _require_repo_root(args.repo_root)
+    submitted_payload = _read_json(args.receipt)
+    receipt = _receipt_from_payload(submitted_payload)
+    current_tree_hash = _checkout_tree_hash(repo_root)
+    if receipt.checkout_tree_hash != current_tree_hash:
+        raise ValidationError("receipt checkout tree hash is stale")
+    authoritative = validate_coordination(
+        repo_root,
+        _read_json(args.manifest),
+        _read_json(args.inventory),
+        _read_json(args.contract),
+        trigger_matrix=args.trigger_matrix,
+        reviewer_routing=args.reviewer_routing,
+        checkout_tree_hash=receipt.checkout_tree_hash,
+        run_id_factory=lambda: receipt.run_id,
+        clock=lambda: receipt.recorded_at,
+    )
+    authoritative_payload = authoritative.to_dict()
+    authoritative_payload["cli_version"] = CLI_VERSION
+    if canonical_bytes(authoritative_payload) != canonical_bytes(submitted_payload):
+        raise ValidationError("receipt does not match authoritative validation")
+    authoritative_changed_paths = list(
+        collect_changed_paths(repo_root, receipt.checkout_tree_hash)
+    )
+    declared_changed_paths = sorted(set(args.changed_path))
+    validated_paths = sorted(
+        set(authoritative_changed_paths).union(declared_changed_paths)
+    )
+    validate_handoff(
+        repo_root, authoritative, args.workstream_id, validated_paths
+    )
+    _emit(
+        {
+            "cli_version": CLI_VERSION,
+            "schema_version": 1,
+            "status": "valid",
+            "run_id": receipt.run_id,
+            "workstream_id": args.workstream_id,
+            "changed_paths": authoritative_changed_paths,
+            "declared_changed_paths": declared_changed_paths,
+            "validated_paths": validated_paths,
+            "changed_path_source": "git_status_plus_declarations",
+        }
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = JSONArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=str(CLI_VERSION))
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    prepare = commands.add_parser("prepare-coordination")
+    prepare.add_argument("--repo-root", required=True, type=Path)
+    prepare.add_argument("--plan", required=True, type=Path)
+    prepare.add_argument("--catalog", type=Path)
+    prepare.add_argument("--out-dir", required=True, type=Path)
+    prepare.add_argument("--json", action="store_true")
+    prepare.set_defaults(handler=handle_prepare)
+
+    validate = commands.add_parser("validate-coordination")
+    validate.add_argument("--repo-root", required=True, type=Path)
+    validate.add_argument("--manifest", required=True, type=Path)
+    validate.add_argument("--inventory", required=True, type=Path)
+    validate.add_argument("--contract", type=Path)
+    validate.add_argument("--checkout-tree-hash")
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(handler=handle_validate_coordination)
+
+    handoff = commands.add_parser("validate-handoff")
+    handoff.add_argument("--repo-root", required=True, type=Path)
+    handoff.add_argument("--manifest", required=True, type=Path)
+    handoff.add_argument("--inventory", required=True, type=Path)
+    handoff.add_argument("--contract", type=Path)
+    handoff.add_argument("--receipt", required=True, type=Path)
+    handoff.add_argument("--workstream-id", required=True)
+    handoff.add_argument("--changed-path", action="append", default=[])
+    handoff.add_argument("--json", action="store_true")
+    handoff.set_defaults(handler=handle_validate_handoff)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+        if args.command in ("validate-coordination", "validate-handoff"):
+            args.reviewer_routing = load_reviewer_routing()
+            args.trigger_matrix = build_trigger_matrix(args.reviewer_routing)
+        return args.handler(args)
+    except (
+        ArgumentError,
+        CanonicalJSONError,
+        PreparationError,
+        ReviewerRoutingError,
+        ValidationError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        payload = {
+            "cli_version": CLI_VERSION,
+            "schema_version": 1,
+            "command": getattr(locals().get("args"), "command", None),
+            "error": {"type": type(error).__name__, "message": str(error)},
+            "fallback": {
+                "parallel_validation": "blocked",
+                "execution": "sequential",
+            },
+        }
+        sys.stderr.buffer.write(canonical_bytes(payload) + b"\n")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

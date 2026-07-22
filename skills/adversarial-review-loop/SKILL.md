@@ -13,13 +13,11 @@ Review a bounded plan or diff with adversarial skepticism, evidence requirements
 
 Start from a review packet. If none exists, create a minimal packet from the user request and local evidence, or stop with `insufficient_evidence` when the target, scope, autonomy, or diff basis is unclear.
 
-Read:
-
-- `references/review-packet.md`
-- `references/reviewer-trigger-matrix.md`
-- `references/evidence-contract.md`
-- `references/loop-control.md`
-- `references/autonomy-levels.md` when auto-apply is considered
+Before creating or updating the review packet, read `references/review-packet.md`.
+Before deriving reviewers, read `references/reviewer-trigger-matrix.md`.
+Before classifying findings, read `references/evidence-contract.md`.
+Before checking stop conditions, read `references/loop-control.md`.
+Before considering auto-apply, read `references/autonomy-levels.md`.
 
 ## Security Boundary
 

@@ -17,6 +17,16 @@
 - Test-first red-green implementation is required for every behavior.
 - Source design: `docs/superpowers/specs/2026-07-21-risk-based-agent-workflow-validation-design.md`.
 
+### Coordination CLI v1 Acceptance Boundary
+
+Coordination CLI v1 ends at `validate-handoff`.
+
+In v1, `integration_gate.status` is open-only; caller-submitted `closed` is rejected.
+
+`close-integration` and its closure receipt are a future v2 milestone and a v1 non-goal.
+
+Until v2 exists, do not claim integration status `verified` or `closed`.
+
 ---
 
 ### Task 1: Canonical JSON and Hash Domains
@@ -230,6 +240,10 @@ def derive_coordination(manifest: dict, inventory: dict, trigger_matrix: dict) -
     """Derive all gate inputs; never accept submitted route or required sets."""
 ```
 
+`path_overlap` remains a derivation diagnostic in version 1. It is not an
+executable contracted profile: validation must reject it so callers split the
+exclusive paths or serialize the writers before deriving a dispatchable route.
+
 - [ ] **Step 4: Run the tests and verify GREEN**
 
 Run: `python3 -m unittest tests.test_coordination_derivation -v`
@@ -310,7 +324,14 @@ def validate_handoff(repo_root: Path, receipt: ValidationReceipt, workstream_id:
 
 For the first release, reject glob metacharacters, absolute paths, `..`,
 nonexistent parents outside root, duplicate owners, cycles, stale core hashes,
-and submitted required sets that differ from derivation.
+submitted required sets that differ from derivation, and exact or ancestor
+exclusive-path overlap. Overlap must return a structured blocked error with the
+split-or-serialize fallback; any accepted receipt has `path_overlap: false`.
+
+Validation also receives the loaded canonical reviewer-routing artifact. It
+rejects a trigger matrix that does not exactly derive from that artifact,
+requires the reviewer registry's exact canonical `(lens, agent)` coverage, and
+rejects `unverified` or unauthorized evidence producers.
 
 - [ ] **Step 4: Run the tests and verify GREEN**
 

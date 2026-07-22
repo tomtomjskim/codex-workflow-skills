@@ -28,6 +28,7 @@
 **Interfaces:**
 - Consumes: `--source-root`, `--target-root`, `--suffix`, and `--dry-run`.
 - Produces: JSON manifest with `create`, `keep`, `conflict`, and `error` entries; creates links only after explicit non-dry-run invocation.
+- Requires: `--target-root` already exists as an approved non-symlink directory; a missing target root is an explicit error and is never created by the installer.
 
 - [ ] **Step 1: Write failing installer tests**
 
@@ -273,6 +274,7 @@ Run:
 
 ```bash
 tmp_root="$(mktemp -d)"
+mkdir -m 700 "$tmp_root/agents"
 python3 scripts/install_agent_adapters.py \
   --source-root "$HOME/.agents/adapters/claude" \
   --target-root "$tmp_root/agents" \
@@ -287,6 +289,8 @@ Expected: 16 links created under the temporary target only.
 Run:
 
 ```bash
+test -d "$HOME/.claude/agents"
+test ! -L "$HOME/.claude/agents"
 python3 scripts/install_agent_adapters.py \
   --source-root "$HOME/.agents/adapters/claude" \
   --target-root "$HOME/.claude/agents" \
@@ -295,7 +299,10 @@ python3 scripts/install_agent_adapters.py \
   --json
 ```
 
-Expected: exact `create`/`keep`/`conflict` manifest with no filesystem mutation.
+Expected: the existing-root precondition passes, followed by an exact
+`create`/`keep`/`conflict` manifest with no filesystem mutation. If the target
+root is absent or a symlink, stop and request a separate, explicit preparation
+step; the installer must not create or replace it.
 
 - [ ] **Step 4: Stop for explicit approval**
 

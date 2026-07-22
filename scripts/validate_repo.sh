@@ -49,6 +49,26 @@ require_file docs/sample-workflow-intake.md
 require_file docs/sample-adversarial-review.md
 require_file docs/sample-resume-multi-review.md
 require_file tests/acceptance-scenarios.md
+require_file scripts/workflow
+require_file scripts/install_agent_adapters.py
+require_file scripts/validate_policy_contracts.py
+require_file scripts/workflow_coordination/canonical_json.py
+require_file scripts/workflow_coordination/reviewer_routing.py
+require_file tests/test_canonical_json.py
+require_file tests/test_policy_contracts.py
+require_file tests/test_git_changes.py
+require_file tests/test_workflow_cli.py
+require_file tests/test_install_agent_adapters.py
+require_file skills/workflow-intake/references/parallel-coordination.md
+require_file skills/adversarial-review-loop/references/reviewer-routing.json
+require_file scripts/run_live_eval.py
+require_file tests/live-eval-scenarios.json
+require_file tests/test_live_eval_runner.py
+
+if [ ! -x scripts/workflow ]; then
+  printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2
+  exit 1
+fi
 
 if [ -f "$SKILL_VALIDATOR" ]; then
   run python3 "$SKILL_VALIDATOR" skills/workflow
@@ -66,6 +86,14 @@ else
 fi
 
 run git diff --check
+run python3 scripts/validate_policy_contracts.py --repo-root .
+run python3 -m unittest tests.test_policy_contracts -v
+run python3 -m unittest tests.test_git_changes -v
+if [ -z "${SHARED_AGENTS_ROOT:-}" ]; then
+  printf 'not_run: external shared-agent audit requires SHARED_AGENTS_ROOT\n'
+fi
+# Full discovery includes tests.test_workflow_cli and every other repository-owned test.
+run python3 -m unittest discover -s tests -v
 
 require_match '\[sample-workflow-intake\.md\]\(docs/sample-workflow-intake\.md\)' README.md 'workflow intake sample link'
 require_match '\[sample-adversarial-review\.md\]\(docs/sample-adversarial-review\.md\)' README.md 'adversarial review sample link'

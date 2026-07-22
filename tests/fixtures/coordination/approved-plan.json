@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "changed_surfaces": ["api", "ui"],
+  "workstreams": [
+    {
+      "id": "frontend",
+      "owner": "developer-frontend",
+      "scope": ["src/ui"],
+      "exclusive_write_paths": ["src/ui"],
+      "depends_on": [],
+      "consumes": [{"kind": "api", "id": "settings-v1"}],
+      "produces": [{"kind": "component", "id": "settings-form"}]
+    },
+    {
+      "id": "backend",
+      "owner": "developer-backend",
+      "scope": ["src/api"],
+      "exclusive_write_paths": ["src/api"],
+      "depends_on": [],
+      "consumes": [],
+      "produces": [{"kind": "api", "id": "settings-v1"}]
+    }
+  ],
+  "selected_route": "independent",
+  "required_reviewers": ["user-selected-reviewer"]
+}
