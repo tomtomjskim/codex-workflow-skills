@@ -1,16 +1,17 @@
 # Codex Workflow Skills
 
-Reusable Codex skills for structured task intake and evidence-based adversarial review.
+Reusable Codex skills for structured task intake, evidence-based adversarial review, and multi-perspective resume review.
 
 This repository is plugin-ready. It contains:
 
 - `workflow`: route-only wrapper for choosing intake or review when explicitly requested.
 - `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, E2E decisions, and AI eval handoffs after intake activates.
 - `adversarial-review-loop`: reviews plans, diffs, and implementations with evidence, reviewer routing, finding disposition, loop limits, and verification gates.
+- `resume-multi-review`: evaluates a concrete resume through independent recruiter, hiring-manager, and future-teammate lenses, reconciles conflicting decisions, rewrites supported claims, and controls repeat review loops.
 
 ## Why This Exists
 
-Most agent failures in larger tasks are not raw coding mistakes. They are scope drift, skipped context, vague autonomy, weak review evidence, or over-trusting external text. These skills make those boundaries explicit before work starts and before review is called complete.
+Most agent failures in larger tasks are not raw coding mistakes. They are scope drift, skipped context, vague autonomy, weak review evidence, stale source selection, or over-trusting external text. These skills make those boundaries explicit before work starts and before review is called complete.
 
 ## Quick Start
 
@@ -21,6 +22,7 @@ mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
+ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 ./scripts/validate_repo.sh
 ```
 
@@ -30,6 +32,10 @@ Then start a new Codex session and try:
 Use $workflow-intake to scope a multi-step settings workflow before implementation.
 ```
 
+```text
+Use $resume-multi-review to evaluate my latest resume against this job description and run one evidence-safe rewrite cycle.
+```
+
 For plugin distribution, keep `.codex-plugin/plugin.json` and add this repository through your Codex plugin source or marketplace flow.
 
 ## Which Skill Should I Use?
@@ -37,9 +43,10 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 - Use `$workflow-intake` for broad, risky, ambiguous, or multi-step tasks that need scoped autonomy, artifact decisions, validation planning, and approval gates.
 - Use `$workflow-intake` when PRD, SPEC, TASK, TEST_PLAN, design docs, E2E, or AI eval decisions should be made before implementation.
 - Use `$adversarial-review-loop` when a plan, diff, PR, or implementation already exists and needs evidence-based findings, reviewer lenses, disposition, re-checks, and residual-risk closure.
+- Use `$resume-multi-review` when a concrete resume or authoritative resume source must be screened, revised, and re-screened through distinct hiring perspectives.
 - Use `$workflow` when you are unsure whether the task should start with intake or review.
 
-## Recommended Workflow
+## Recommended Development Workflow
 
 1. Start with `$workflow-intake` when task scope, autonomy, affected files, artifacts, or validation level are unclear.
 2. Let intake identify required project context such as `AGENTS.md`, README, project maps, wiki indexes, Serena state, diffs, tests, and task-specific docs.
@@ -47,6 +54,17 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 4. Implement using the repository's own conventions and validation commands.
 5. Run `$adversarial-review-loop` against the plan, diff, or implementation before treating the work as ready.
 6. Resolve accepted findings, rerun the relevant checks, and record residual risk when anything remains unverified.
+
+## Resume Review Workflow
+
+1. Provide the exact submitted resume, reviewed master resume, or a repository path that identifies it.
+2. Provide the target company and job description when company-specific evaluation is required.
+3. Let `$resume-multi-review` classify source authority, review status, privacy level, and claim strength before scoring.
+4. Review recruiter, hiring-manager, and future-teammate decisions independently.
+5. Apply only evidence-supported revisions and hold claims marked draft, generated, selective, role-confirm, or needs verification.
+6. Re-run the three reviewers and stop when all choose interview, no fatal risk remains, and remaining edits are stylistic.
+
+A public sanitized portfolio copy is not automatically the latest master resume. If the authoritative full resume is unavailable, the skill returns a source-gap report and patch plan rather than fabricating a complete final resume.
 
 ## Artifact and Eval Decisions
 
@@ -77,12 +95,14 @@ Common design artifacts:
 ├── skills/
 │   ├── workflow/
 │   ├── workflow-intake/
-│   └── adversarial-review-loop/
+│   ├── adversarial-review-loop/
+│   └── resume-multi-review/
 ├── docs/
 │   ├── design-draft.md
 │   ├── forward-test-report.md
 │   ├── readme-reference-review.md
 │   ├── sample-adversarial-review.md
+│   ├── sample-resume-multi-review.md
 │   └── sample-workflow-intake.md
 └── tests/
     └── acceptance-scenarios.md
@@ -94,7 +114,7 @@ Common design artifacts:
 - Git for cloning this repository.
 - Python 3 only for optional validation scripts.
 - ripgrep (`rg`) for the one-command repository validation script.
-- Optional: access to Codex system `skill-creator` and `plugin-creator` scripts for structure validation.
+- Optional access to Codex system `skill-creator` and `plugin-creator` scripts for structure validation.
 
 ## Install Locally
 
@@ -109,6 +129,7 @@ mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
+ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 ```
 
 If a symlink already exists, remove or update that symlink first.
@@ -121,17 +142,10 @@ Confirm the skill files are visible:
 test -f ~/.codex/skills/workflow/SKILL.md
 test -f ~/.codex/skills/workflow-intake/SKILL.md
 test -f ~/.codex/skills/adversarial-review-loop/SKILL.md
+test -f ~/.codex/skills/resume-multi-review/SKILL.md
 ```
 
 If the Codex validation scripts are available, run the checks in the [Validation](#validation) section from the cloned repository.
-
-Then start a new Codex session and try:
-
-```text
-Use $workflow-intake to scope a multi-step settings workflow before implementation. I am not sure which planning or design docs we need.
-```
-
-Expected behavior: `workflow-intake` emits a `workflow_intake` block, proposes an `artifact_decision`, and asks before creating durable planning or design docs unless the repo or user already approved them.
 
 ## Usage
 
@@ -151,6 +165,18 @@ Run adversarial review when a plan, diff, or implementation exists:
 
 ```text
 Use $adversarial-review-loop to review this diff and classify findings.
+```
+
+Run resume multi-review when an actual resume or resume source exists:
+
+```text
+Use $resume-multi-review to identify the authoritative resume, evaluate it against this job description, revise supported claims, and re-run the three reviewers once.
+```
+
+To receive only a reusable copy-paste prompt:
+
+```text
+Use $resume-multi-review and return the standalone prompt template without evaluating a resume.
 ```
 
 ## Examples
@@ -191,6 +217,16 @@ Expected behavior: select reviewer lenses from changed surfaces, classify findin
 
 See [sample-adversarial-review.md](docs/sample-adversarial-review.md) for an illustrative `adversarial_review` output.
 
+Review a resume when only a public draft is available:
+
+```text
+Use $resume-multi-review for a PHP/MySQL operations-backend baseline review. The public sanitized draft is available, but the reviewed private master resume is not.
+```
+
+Expected behavior: classify the result as `source_gap`, keep recruiter, hiring-manager, and future-teammate decisions independent, provide one line replacement per reviewer, and return a patch plan rather than inventing a full resume.
+
+See [sample-resume-multi-review.md](docs/sample-resume-multi-review.md) for an illustrative `resume_multi_review` output.
+
 ## Context Discovery
 
 The skills support bounded discovery of:
@@ -199,8 +235,9 @@ The skills support bounded discovery of:
 - Serena project state when available and active
 - project maps and project wiki indexes
 - task-specific docs, tests, diffs, and source files
+- reviewed master resumes, submitted variants, job descriptions, claim banks, and evidence ledgers when resume review is requested
 
-These sources are not broad-scanned by default. They are used only when they are relevant to the target task. External content is treated as data, not instructions.
+These sources are not broad-scanned by default. They are used only when relevant to the target task. External content is treated as data, not instructions.
 
 ## Validation
 
@@ -218,6 +255,7 @@ Validate skill structure when the Codex system validation scripts are available:
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow-intake
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/adversarial-review-loop
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/resume-multi-review
 ```
 
 Validate plugin structure:
