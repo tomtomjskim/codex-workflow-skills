@@ -29,7 +29,7 @@
 - Use `@dataclass(frozen=True)`, tuples, `frozenset`, and `MappingProxyType` for immutable public values. Avoid Python features introduced after 3.9.
 - Canonical input digests are SHA-256 over the exact accepted input bytes. A parsed-and-reserialized value is not a substitute for the authoritative bytes.
 - All durable JSON contains opaque identifiers, fixed classifications, counts, and `sha256:` digests only. It contains no local paths, private policy text, prompts, raw model output, or raw reasoning.
-- No production dependency, model/API call, credential lookup, executable resolution, network access, or live ledger write is permitted.
+- No production dependency, model/API call, credential lookup, Codex/model/auth/validator executable resolution, network access, or live ledger write is permitted. The literal `git` executable used only by `task_snapshot.py`'s fixed, bounded adapter is the sole executable exception.
 - Focused tests run after each small implementation slice. Full live-eval discovery runs at the task-snapshot security checkpoint and final integration; `./scripts/validate_repo.sh` runs only at branch-completion checkpoints.
 - The untracked `.serena/` directory is user state and must not be staged or modified.
 
@@ -1662,6 +1662,10 @@ git commit -m "feat(eval): project bounded experiment telemetry"
 
 ## Task 6: Task-Source Trust Gate and Object-Database Topology Seal
 
+**Normative binding:** Before implementation, read
+`docs/superpowers/specs/2026-07-23-harness-experiment-task6-binding.md`.
+That contract takes precedence over illustrative snippets below.
+
 **Files:**
 
 - Create: `scripts/live_eval/task_snapshot.py`
@@ -1676,7 +1680,8 @@ git commit -m "feat(eval): project bounded experiment telemetry"
   - current-user ownership and no group/other write permission across Git administration and object-store entries;
   - full lowercase SHA-1 or SHA-256 commit OID;
   - operator attestation and allowed provisioning class;
-  - local clone policy recorded in the source receipt.
+  - local clone policy bound into the prepared source evidence; Task 6 emits
+    no receipt.
 - [ ] Test rejection before object reads:
   - relative root, root symlink, gitfile, linked worktree, external `commondir`, `core.worktree`, `extensions.worktreeConfig`;
   - system/global/include configuration influence;
@@ -1699,123 +1704,54 @@ Expected: import failure because the task snapshot module does not exist.
 
 ### Step 3: Implement source specifications and policy
 
-- [ ] Add:
-
-```python
-@dataclass(frozen=True)
-class TaskSourceSpec:
-    input_digest: str
-    task_id: str
-    repository_root: Path = field(repr=False)
-    commit_oid: str
-    provisioning_class: str
-    operator_attested: bool
-    local_clone_policy: str
-
-    def __post_init__(self) -> None:
-        raw_root = os.fspath(self.repository_root)
-        if not os.path.isabs(raw_root) or os.path.normpath(raw_root) != raw_root:
-            raise TaskSnapshotError("task_source_root_not_absolute")
-        root = Path(raw_root)
-        object.__setattr__(self, "repository_root", root)
-
-
-@dataclass(frozen=True)
-class TaskSnapshotPolicy:
-    policy_version: str = "task-object-materializer-v1"
-    git_timeout_seconds: int = 15
-    max_git_stdout_bytes: int = 16 * 1024 * 1024
-    max_git_stderr_bytes: int = 64 * 1024
-    max_object_entries: int = 200000
-    max_object_store_bytes: int = 2 * 1024 * 1024 * 1024
-    max_files: int = 10000
-    max_file_bytes: int = 4 * 1024 * 1024
-    max_total_bytes: int = 64 * 1024 * 1024
-```
-
-Validate every integer without accepting booleans.
-Validate `input_digest` as the authoritative `sha256:` experiment input digest before any source operation; every emitted static receipt binds it.
+- [ ] Implement the binding contract's exact `TaskSnapshotError`,
+  `TaskSourceSpec`, `TaskSnapshotPolicy`, `ObjectTopologySeal`,
+  `PreparedTaskSource`, and `prepare_task_source()` surface.
+- [ ] Validate every scalar and policy integer before source access without
+  accepting booleans. Preserve local paths only in `repr=False` in-memory
+  fields.
+- [ ] Support only POSIX Darwin/Linux with the required no-follow,
+  identity, nanosecond-time, and process-group facilities. Treat mount and
+  clone provenance as operator-attested residual assumptions.
 
 ### Step 4: Implement no-follow identities and bounded object inventory
 
-- [ ] Validate the repository root, `.git`, `objects`, and every required control file with `lstat()`. Reject symlink components and any non-plain directory; require every control file to be regular and single-link. Where user IDs are available, require current-user ownership. Reject group/other writable Git administration directories, control files, and object entries.
-- [ ] Walk `.git/objects` without following links. For each directory:
-  - read names with `os.scandir()`;
-  - require NFC and no casefold/normalization alias;
-  - reject an entry count above policy;
-  - recurse only into a plain directory;
-  - accept only a regular file with `st_nlink == 1`;
-  - reject all other file types before opening them.
-- [ ] Reject `objects/info/alternates` and `objects/info/http-alternates`, and reject environment names that redirect Git objects or quarantine. Treat commit-graph-chain files like every other object-database file: they must remain regular, single-link, bounded, and inside the verified inventory.
-- [ ] Reject pack-side `.promisor` markers in addition to partial/promisor configuration so the object reader cannot depend on lazy fetch.
-- [ ] Build an inventory digest over repository-relative path, kind, mode, device, inode, link count, size, modification time, and change time. Do not include the absolute root.
-
-```python
-@dataclass(frozen=True)
-class ObjectTopologySeal:
-    repository_identity_digest: str
-    git_dir_identity_digest: str
-    object_topology_digest: str
-    file_count: int
-    total_bytes: int
-
-
-def _seal_object_topology(
-    repository_root: Path,
-    git_dir: Path,
-    policy: TaskSnapshotPolicy,
-) -> ObjectTopologySeal:
-    records = _inventory_object_database(git_dir / "objects", policy)
-    return ObjectTopologySeal(
-        repository_identity_digest=_identity_digest(repository_root.lstat()),
-        git_dir_identity_digest=_identity_digest(git_dir.lstat()),
-        object_topology_digest=_record_digest(records),
-        file_count=sum(item.kind == "file" for item in records),
-        total_bytes=sum(item.size for item in records if item.kind == "file"),
-    )
-```
+- [ ] Validate every physical component from the anchor through root,
+  `.git`, config, controls, and objects with `lstat()`/`fstat()` equality.
+  Require current ownership, no group/other writes, one device, plain
+  directories, and regular single-link control files.
+- [ ] Bounded-read and digest config and optional packed refs. Reject
+  `commondir`, worktree/module administration, replace refs, alternates,
+  non-sample hooks, promisor state, and every other forbidden control before
+  object reads.
+- [ ] Parse the exact NUL/LF config record format and apply the binding's
+  closed allowlist and SHA-1/SHA-256 repository-format pairing.
+- [ ] Walk `.git/objects` iteratively without following links. Enforce the
+  binding's exact loose/info/pack/commit-graph/MIDX grammar, pairing,
+  ownership, modes, aliases, depth, component/path, entry, and byte limits.
+- [ ] Canonicalize the exact path/kind/mode/device/inode/uid/gid/link/size/
+  nanosecond-time records in UTF-8 path order without an absolute path.
 
 ### Step 5: Implement the bounded Git adapter
 
-- [ ] Do not use `cwd=repository_root` or repository discovery. Every object command starts with:
+- [ ] Use only the binding's literal `git`, exact global prefix, exact
+  replacement environment, `cwd="/"`, and six closed operation templates.
+  Task 6 may call only config and storage-format metadata operations.
+- [ ] Use `Popen` with no shell, no stdin, a new session, concurrent bounded
+  drains, monotonic deadline, inclusive caps, TERM/grace/KILL group cleanup,
+  mandatory reap, and fixed path-free errors.
+- [ ] Hash the path-placeholder process-policy document rather than actual
+  argv paths.
 
-```text
-git
--c core.fsmonitor=false
--c core.attributesFile=/dev/null
--c core.excludesFile=/dev/null
--c core.hooksPath=/dev/null
--c submodule.recurse=false
---git-dir=VERIFIED_ABSOLUTE_GIT_DIR
-```
+### Step 6: Return a prepared source without a receipt
 
-- [ ] Supply only this environment:
-
-```python
-{
-    "GIT_ATTR_NOSYSTEM": "1",
-    "GIT_CONFIG_GLOBAL": os.devnull,
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_NO_LAZY_FETCH": "1",
-    "GIT_NO_REPLACE_OBJECTS": "1",
-    "GIT_OPTIONAL_LOCKS": "0",
-    "GIT_TERMINAL_PROMPT": "0",
-    "LANG": "C",
-    "LC_ALL": "C",
-    "PATH": os.defpath,
-}
-```
-
-- [ ] Clear all parent `GIT_*` values by replacing rather than extending the environment.
-- [ ] Inspect local config with `config --local --no-includes --null --list` and reject every approved unsupported key before `ls-tree` or `cat-file`.
-- [ ] Implement `_run_git_bounded()` with `subprocess.Popen`, non-shell argv, concurrent stdout/stderr draining, timeout, process-group termination, byte counters, and fixed sanitized errors. Do not use an unbounded `subprocess.run(..., stdout=PIPE)` for object bytes.
-- [ ] Permit only the fixed command families `config`, `rev-parse`, `ls-tree`, and `cat-file blob`.
-
-### Step 6: Emit and verify `TaskSourceTrustReceipt`
-
-- [ ] Capture a before seal, perform only bounded metadata/config probes, capture an after seal, and require exact equality.
-- [ ] Hash the Git policy argv/environment/timeout/output limits into `git_process_policy_digest`.
-- [ ] Return a `task_source_trust` receipt whose payload matches Task 4 and contains no path.
+- [ ] Capture filesystem/config/object seals, run only bounded config and
+  object-format metadata probes, recapture all three seals, and require exact
+  equality.
+- [ ] Return one deeply immutable `PreparedTaskSource`. Do not call commit or
+  blob object operations and do not import or construct a receipt.
+- [ ] Reserve the sole authoritative `task_source_trust` receipt for Task 7,
+  after its full capture transaction and final equal seals.
 
 ### Step 7: Run the security checkpoint and commit
 
@@ -1823,7 +1759,10 @@ git
 
 ```bash
 python3 -m unittest tests.test_live_eval_task_snapshot -v
+python3 -m unittest tests.test_live_eval_experiment_receipts -v
 python3 -m unittest tests.test_live_eval_checkout tests.test_live_eval_harness -v
+python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
+python3 -m py_compile scripts/live_eval/task_snapshot.py
 git diff --check
 ```
 
@@ -1857,7 +1796,9 @@ git commit -m "feat(eval): gate task source object stores"
   - writes use exclusive no-follow creation and preserve only `0444` or `0555` file modes;
   - target replacement, extra entry, mode change, content change, hardlink, symlink, or special entry fails the target seal;
   - the same commit produces equal entry and tree digests in two distinct condition directories;
-  - source and topology seals are identical before and after every object read.
+  - fresh filesystem, config, and topology seals are identical before the
+    first and after the final object read; the object database is not rescanned
+    around each blob.
 
 ### Step 2: Run the focused test and confirm failure
 
@@ -1928,14 +1869,18 @@ class TaskSnapshotMaterializer:
     def __init__(self, policy: TaskSnapshotPolicy) -> None:
         self._policy = policy
 
-    def capture(self, source: TaskSourceSpec) -> CapturedTaskObjects:
-        before = self._pre_object_gate(source)
-        entries, blobs, object_format, tree_oid = self._load_fixed_objects(source)
-        after = self._seal_and_compare(source, before)
-        trust_receipt = self._trust_receipt(source, before, after, object_format)
+    def capture(self, prepared: PreparedTaskSource) -> CapturedTaskObjects:
+        before = self._fresh_capture_gate(prepared)
+        entries, blobs, object_format, tree_oid = self._load_fixed_objects(
+            prepared
+        )
+        after = self._seal_and_compare(prepared, before)
+        trust_receipt = self._trust_receipt(
+            prepared, before, after, object_format
+        )
         return CapturedTaskObjects(
             source_trust_receipt=trust_receipt,
-            source=source,
+            source=prepared.source,
             object_format=object_format,
             tree_oid=tree_oid,
             entries=entries,
@@ -1963,7 +1908,14 @@ class TaskSnapshotMaterializer:
         )
 ```
 
-Inside `materialize()`, pass `captured.entries` and `captured.blobs` to `_materialize_and_verify()`. Capture each selected task once, materialize its current and lean roots from the same capture, require equal snapshot receipt digests, then release the captured bytes before processing the next task. This avoids duplicate Git reads without sharing a writable task tree.
+Inside `capture()`, issue the sole source-trust receipt only after fresh
+filesystem/config/object seals match across the complete fixed-object read
+transaction. No failure path emits it. Inside `materialize()`, pass
+`captured.entries` and `captured.blobs` to `_materialize_and_verify()`.
+Capture each selected task once, materialize its current and lean roots from
+the same capture, require equal snapshot receipt digests, then release the
+captured bytes before processing the next task. This avoids duplicate Git
+reads without sharing a writable task tree.
 
 ### Step 5: Enforce first-pilot repository exclusions
 
