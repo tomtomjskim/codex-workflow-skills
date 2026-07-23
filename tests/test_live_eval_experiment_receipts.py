@@ -1374,6 +1374,122 @@ class AnalysisProjectionTests(unittest.TestCase):
         )
         self.assertEqual(regression.outcome, "reject_for_safety")
 
+    def test_precedence_combinations_use_canonical_history_evidence(self):
+        cases = (
+            (
+                "absolute+partial+high",
+                True,
+                True,
+                True,
+                False,
+                "reject_for_safety",
+                "absolute_lean_safety_regression",
+                False,
+            ),
+            (
+                "partial+high",
+                False,
+                True,
+                True,
+                False,
+                "inconclusive",
+                "experiment_partial",
+                False,
+            ),
+            (
+                "high+machine",
+                False,
+                False,
+                True,
+                True,
+                "reject_for_safety",
+                "masked_high_regression",
+                True,
+            ),
+        )
+        for (
+            name,
+            absolute,
+            partial,
+            high,
+            machine,
+            expected_outcome,
+            expected_reason,
+            expected_aggregate,
+        ) in cases:
+            with self.subTest(case=name):
+                plan, preflight = _runtime_fixture()
+                task_id = plan.pilot_schedule[0].task_id
+                machine_results = {}
+                safety_overrides = {}
+                if absolute:
+                    assertion_id = next(
+                        candidate[
+                            "absolute_safety_assertion_ids"
+                        ][0]
+                        for candidate in plan.plan_document[
+                            "candidates"
+                        ]
+                        if candidate["task_id"] == task_id
+                    )
+                    machine_results[(task_id, "current")] = "fail"
+                    safety_overrides[(task_id, "lean")] = {
+                        "machine_assertion_result": "fail",
+                        "assertion_id": assertion_id,
+                        "safety_basis": _digest(
+                            "precedence-absolute-basis"
+                        ),
+                    }
+                elif machine:
+                    machine_results[(task_id, "current")] = "pass"
+                    machine_results[(task_id, "lean")] = "fail"
+
+                history = []
+                _append_containment_and_canaries(
+                    plan, preflight, history
+                )
+                terminals = _append_controlled_pilots(
+                    plan,
+                    preflight,
+                    history,
+                    machine_results=machine_results,
+                    safety_overrides=safety_overrides,
+                )
+                _, _, unmask = _append_controlled_review_chain(
+                    plan,
+                    preflight,
+                    history,
+                    terminals,
+                    high=high,
+                )
+                if partial:
+                    _append_runtime(
+                        plan,
+                        preflight,
+                        history,
+                        "experiment_stop",
+                        _stop_payload(
+                            stage="decision",
+                            reason="operator_stop",
+                            canary_count=2,
+                            pilot_count=8,
+                            evidence=(unmask.receipt_digest,),
+                        ),
+                    )
+
+                decision = analyze_runtime_history(
+                    build_analysis_contract(plan),
+                    plan,
+                    preflight,
+                    history,
+                )
+                self.assertEqual(decision.outcome, expected_outcome)
+                self.assertEqual(decision.reason_code, expected_reason)
+                self.assertIs(
+                    decision.comparative_aggregate_emitted,
+                    expected_aggregate,
+                )
+
     def test_analysis_boundary_rejects_raw_pairs_tokens_and_caller_datasets(self):
         plan, preflight = _runtime_fixture()
         history = []
@@ -1434,7 +1550,72 @@ class AnalysisProjectionTests(unittest.TestCase):
                 history,
             )
 
+    def test_analysis_boundary_rejects_safety_basis_outside_lean_failure(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_controlled_pilots(
+            plan, preflight, history
+        )
+        _append_controlled_review_chain(
+            plan, preflight, history, terminals
+        )
+        dataset = project_analysis_dataset(plan, preflight, history)
+        contract = build_analysis_contract(plan)
+        pair = dataset.pairs[0]
+        assertion_id = contract.task_assertions[
+            0
+        ].absolute_safety_assertion_ids[0]
+        basis = _digest("invalid-safety-position")
+        attacks = (
+            (
+                "current",
+                replace(
+                    pair,
+                    current=replace(
+                        pair.current,
+                        machine_assertion_passed=False,
+                        absolute_safety_assertion_id=assertion_id,
+                        absolute_safety_basis_digest=basis,
+                    ),
+                ),
+            ),
+            (
+                "lean",
+                replace(
+                    pair,
+                    lean=replace(
+                        pair.lean,
+                        machine_assertion_passed=True,
+                        absolute_safety_assertion_id=assertion_id,
+                        absolute_safety_basis_digest=basis,
+                    ),
+                ),
+            ),
+        )
+        for condition, forged_pair in attacks:
+            with self.subTest(condition=condition):
+                self.assertDatasetInvalid(
+                    contract,
+                    replace(
+                        dataset,
+                        pairs=(forged_pair,) + dataset.pairs[1:],
+                    ),
+                )
+
     def test_replay_and_projection_both_reject_rebuilt_nested_mutations(self):
+        def assert_both_boundaries_reject(
+            plan, preflight, bad_history
+        ):
+            for boundary in (
+                replay_runtime_history,
+                project_analysis_dataset,
+            ):
+                with self.subTest(boundary=boundary.__name__):
+                    self.assertHistoryInvalid(
+                        boundary, plan, preflight, bad_history
+                    )
+
         plan, preflight = _runtime_fixture()
         history = []
         _append_containment_and_canaries(plan, preflight, history)
@@ -1487,104 +1668,151 @@ class AnalysisProjectionTests(unittest.TestCase):
             changed_terminal,
             telemetry_stop,
         ]
-        for boundary in (
-            replay_runtime_history,
-            project_analysis_dataset,
-        ):
-            self.assertHistoryInvalid(
-                boundary, plan, preflight, bad_telemetry_history
-            )
+        assert_both_boundaries_reject(
+            plan, preflight, bad_telemetry_history
+        )
 
-        plan, preflight = _runtime_fixture()
-        history = []
-        _append_containment_and_canaries(plan, preflight, history)
-        terminals = _append_completed_pilots(
-            plan, preflight, history
-        )
-        packet_payload, score_payload, mapping_payload = (
-            _review_chain_payloads(plan, terminals)
-        )
-        packet = _append_runtime(
-            plan,
-            preflight,
-            history,
-            "masked_review_packet",
-            packet_payload,
-        )
-        score_payload["masked_packet_receipt_digest"] = (
-            packet.receipt_digest
-        )
-        score_payload["locked_score_records"][0][
-            "correctness_score"
-        ] += 1
-        changed_score = _runtime_receipt(
-            plan, preflight, history, "score_lock", score_payload
-        )
-        score_stop = make_receipt(
-            "experiment_stop",
-            plan.input_digest,
-            plan.plan_digest,
-            changed_score.receipt_digest,
-            _stop_payload(
-                stage="unmask",
-                reason="operator_stop",
-                canary_count=2,
-                pilot_count=8,
-                evidence=(changed_score.receipt_digest,),
-            ),
-        )
-        bad_score_history = history + [changed_score, score_stop]
-        for boundary in (
-            replay_runtime_history,
-            project_analysis_dataset,
+        for score_field in (
+            "correctness_score",
+            "active_review_milliseconds",
         ):
-            self.assertHistoryInvalid(
-                boundary, plan, preflight, bad_score_history
-            )
+            with self.subTest(
+                receipt_type="score_lock", field=score_field
+            ):
+                plan, preflight = _runtime_fixture()
+                history = []
+                _append_containment_and_canaries(
+                    plan, preflight, history
+                )
+                terminals = _append_completed_pilots(
+                    plan, preflight, history
+                )
+                packet_payload, score_payload, _ = (
+                    _review_chain_payloads(plan, terminals)
+                )
+                packet = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "masked_review_packet",
+                    packet_payload,
+                )
+                score_payload["masked_packet_receipt_digest"] = (
+                    packet.receipt_digest
+                )
+                score_payload["locked_score_records"][0][
+                    score_field
+                ] += 1
+                changed_score = _runtime_receipt(
+                    plan,
+                    preflight,
+                    history,
+                    "score_lock",
+                    score_payload,
+                )
+                score_stop = make_receipt(
+                    "experiment_stop",
+                    plan.input_digest,
+                    plan.plan_digest,
+                    changed_score.receipt_digest,
+                    _stop_payload(
+                        stage="unmask",
+                        reason="operator_stop",
+                        canary_count=2,
+                        pilot_count=8,
+                        evidence=(changed_score.receipt_digest,),
+                    ),
+                )
+                assert_both_boundaries_reject(
+                    plan,
+                    preflight,
+                    history + [changed_score, score_stop],
+                )
 
-        valid_score = _append_runtime(
-            plan,
-            preflight,
-            history,
-            "score_lock",
-            {
-                **_review_chain_payloads(plan, terminals)[1],
-                "masked_packet_receipt_digest": packet.receipt_digest,
-            },
-        )
-        mapping_payload["score_lock_receipt_digest"] = (
-            valid_score.receipt_digest
-        )
-        mapping_payload["condition_mapping_records"][0][
-            "task_id"
-        ] = plan.pilot_schedule[0].task_id
-        changed_mapping = _runtime_receipt(
-            plan, preflight, history, "unmask", mapping_payload
-        )
-        mapping_stop = make_receipt(
-            "experiment_stop",
-            plan.input_digest,
-            plan.plan_digest,
-            changed_mapping.receipt_digest,
-            _stop_payload(
-                stage="decision",
-                reason="operator_stop",
-                canary_count=2,
-                pilot_count=8,
-                evidence=(changed_mapping.receipt_digest,),
-            ),
-        )
-        bad_mapping_history = history + [
-            changed_mapping,
-            mapping_stop,
-        ]
-        for boundary in (
-            replay_runtime_history,
-            project_analysis_dataset,
+        for mapping_field in (
+            "task_id",
+            "condition",
+            "pilot_terminal_receipt_digest",
         ):
-            self.assertHistoryInvalid(
-                boundary, plan, preflight, bad_mapping_history
-            )
+            with self.subTest(
+                receipt_type="unmask", field=mapping_field
+            ):
+                plan, preflight = _runtime_fixture()
+                history = []
+                _append_containment_and_canaries(
+                    plan, preflight, history
+                )
+                terminals = _append_completed_pilots(
+                    plan, preflight, history
+                )
+                packet_payload, score_payload, mapping_payload = (
+                    _review_chain_payloads(plan, terminals)
+                )
+                packet = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "masked_review_packet",
+                    packet_payload,
+                )
+                score_payload["masked_packet_receipt_digest"] = (
+                    packet.receipt_digest
+                )
+                valid_score = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "score_lock",
+                    score_payload,
+                )
+                mapping_payload["score_lock_receipt_digest"] = (
+                    valid_score.receipt_digest
+                )
+                record = mapping_payload[
+                    "condition_mapping_records"
+                ][0]
+                if mapping_field == "task_id":
+                    changed_value = next(
+                        run.task_id
+                        for run in plan.pilot_schedule
+                        if run.task_id != record["task_id"]
+                    )
+                elif mapping_field == "condition":
+                    changed_value = (
+                        "lean"
+                        if record["condition"] == "current"
+                        else "current"
+                    )
+                else:
+                    changed_value = _digest(
+                        "forged-pilot-terminal"
+                    )
+                record[mapping_field] = changed_value
+                changed_mapping = _runtime_receipt(
+                    plan,
+                    preflight,
+                    history,
+                    "unmask",
+                    mapping_payload,
+                )
+                mapping_stop = make_receipt(
+                    "experiment_stop",
+                    plan.input_digest,
+                    plan.plan_digest,
+                    changed_mapping.receipt_digest,
+                    _stop_payload(
+                        stage="decision",
+                        reason="operator_stop",
+                        canary_count=2,
+                        pilot_count=8,
+                        evidence=(changed_mapping.receipt_digest,),
+                    ),
+                )
+                assert_both_boundaries_reject(
+                    plan,
+                    preflight,
+                    history + [changed_mapping, mapping_stop],
+                )
 
 
 class RuntimeReplayTests(unittest.TestCase):
@@ -2287,6 +2515,27 @@ class RuntimeReplayTests(unittest.TestCase):
             history + [containment],
         )
 
+    def test_runtime_reconstruction_rejects_snapshot_digest_string_subclass(self):
+        plan, preflight = _runtime_fixture()
+        forged_children = list(plan.pilot_invocation_plans)
+        forged_children[0] = replace(
+            forged_children[0],
+            snapshot_receipt_digest=_StringSubclass(
+                forged_children[0].snapshot_receipt_digest
+            ),
+        )
+        forged_plan = replace(
+            plan,
+            pilot_invocation_plans=tuple(forged_children),
+        )
+
+        self.assertHistoryInvalid(
+            replay_runtime_history,
+            forged_plan,
+            preflight,
+            (),
+        )
+
     def test_nested_telemetry_score_and_mapping_digests_are_recomputed(self):
         plan, preflight = _runtime_fixture()
         history = []
@@ -2828,6 +3077,83 @@ class RuntimeReplayTests(unittest.TestCase):
             distinct_history,
             cross_task,
         )
+
+    def test_replay_rejects_safety_basis_outside_lean_failure(self):
+        for condition, machine_result in (
+            ("current", "fail"),
+            ("lean", "pass"),
+        ):
+            with self.subTest(
+                condition=condition, machine_result=machine_result
+            ):
+                plan, preflight = _runtime_fixture()
+                history = []
+                _append_containment_and_canaries(
+                    plan, preflight, history
+                )
+                index = next(
+                    index
+                    for index, run in enumerate(plan.pilot_schedule)
+                    if run.condition == condition
+                )
+                _append_completed_pilots(
+                    plan,
+                    preflight,
+                    history,
+                    stop_after=index,
+                )
+                run = plan.pilot_schedule[index]
+                child = plan.pilot_invocation_plans[index]
+                reservation = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "pilot_reservation",
+                    {
+                        "reservation_id": (
+                            "invalid-safety-{}".format(condition)
+                        ),
+                        "task_id": run.task_id,
+                        "condition": run.condition,
+                        "snapshot_receipt_digest": (
+                            child.snapshot_receipt_digest
+                        ),
+                        "invocation_plan_digest": plan.plan_document[
+                            "pilot_invocation_plan_digests"
+                        ][index],
+                    },
+                )
+                candidate = next(
+                    candidate
+                    for candidate in plan.plan_document["candidates"]
+                    if candidate["task_id"] == run.task_id
+                )
+                terminal = _runtime_receipt(
+                    plan,
+                    preflight,
+                    history,
+                    "pilot_terminal",
+                    _pilot_terminal_payload(
+                        plan,
+                        reservation,
+                        index,
+                        machine_assertion_result=machine_result,
+                        assertion_id=candidate[
+                            "absolute_safety_assertion_ids"
+                        ][0],
+                        safety_basis=_digest(
+                            "invalid-safety-{}".format(condition)
+                        ),
+                    ),
+                )
+
+                self.assertHistoryInvalid(
+                    validate_runtime_transition,
+                    plan,
+                    preflight,
+                    history,
+                    terminal,
+                )
 
 
 class StaticReceiptTests(unittest.TestCase):

@@ -684,7 +684,7 @@ def _require_opaque_identifier(value: object, label: str) -> str:
 
 def _require_digest(value: object, label: str) -> str:
     del label
-    if not isinstance(value, str) or _DIGEST_PATTERN.fullmatch(value) is None:
+    if type(value) is not str or _DIGEST_PATTERN.fullmatch(value) is None:
         _raise_input_error()
     return value
 
@@ -1840,7 +1840,11 @@ def _validate_analysis_observation(
         _raise_analysis_dataset_error()
     if assertion_id is not None:
         checked_id = _analysis_nfc_text(assertion_id)
-        if checked_id not in task.absolute_safety_assertion_ids:
+        if (
+            checked_id not in task.absolute_safety_assertion_ids
+            or condition != "lean"
+            or observation.machine_assertion_passed is not False
+        ):
             _raise_analysis_dataset_error()
         _analysis_digest(basis)
     return observation

@@ -1593,7 +1593,11 @@ def _apply_pilot_terminal(
         "absolute_safety_assertion_ids"
     ]
     assertion_id = payload["absolute_safety_assertion_id"]
-    if assertion_id is not None and assertion_id not in registered:
+    if assertion_id is not None and (
+        assertion_id not in registered
+        or payload["condition"] != "lean"
+        or payload["machine_assertion_result"] != "fail"
+    ):
         _raise_history_invalid()
     state.pilot_terminals.append(candidate)
     if (

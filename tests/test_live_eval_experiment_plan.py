@@ -45,6 +45,10 @@ VALID_INPUT = FIXTURE / "valid-plan-input.json"
 ANALYSIS_BOUNDARIES = FIXTURE / "analysis-boundaries.json"
 
 
+class _StringSubclass(str):
+    pass
+
+
 EXPECTED_CANARY_OVERLAY_RECIPE = {
     "assembly_order": [
         "base_bytes",
@@ -1322,10 +1326,10 @@ class ExperimentPlanTests(unittest.TestCase):
         plan = self.build()
         contract = experiment_plan_module.build_analysis_contract(plan)
 
-        def make_dataset(*, lean_score, zero_reported_baseline=False):
+        def make_dataset(*, lean_score, zero_baseline=None):
             pairs = []
             for task in contract.task_assertions:
-                if zero_reported_baseline:
+                if zero_baseline == "reported_tokens":
                     current_input = current_output = 0
                     lean_input = lean_output = 0
                     current_reasoning = lean_reasoning = 0
@@ -1344,8 +1348,17 @@ class ExperimentPlanTests(unittest.TestCase):
                     cached_input_tokens=0,
                     output_tokens=current_output,
                     reasoning_output_tokens=current_reasoning,
-                    wall_time_milliseconds=1_000,
-                    active_review_milliseconds=1_000,
+                    wall_time_milliseconds=(
+                        0
+                        if zero_baseline == "wall_time_milliseconds"
+                        else 1_000
+                    ),
+                    active_review_milliseconds=(
+                        0
+                        if zero_baseline
+                        == "active_review_milliseconds"
+                        else 1_000
+                    ),
                     machine_assertion_passed=True,
                     absolute_safety_assertion_id=None,
                     absolute_safety_basis_digest=None,
@@ -1361,8 +1374,17 @@ class ExperimentPlanTests(unittest.TestCase):
                     cached_input_tokens=0,
                     output_tokens=lean_output,
                     reasoning_output_tokens=lean_reasoning,
-                    wall_time_milliseconds=800,
-                    active_review_milliseconds=800,
+                    wall_time_milliseconds=(
+                        0
+                        if zero_baseline == "wall_time_milliseconds"
+                        else 800
+                    ),
+                    active_review_milliseconds=(
+                        0
+                        if zero_baseline
+                        == "active_review_milliseconds"
+                        else 800
+                    ),
                     machine_assertion_passed=True,
                     absolute_safety_assertion_id=None,
                     absolute_safety_basis_digest=None,
@@ -1417,25 +1439,42 @@ class ExperimentPlanTests(unittest.TestCase):
             "screening_thresholds_not_met",
         )
 
-        ineligible = experiment_plan_module.analyze_pairs(
-            contract,
-            make_dataset(
-                lean_score=75, zero_reported_baseline=True
-            ),
+        metric_order = (
+            "reported_tokens",
+            "wall_time_milliseconds",
+            "active_review_milliseconds",
         )
-        self.assertEqual(
-            ineligible.efficiency_medians["reported_tokens"], None
-        )
-        self.assertEqual(
-            ineligible.qualifying_efficiency_metrics,
-            (
-                "wall_time_milliseconds",
-                "active_review_milliseconds",
-            ),
-        )
-        self.assertEqual(
-            ineligible.outcome, "advance_to_larger_study"
-        )
+        for zero_baseline in metric_order:
+            with self.subTest(zero_baseline=zero_baseline):
+                ineligible = experiment_plan_module.analyze_pairs(
+                    contract,
+                    make_dataset(
+                        lean_score=75,
+                        zero_baseline=zero_baseline,
+                    ),
+                )
+                self.assertEqual(
+                    tuple(ineligible.efficiency_medians),
+                    metric_order,
+                )
+                self.assertIsNone(
+                    ineligible.efficiency_medians[zero_baseline]
+                )
+                self.assertEqual(
+                    ineligible.qualifying_efficiency_metrics,
+                    tuple(
+                        metric
+                        for metric in metric_order
+                        if metric != zero_baseline
+                    ),
+                )
+                self.assertNotIn(
+                    zero_baseline,
+                    ineligible.qualifying_efficiency_metrics,
+                )
+                self.assertEqual(
+                    ineligible.outcome, "advance_to_larger_study"
+                )
 
     def test_builds_deterministic_deeply_immutable_canonical_plan(self):
         plan = self.build()
@@ -1727,6 +1766,61 @@ class ExperimentPlanTests(unittest.TestCase):
             for child in self.pilot_plans
         )
         self.assertPlanInvalid(pilot_invocation_plans=cross_task)
+
+    def test_builder_rejects_snapshot_receipt_digest_string_subclass(self):
+        forged_children = list(self.pilot_plans)
+        forged_children[0] = replace(
+            forged_children[0],
+            snapshot_receipt_digest=_StringSubclass(
+                forged_children[0].snapshot_receipt_digest
+            ),
+        )
+
+        self.assertPlanInvalid(
+            pilot_invocation_plans=tuple(forged_children)
+        )
+
+    def test_builder_rejects_string_subclasses_across_plan_digest_fields(self):
+        forged_template = replace(
+            self.templates[0],
+            base_profile_digest=_StringSubclass(
+                self.templates[0].base_profile_digest
+            ),
+        )
+        forged_pilot = replace(
+            self.pilot_plans[0],
+            codex_home_identity_digest=_StringSubclass(
+                self.pilot_plans[0].codex_home_identity_digest
+            ),
+        )
+        cases = (
+            {
+                "bundle_digest": _StringSubclass(
+                    self.bundle_digest
+                )
+            },
+            {
+                "task_source_trust_receipt_digests": (
+                    _StringSubclass(self.source_receipts[0]),
+                    self.source_receipts[1],
+                )
+            },
+            {
+                "canary_templates": (
+                    forged_template,
+                    self.templates[1],
+                )
+            },
+            {
+                "pilot_invocation_plans": (
+                    forged_pilot,
+                )
+                + self.pilot_plans[1:]
+            },
+        )
+        for overrides in cases:
+            with self.subTest(field=next(iter(overrides))):
+                self.assertPlanInvalid(**overrides)
 
     def test_explicit_capability_sets_may_be_empty_or_partial(self):
         restrictive = replace(

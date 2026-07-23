@@ -222,6 +222,8 @@ For a completed `pilot_terminal`:
 - `machine_assertion_result` is `pass` or `fail`;
 - diff and inventory values are digests; and
 - assertion ID and basis are jointly null or jointly non-null.
+- A non-null assertion ID and basis additionally require `condition=lean`
+  and `machine_assertion_result=fail`.
 
 For a non-completed `pilot_terminal`, `telemetry_summary`,
 `telemetry_summary_digest`, `wall_time_milliseconds`,
