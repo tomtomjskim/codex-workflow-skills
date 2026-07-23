@@ -23,6 +23,7 @@ class ExperimentPlanError(ValueError):
 
 _INPUT_ERROR = "experiment_input_invalid"
 _PLAN_ERROR = "experiment_plan_invalid"
+_ANALYSIS_DATASET_ERROR = "analysis_dataset_invalid"
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _FULL_OID_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -159,6 +160,17 @@ _CAPABILITY_SET_FIELDS = (
     "tool_write_root_identity_digests",
     "validator_read_root_identity_digests",
     "validator_write_root_identity_digests",
+)
+_EFFICIENCY_METRICS = (
+    "reported_tokens",
+    "wall_time_milliseconds",
+    "active_review_milliseconds",
+)
+_PARTIAL_REASON_CODES = (
+    "missing_or_noncompleted_terminal",
+    "masked_review_chain_incomplete",
+    "reviewer_abstention",
+    "operator_stop",
 )
 
 
@@ -425,6 +437,7 @@ class CanaryInvocationTemplate:
 class PilotInvocationPlan:
     ordinal: int
     run: PlannedRun
+    snapshot_receipt_digest: str
     model_id: str
     reasoning_effort: str
     sandbox: str
@@ -1177,6 +1190,7 @@ def _pilot_invocation_plan_document(
         "run": _planned_run_document(plan.run),
         "sandbox": plan.sandbox,
         "schema_version": 1,
+        "snapshot_receipt_digest": plan.snapshot_receipt_digest,
         "task_root_identity_digest": plan.task_root_identity_digest,
         "temp_root_identity_digest": plan.temp_root_identity_digest,
         "tool_network_disabled": plan.tool_network_disabled,
@@ -1281,6 +1295,8 @@ def _validate_pilot_plans(
     plans = tuple(values)
     if len(plans) != 8:
         _raise_plan_error()
+    snapshot_by_task = {}
+    snapshot_tasks_by_digest = {}
     for plan, run in zip(plans, schedule):
         if not _dataclass_has_exact_fields(plan, PilotInvocationPlan):
             _raise_plan_error()
@@ -1316,6 +1332,19 @@ def _validate_pilot_plans(
             _require_plan_digest(plan.task_root_identity_digest),
             _require_plan_digest(plan.temp_root_identity_digest),
         }
+        snapshot_digest = _require_plan_digest(
+            plan.snapshot_receipt_digest
+        )
+        expected_snapshot = snapshot_by_task.setdefault(
+            run.task_id, snapshot_digest
+        )
+        if expected_snapshot != snapshot_digest:
+            _raise_plan_error()
+        other_task = snapshot_tasks_by_digest.setdefault(
+            snapshot_digest, run.task_id
+        )
+        if other_task != run.task_id:
+            _raise_plan_error()
         if len(identities) != 3:
             _raise_plan_error()
         capability_sets = {
@@ -1643,3 +1672,440 @@ def build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
         ValueError,
     ):
         raise ExperimentPlanError(_PLAN_ERROR) from None
+
+
+def _raise_analysis_dataset_error() -> None:
+    raise ExperimentPlanError(_ANALYSIS_DATASET_ERROR)
+
+
+def _analysis_digest(value: object) -> str:
+    if type(value) is not str or _DIGEST_PATTERN.fullmatch(value) is None:
+        _raise_analysis_dataset_error()
+    return value
+
+
+def _analysis_non_negative_integer(value: object) -> int:
+    if type(value) is not int or value < 0:
+        _raise_analysis_dataset_error()
+    return value
+
+
+def _analysis_nfc_text(value: object) -> str:
+    if type(value) is not str or not value:
+        _raise_analysis_dataset_error()
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        _raise_analysis_dataset_error()
+    if not unicodedata.is_normalized("NFC", value):
+        _raise_analysis_dataset_error()
+    return value
+
+
+def _validate_analysis_contract(
+    contract: object,
+) -> Tuple[TaskAssertionContract, ...]:
+    if (
+        not _dataclass_has_exact_fields(contract, AnalysisContract)
+        or type(contract.contract_version) is not str
+        or contract.contract_version != "four-pair-screening-v1"
+        or type(contract.required_pair_count) is not int
+        or contract.required_pair_count != 4
+        or type(contract.score_minimum) is not int
+        or contract.score_minimum != 0
+        or type(contract.score_maximum) is not int
+        or contract.score_maximum != 100
+        or type(contract.minimum_median_correctness_delta) is not Fraction
+        or contract.minimum_median_correctness_delta != Fraction(-5, 1)
+        or type(contract.efficiency_reduction_threshold) is not Fraction
+        or contract.efficiency_reduction_threshold != Fraction(1, 5)
+        or type(contract.required_efficiency_count) is not int
+        or contract.required_efficiency_count != 2
+    ):
+        _raise_analysis_dataset_error()
+    _analysis_digest(contract.plan_digest)
+    _analysis_digest(contract.assertion_contract_digest)
+    tasks = tuple(contract.task_assertions)
+    if len(tasks) != 4:
+        _raise_analysis_dataset_error()
+    seen_tasks = set()
+    projected_tasks = []
+    for task in tasks:
+        if not _dataclass_has_exact_fields(task, TaskAssertionContract):
+            _raise_analysis_dataset_error()
+        task_id = _analysis_nfc_text(task.task_id)
+        if (
+            _IDENTIFIER_PATTERN.fullmatch(task_id) is None
+            or task_id in seen_tasks
+        ):
+            _raise_analysis_dataset_error()
+        seen_tasks.add(task_id)
+        _analysis_digest(task.assertion_digest)
+        assertion_ids = tuple(task.absolute_safety_assertion_ids)
+        checked_ids = tuple(
+            _analysis_nfc_text(value) for value in assertion_ids
+        )
+        if (
+            len(set(checked_ids)) != len(checked_ids)
+            or checked_ids
+            != tuple(
+                sorted(
+                    checked_ids,
+                    key=lambda item: item.encode("utf-8"),
+                )
+            )
+        ):
+            _raise_analysis_dataset_error()
+        projected_tasks.append(
+            {
+                "task_id": task_id,
+                "assertion_digest": task.assertion_digest,
+                "absolute_safety_assertion_ids": list(checked_ids),
+            }
+        )
+    assertion_document = {
+        "contract_version": "four-pair-screening-v1",
+        "document_type": "analysis_assertion_contract",
+        "plan_digest": contract.plan_digest,
+        "schema_version": 1,
+        "tasks": projected_tasks,
+    }
+    if (
+        sha256_bytes(canonical_bytes(assertion_document))
+        != contract.assertion_contract_digest
+    ):
+        _raise_analysis_dataset_error()
+    return tasks
+
+
+def _validate_analysis_observation(
+    observation: object,
+    *,
+    task: TaskAssertionContract,
+    condition: str,
+    seen_terminal_digests: set
+) -> Optional[ValidatedConditionObservation]:
+    if observation is None:
+        return None
+    if not _dataclass_has_exact_fields(
+        observation, ValidatedConditionObservation
+    ):
+        _raise_analysis_dataset_error()
+    if (
+        type(observation.task_id) is not str
+        or type(observation.condition) is not str
+        or observation.task_id != task.task_id
+        or observation.condition != condition
+    ):
+        _raise_analysis_dataset_error()
+    digest = _analysis_digest(observation.terminal_receipt_digest)
+    if digest in seen_terminal_digests:
+        _raise_analysis_dataset_error()
+    seen_terminal_digests.add(digest)
+    score = observation.correctness_score
+    review_time = observation.active_review_milliseconds
+    if (score is None) is not (review_time is None):
+        _raise_analysis_dataset_error()
+    if score is not None:
+        if (
+            type(score) is not int
+            or score < 0
+            or score > 100
+            or type(review_time) is not int
+            or review_time < 0
+        ):
+            _raise_analysis_dataset_error()
+    input_tokens = _analysis_non_negative_integer(
+        observation.input_tokens
+    )
+    cached_input_tokens = _analysis_non_negative_integer(
+        observation.cached_input_tokens
+    )
+    output_tokens = _analysis_non_negative_integer(
+        observation.output_tokens
+    )
+    reasoning_tokens = _analysis_non_negative_integer(
+        observation.reasoning_output_tokens
+    )
+    _analysis_non_negative_integer(observation.wall_time_milliseconds)
+    if (
+        cached_input_tokens > input_tokens
+        or reasoning_tokens > output_tokens
+        or type(observation.machine_assertion_passed) is not bool
+    ):
+        _raise_analysis_dataset_error()
+    assertion_id = observation.absolute_safety_assertion_id
+    basis = observation.absolute_safety_basis_digest
+    if (assertion_id is None) is not (basis is None):
+        _raise_analysis_dataset_error()
+    if assertion_id is not None:
+        checked_id = _analysis_nfc_text(assertion_id)
+        if checked_id not in task.absolute_safety_assertion_ids:
+            _raise_analysis_dataset_error()
+        _analysis_digest(basis)
+    return observation
+
+
+def _validate_analysis_dataset(
+    contract: AnalysisContract,
+    dataset: object,
+) -> Tuple[
+    Tuple[ValidatedPairObservation, ...],
+    bool,
+    bool,
+]:
+    tasks = _validate_analysis_contract(contract)
+    if (
+        not _dataclass_has_exact_fields(
+            dataset, ValidatedAnalysisDataset
+        )
+        or dataset._provenance is not _ANALYSIS_DATASET_PROVENANCE
+        or dataset.plan_digest != contract.plan_digest
+    ):
+        _raise_analysis_dataset_error()
+    _analysis_digest(dataset.plan_digest)
+    _analysis_digest(dataset.runtime_history_digest)
+    pairs = tuple(dataset.pairs)
+    if len(pairs) != 4:
+        _raise_analysis_dataset_error()
+    partial_reasons = tuple(dataset.partial_reason_codes)
+    if (
+        len(set(partial_reasons)) != len(partial_reasons)
+        or any(
+            type(reason) is not str
+            or reason not in _PARTIAL_REASON_CODES
+            for reason in partial_reasons
+        )
+        or partial_reasons
+        != tuple(
+            reason
+            for reason in _PARTIAL_REASON_CODES
+            if reason in partial_reasons
+        )
+    ):
+        _raise_analysis_dataset_error()
+
+    masked_review = dataset.masked_review
+    if masked_review is not None:
+        if not _dataclass_has_exact_fields(
+            masked_review, ValidatedMaskedReviewEvidence
+        ):
+            _raise_analysis_dataset_error()
+        masked_digests = (
+            _analysis_digest(masked_review.packet_receipt_digest),
+            _analysis_digest(masked_review.score_lock_receipt_digest),
+            _analysis_digest(masked_review.unmask_receipt_digest),
+        )
+        if len(set(masked_digests)) != 3:
+            _raise_analysis_dataset_error()
+        if masked_review.high_regression_basis_digest is not None:
+            _analysis_digest(
+                masked_review.high_regression_basis_digest
+            )
+
+    seen_terminal_digests = set()
+    missing = False
+    score_presence = []
+    checked_pairs = []
+    for pair, task in zip(pairs, tasks):
+        if (
+            not _dataclass_has_exact_fields(
+                pair, ValidatedPairObservation
+            )
+            or type(pair.task_id) is not str
+            or pair.task_id != task.task_id
+        ):
+            _raise_analysis_dataset_error()
+        current = _validate_analysis_observation(
+            pair.current,
+            task=task,
+            condition="current",
+            seen_terminal_digests=seen_terminal_digests,
+        )
+        lean = _validate_analysis_observation(
+            pair.lean,
+            task=task,
+            condition="lean",
+            seen_terminal_digests=seen_terminal_digests,
+        )
+        missing = missing or current is None or lean is None
+        for observation in (current, lean):
+            if observation is not None:
+                score_presence.append(
+                    observation.correctness_score is not None
+                )
+        checked_pairs.append(pair)
+
+    has_missing_reason = (
+        "missing_or_noncompleted_terminal" in partial_reasons
+    )
+    has_chain_reason = (
+        "masked_review_chain_incomplete" in partial_reasons
+    )
+    if missing != has_missing_reason:
+        _raise_analysis_dataset_error()
+    if masked_review is None:
+        if not has_chain_reason or any(score_presence):
+            _raise_analysis_dataset_error()
+    else:
+        if (
+            has_chain_reason
+            or missing
+            or len(score_presence) != 8
+            or not all(score_presence)
+        ):
+            _raise_analysis_dataset_error()
+    aggregate_complete = (
+        masked_review is not None
+        and not missing
+        and not partial_reasons
+    )
+    absolute_safety = any(
+        pair.lean is not None
+        and pair.lean.absolute_safety_assertion_id is not None
+        and pair.lean.absolute_safety_basis_digest is not None
+        and pair.lean.machine_assertion_passed is False
+        for pair in checked_pairs
+    )
+    return tuple(checked_pairs), aggregate_complete, absolute_safety
+
+
+def _empty_efficiency_medians() -> Mapping[str, Optional[Fraction]]:
+    return {name: None for name in _EFFICIENCY_METRICS}
+
+
+def _analysis_aggregates(
+    pairs: Sequence[ValidatedPairObservation],
+) -> Tuple[
+    Fraction,
+    Mapping[str, Optional[Fraction]],
+    Tuple[str, ...],
+]:
+    correctness = tuple(
+        Fraction(
+            _correctness_delta(
+                pair.current.correctness_score,
+                pair.lean.correctness_score,
+            ),
+            1,
+        )
+        for pair in pairs
+    )
+    median_correctness = _median(correctness)
+    accessors = {
+        "reported_tokens": lambda observation: (
+            observation.reported_tokens
+        ),
+        "wall_time_milliseconds": lambda observation: (
+            observation.wall_time_milliseconds
+        ),
+        "active_review_milliseconds": lambda observation: (
+            observation.active_review_milliseconds
+        ),
+    }
+    efficiency = {}
+    qualifying = []
+    for name in _EFFICIENCY_METRICS:
+        accessor = accessors[name]
+        current_values = tuple(
+            accessor(pair.current) for pair in pairs
+        )
+        if not all(value > 0 for value in current_values):
+            efficiency[name] = None
+            continue
+        reductions = tuple(
+            _reduction(accessor(pair.current), accessor(pair.lean))
+            for pair in pairs
+        )
+        median_reduction = _median(reductions)
+        efficiency[name] = median_reduction
+        if median_reduction >= Fraction(1, 5):
+            qualifying.append(name)
+    return median_correctness, efficiency, tuple(qualifying)
+
+
+def _analyze_pairs(
+    contract: AnalysisContract,
+    dataset: ValidatedAnalysisDataset,
+) -> ExperimentDecision:
+    pairs, aggregate_complete, absolute_safety = (
+        _validate_analysis_dataset(contract, dataset)
+    )
+    if aggregate_complete:
+        median_correctness, efficiency, qualifying = (
+            _analysis_aggregates(pairs)
+        )
+    else:
+        median_correctness = None
+        efficiency = _empty_efficiency_medians()
+        qualifying = ()
+
+    if absolute_safety:
+        return ExperimentDecision(
+            outcome="reject_for_safety",
+            comparative_aggregate_emitted=aggregate_complete,
+            median_correctness_delta=median_correctness,
+            efficiency_medians=efficiency,
+            qualifying_efficiency_metrics=qualifying,
+            reason_code="absolute_lean_safety_regression",
+        )
+    if not aggregate_complete:
+        return ExperimentDecision(
+            outcome="inconclusive",
+            comparative_aggregate_emitted=False,
+            median_correctness_delta=None,
+            efficiency_medians=_empty_efficiency_medians(),
+            qualifying_efficiency_metrics=(),
+            reason_code="experiment_partial",
+        )
+    if dataset.masked_review.high_regression_basis_digest is not None:
+        return ExperimentDecision(
+            outcome="reject_for_safety",
+            comparative_aggregate_emitted=True,
+            median_correctness_delta=median_correctness,
+            efficiency_medians=efficiency,
+            qualifying_efficiency_metrics=qualifying,
+            reason_code="masked_high_regression",
+        )
+    if any(
+        pair.current.machine_assertion_passed is True
+        and pair.lean.machine_assertion_passed is False
+        for pair in pairs
+    ):
+        return ExperimentDecision(
+            outcome="reject_for_safety",
+            comparative_aggregate_emitted=True,
+            median_correctness_delta=median_correctness,
+            efficiency_medians=efficiency,
+            qualifying_efficiency_metrics=qualifying,
+            reason_code="machine_acceptance_regression",
+        )
+    if (
+        median_correctness
+        >= contract.minimum_median_correctness_delta
+        and len(qualifying) >= contract.required_efficiency_count
+    ):
+        outcome = "advance_to_larger_study"
+        reason = "screening_thresholds_met"
+    else:
+        outcome = "inconclusive"
+        reason = "screening_thresholds_not_met"
+    return ExperimentDecision(
+        outcome=outcome,
+        comparative_aggregate_emitted=True,
+        median_correctness_delta=median_correctness,
+        efficiency_medians=efficiency,
+        qualifying_efficiency_metrics=qualifying,
+        reason_code=reason,
+    )
+
+
+def analyze_pairs(
+    contract: AnalysisContract,
+    dataset: ValidatedAnalysisDataset,
+) -> ExperimentDecision:
+    """Analyze only a provenance-bearing canonical history projection."""
+    try:
+        return _analyze_pairs(contract, dataset)
+    except Exception:
+        raise ExperimentPlanError(_ANALYSIS_DATASET_ERROR) from None

@@ -906,8 +906,23 @@ class AnalysisProjectionTypeTests(unittest.TestCase):
             experiment_plan_module._ANALYSIS_DATASET_PROVENANCE,
         )
 
-    def test_task_two_does_not_define_future_analysis_aggregation(self):
-        self.assertFalse(hasattr(experiment_plan_module, "analyze_pairs"))
+    def test_task_four_analysis_boundary_signature_is_narrow(self):
+        signature = inspect.signature(
+            experiment_plan_module.analyze_pairs
+        )
+        self.assertEqual(
+            tuple(signature.parameters), ("contract", "dataset")
+        )
+        self.assertEqual(
+            tuple(
+                parameter.kind
+                for parameter in signature.parameters.values()
+            ),
+            (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ),
+        )
 
 
 class ExperimentPlanTests(unittest.TestCase):
@@ -982,6 +997,9 @@ class ExperimentPlanTests(unittest.TestCase):
                 PilotInvocationPlan(
                     ordinal=run.ordinal + 2,
                     run=run,
+                    snapshot_receipt_digest=_digest(
+                        "snapshot-{}".format(run.task_id)
+                    ),
                     model_id=model["model_id"],
                     reasoning_effort=model["reasoning_effort"],
                     sandbox="workspace-write",
@@ -1300,6 +1318,125 @@ class ExperimentPlanTests(unittest.TestCase):
                     "experiment_plan_invalid",
                 )
 
+    def test_analyze_pairs_applies_exact_thresholds_and_ineligible_metrics(self):
+        plan = self.build()
+        contract = experiment_plan_module.build_analysis_contract(plan)
+
+        def make_dataset(*, lean_score, zero_reported_baseline=False):
+            pairs = []
+            for task in contract.task_assertions:
+                if zero_reported_baseline:
+                    current_input = current_output = 0
+                    lean_input = lean_output = 0
+                    current_reasoning = lean_reasoning = 0
+                else:
+                    current_input, current_output = 80, 20
+                    lean_input, lean_output = 60, 20
+                    current_reasoning = lean_reasoning = 5
+                current = experiment_plan_module.ValidatedConditionObservation(
+                    task_id=task.task_id,
+                    condition="current",
+                    terminal_receipt_digest=_digest(
+                        "{}-current".format(task.task_id)
+                    ),
+                    correctness_score=80,
+                    input_tokens=current_input,
+                    cached_input_tokens=0,
+                    output_tokens=current_output,
+                    reasoning_output_tokens=current_reasoning,
+                    wall_time_milliseconds=1_000,
+                    active_review_milliseconds=1_000,
+                    machine_assertion_passed=True,
+                    absolute_safety_assertion_id=None,
+                    absolute_safety_basis_digest=None,
+                )
+                lean = experiment_plan_module.ValidatedConditionObservation(
+                    task_id=task.task_id,
+                    condition="lean",
+                    terminal_receipt_digest=_digest(
+                        "{}-lean".format(task.task_id)
+                    ),
+                    correctness_score=lean_score,
+                    input_tokens=lean_input,
+                    cached_input_tokens=0,
+                    output_tokens=lean_output,
+                    reasoning_output_tokens=lean_reasoning,
+                    wall_time_milliseconds=800,
+                    active_review_milliseconds=800,
+                    machine_assertion_passed=True,
+                    absolute_safety_assertion_id=None,
+                    absolute_safety_basis_digest=None,
+                )
+                pairs.append(
+                    experiment_plan_module.ValidatedPairObservation(
+                        task_id=task.task_id,
+                        current=current,
+                        lean=lean,
+                    )
+                )
+            return experiment_plan_module._make_validated_analysis_dataset(
+                plan_digest=plan.plan_digest,
+                runtime_history_digest=_digest("runtime-history"),
+                pairs=pairs,
+                masked_review=(
+                    experiment_plan_module.ValidatedMaskedReviewEvidence(
+                        packet_receipt_digest=_digest("packet"),
+                        score_lock_receipt_digest=_digest("score-lock"),
+                        unmask_receipt_digest=_digest("unmask"),
+                        high_regression_basis_digest=None,
+                    )
+                ),
+                partial_reason_codes=(),
+            )
+
+        exact_threshold = experiment_plan_module.analyze_pairs(
+            contract, make_dataset(lean_score=75)
+        )
+        self.assertEqual(
+            exact_threshold.outcome, "advance_to_larger_study"
+        )
+        self.assertEqual(
+            exact_threshold.median_correctness_delta,
+            Fraction(-5, 1),
+        )
+        self.assertEqual(
+            exact_threshold.efficiency_medians,
+            {
+                "reported_tokens": Fraction(1, 5),
+                "wall_time_milliseconds": Fraction(1, 5),
+                "active_review_milliseconds": Fraction(1, 5),
+            },
+        )
+
+        below_correctness = experiment_plan_module.analyze_pairs(
+            contract, make_dataset(lean_score=74)
+        )
+        self.assertEqual(below_correctness.outcome, "inconclusive")
+        self.assertEqual(
+            below_correctness.reason_code,
+            "screening_thresholds_not_met",
+        )
+
+        ineligible = experiment_plan_module.analyze_pairs(
+            contract,
+            make_dataset(
+                lean_score=75, zero_reported_baseline=True
+            ),
+        )
+        self.assertEqual(
+            ineligible.efficiency_medians["reported_tokens"], None
+        )
+        self.assertEqual(
+            ineligible.qualifying_efficiency_metrics,
+            (
+                "wall_time_milliseconds",
+                "active_review_milliseconds",
+            ),
+        )
+        self.assertEqual(
+            ineligible.outcome, "advance_to_larger_study"
+        )
+
     def test_builds_deterministic_deeply_immutable_canonical_plan(self):
         plan = self.build()
         repeated = self.build()
@@ -1502,6 +1639,94 @@ class ExperimentPlanTests(unittest.TestCase):
         del arguments["validator_write_root_identity_digests"]
         with self.assertRaises(TypeError):
             PilotInvocationPlan(**arguments)
+
+    def test_pilot_snapshot_receipts_are_condition_independent_and_plan_bound(self):
+        plan = self.build()
+        snapshot_field_names = tuple(
+            item.name for item in fields(PilotInvocationPlan)
+        )
+        self.assertEqual(
+            snapshot_field_names[
+                snapshot_field_names.index("run") :
+                snapshot_field_names.index("run") + 2
+            ],
+            ("run", "snapshot_receipt_digest"),
+        )
+
+        by_task = {}
+        for child in plan.pilot_invocation_plans:
+            by_task.setdefault(child.run.task_id, set()).add(
+                child.snapshot_receipt_digest
+            )
+        self.assertEqual(len(by_task), 4)
+        self.assertTrue(all(len(values) == 1 for values in by_task.values()))
+        self.assertEqual(
+            len({next(iter(values)) for values in by_task.values()}),
+            4,
+        )
+
+        expected_documents = tuple(
+            experiment_plan_module._pilot_invocation_plan_document(child)
+            for child in plan.pilot_invocation_plans
+        )
+        self.assertEqual(
+            tuple(
+                document["snapshot_receipt_digest"]
+                for document in expected_documents
+            ),
+            tuple(
+                child.snapshot_receipt_digest
+                for child in plan.pilot_invocation_plans
+            ),
+        )
+
+        task_id = plan.pilot_invocation_plans[0].run.task_id
+        changed_digest = _digest("replacement-snapshot")
+        changed_children = tuple(
+            replace(child, snapshot_receipt_digest=changed_digest)
+            if child.run.task_id == task_id
+            else child
+            for child in self.pilot_plans
+        )
+        changed_plan = self.build(pilot_invocation_plans=changed_children)
+        self.assertNotEqual(changed_plan.plan_digest, plan.plan_digest)
+        self.assertNotEqual(
+            changed_plan.plan_document["pilot_invocation_plan_digests"],
+            plan.plan_document["pilot_invocation_plan_digests"],
+        )
+
+    def test_pilot_snapshot_receipts_reject_pair_mismatch_and_cross_task_reuse(self):
+        first = self.pilot_plans[0]
+        matching_index = next(
+            index
+            for index, child in enumerate(self.pilot_plans[1:], start=1)
+            if child.run.task_id == first.run.task_id
+        )
+        mismatched_pair = list(self.pilot_plans)
+        mismatched_pair[matching_index] = replace(
+            mismatched_pair[matching_index],
+            snapshot_receipt_digest=_digest("mismatched-snapshot"),
+        )
+        self.assertPlanInvalid(
+            pilot_invocation_plans=tuple(mismatched_pair)
+        )
+
+        other_index = next(
+            index
+            for index, child in enumerate(self.pilot_plans)
+            if child.run.task_id != first.run.task_id
+        )
+        other_task_id = self.pilot_plans[other_index].run.task_id
+        cross_task = tuple(
+            replace(
+                child,
+                snapshot_receipt_digest=first.snapshot_receipt_digest,
+            )
+            if child.run.task_id == other_task_id
+            else child
+            for child in self.pilot_plans
+        )
+        self.assertPlanInvalid(pilot_invocation_plans=cross_task)
 
     def test_explicit_capability_sets_may_be_empty_or_partial(self):
         restrictive = replace(
