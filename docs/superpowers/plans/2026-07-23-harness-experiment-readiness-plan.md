@@ -715,14 +715,120 @@ class ExperimentDecision:
         )
 ```
 
-`experiment_plan.py` owns `_ANALYSIS_DATASET_PROVENANCE` and the module-private
-`_make_validated_analysis_dataset(...)` factory. The factory supplies the
-identity token above after coercing tuples. `analyze_pairs()` requires identity
-with that token. Task 4's `experiment_receipts.project_analysis_dataset()` is
-the only supported public producer and calls this plan-owned private factory
-after canonical replay. This is a misuse barrier, not a security boundary.
+- [ ] Add the exact plan-derived analysis contract API:
 
-The fixed `AnalysisContract` uses a 0-to-100 integer score, minimum median correctness delta `Fraction(-5, 1)`, efficiency threshold `Fraction(1, 5)`, and required efficiency count `2`. It also carries the plan digest, plan-bound assertion digest, and registered absolute-safety assertion IDs for each task.
+```python
+@dataclass(frozen=True)
+class TaskAssertionContract:
+    task_id: str
+    assertion_digest: str
+    absolute_safety_assertion_ids: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "absolute_safety_assertion_ids",
+            tuple(self.absolute_safety_assertion_ids),
+        )
+
+
+@dataclass(frozen=True)
+class AnalysisContract:
+    contract_version: str
+    plan_digest: str
+    assertion_contract_digest: str
+    task_assertions: Tuple[TaskAssertionContract, ...]
+    required_pair_count: int
+    score_minimum: int
+    score_maximum: int
+    minimum_median_correctness_delta: Fraction
+    efficiency_reduction_threshold: Fraction
+    required_efficiency_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_assertions", tuple(self.task_assertions))
+
+
+def build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
+    ...
+```
+
+`build_analysis_contract()` accepts no override arguments. It requires exact
+`ExperimentPlan` type, verifies canonical plan bytes and digest, verifies the
+eight-run/four-adjacent-pair schedule, and uses each pair's first occurrence as
+task order. That order must exactly cover the four candidate tasks. It projects
+each candidate's `task_id`, `assertion_digest`, and sorted
+`absolute_safety_assertion_ids` into `TaskAssertionContract`.
+Before deriving that order, it projects the public `pilot_schedule` through
+the same `_planned_run_document()` representation and requires exact equality
+with `plan.plan_document["pilot_schedule"]`. A public schedule paired with
+different embedded canonical bytes is invalid even when both are independently
+well formed.
+
+The assertion contract digest is SHA-256 over this canonical document:
+
+```python
+{
+    "contract_version": "four-pair-screening-v1",
+    "document_type": "analysis_assertion_contract",
+    "plan_digest": plan.plan_digest,
+    "schema_version": 1,
+    "tasks": [
+        {
+            "task_id": item.task_id,
+            "assertion_digest": item.assertion_digest,
+            "absolute_safety_assertion_ids": list(
+                item.absolute_safety_assertion_ids
+            ),
+        }
+        for item in task_assertions
+    ],
+}
+```
+
+The returned fixed values are `contract_version=four-pair-screening-v1`,
+`required_pair_count=4`, `score_minimum=0`, `score_maximum=100`,
+`minimum_median_correctness_delta=Fraction(-5, 1)`,
+`efficiency_reduction_threshold=Fraction(1, 5)`, and
+`required_efficiency_count=2`. A malformed plan, schedule/candidate mismatch,
+or canonical/digest mismatch raises
+`ExperimentPlanError("experiment_plan_invalid")`.
+
+- [ ] Add the exact module-private dataset factory:
+
+```python
+_ANALYSIS_DATASET_PROVENANCE = object()
+
+
+def _make_validated_analysis_dataset(
+    *,
+    plan_digest: str,
+    runtime_history_digest: str,
+    pairs: Sequence[ValidatedPairObservation],
+    masked_review: Optional[ValidatedMaskedReviewEvidence],
+    partial_reason_codes: Sequence[str],
+) -> ValidatedAnalysisDataset:
+    return ValidatedAnalysisDataset(
+        plan_digest=plan_digest,
+        runtime_history_digest=runtime_history_digest,
+        pairs=tuple(pairs),
+        masked_review=masked_review,
+        partial_reason_codes=tuple(partial_reason_codes),
+        _provenance=_ANALYSIS_DATASET_PROVENANCE,
+    )
+```
+
+The factory exposes no provenance argument and performs tuple detachment plus
+token injection only. It does not establish receipt authenticity or trust any
+score, usage, duration, machine result, assertion, or validity value. Task 4's
+`experiment_receipts.project_analysis_dataset()` is the only supported public
+producer and calls this factory only after canonical replay. The provenance
+identity is a misuse barrier, not a security boundary.
+
+`analyze_pairs()` is entirely absent in Task 2—no stub or placeholder is
+added. Task 4 implements it only after receipt projection exists, and then
+requires the provenance identity plus full contract/plan/dataset
+cross-validation.
 
 For each completed-terminal observation, `correctness_score` and
 `active_review_milliseconds` are jointly null only on a replayed stop branch
