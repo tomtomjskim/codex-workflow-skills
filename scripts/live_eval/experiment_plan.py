@@ -946,7 +946,7 @@ def build_pilot_schedule(
 
 
 def _dataclass_has_exact_fields(value: object, expected_type: type) -> bool:
-    if not isinstance(value, expected_type):
+    if type(value) is not expected_type:
         return False
     return set(vars(value)) == {item.name for item in fields(expected_type)}
 

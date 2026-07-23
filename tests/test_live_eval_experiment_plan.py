@@ -257,6 +257,14 @@ def _frozen_document(value):
     return canonical_bytes(thaw_json_value(value))
 
 
+class _MutableCanaryTemplate(CanaryInvocationTemplate):
+    __slots__ = ("mutable_state",)
+
+
+class _MutablePilotInvocationPlan(PilotInvocationPlan):
+    __slots__ = ("mutable_state",)
+
+
 class CanonicalExperimentInputTests(unittest.TestCase):
     def assertInvalidValue(self, value):
         with self.assertRaises(ExperimentPlanError) as raised:
@@ -927,6 +935,35 @@ class ExperimentPlanTests(unittest.TestCase):
                 arguments[forbidden] = "forbidden"
                 with self.assertRaises(TypeError):
                     CanaryInvocationTemplate(**arguments)
+
+    def test_builder_rejects_child_subclasses_with_digest_excluded_mutable_slots(self):
+        canary = _MutableCanaryTemplate(
+            **{
+                item.name: getattr(self.templates[0], item.name)
+                for item in fields(CanaryInvocationTemplate)
+            }
+        )
+        object.__setattr__(canary, "mutable_state", [])
+        pilot = _MutablePilotInvocationPlan(
+            **{
+                item.name: getattr(self.pilot_plans[0], item.name)
+                for item in fields(PilotInvocationPlan)
+            }
+        )
+        object.__setattr__(pilot, "mutable_state", [])
+        self.assertEqual(vars(canary), vars(self.templates[0]))
+        self.assertEqual(vars(pilot), vars(self.pilot_plans[0]))
+        self.assertNotIn("mutable_state", vars(canary))
+        self.assertNotIn("mutable_state", vars(pilot))
+
+        with self.subTest(child_type="canary"):
+            self.assertPlanInvalid(
+                canary_templates=(canary, self.templates[1])
+            )
+        with self.subTest(child_type="pilot"):
+            self.assertPlanInvalid(
+                pilot_invocation_plans=(pilot,) + self.pilot_plans[1:]
+            )
 
     def test_builder_rejects_wrong_canary_ordinals_profiles_policies_and_sandbox(self):
         invalid_templates = (
