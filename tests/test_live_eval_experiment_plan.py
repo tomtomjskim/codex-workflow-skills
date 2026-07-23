@@ -1,5 +1,6 @@
 import copy
-from dataclasses import asdict, fields, replace
+from dataclasses import FrozenInstanceError, asdict, fields, replace
+from fractions import Fraction
 import hashlib
 import inspect
 import json
@@ -210,6 +211,10 @@ def _fixture_value():
     return json.loads(VALID_INPUT.read_text(encoding="utf-8"))
 
 
+def _analysis_boundaries_value():
+    return json.loads(ANALYSIS_BOUNDARIES.read_text(encoding="utf-8"))
+
+
 def _at(value, path):
     current = value
     for part in path:
@@ -262,6 +267,10 @@ class _MutableCanaryTemplate(CanaryInvocationTemplate):
 
 
 class _MutablePilotInvocationPlan(PilotInvocationPlan):
+    __slots__ = ("mutable_state",)
+
+
+class _MutableExperimentPlan(experiment_plan_module.ExperimentPlan):
     __slots__ = ("mutable_state",)
 
 
@@ -474,7 +483,7 @@ class CanonicalExperimentInputTests(unittest.TestCase):
                 "mutant_digest": _digest("mutant-" + category),
                 "result": "fail",
             }
-            for category in boundaries["formatting_only_categories"]
+            for category in ("formatting", "parsing", "syntax_only")
         ]
         self.assertInvalidValue(formatting_only)
 
@@ -617,6 +626,290 @@ class PilotScheduleTests(unittest.TestCase):
         self.assertTrue(any(item != schedule for item in changed_schedules))
 
 
+class AnalysisPrimitiveTests(unittest.TestCase):
+    def setUp(self):
+        self.cases = _analysis_boundaries_value()
+
+    def test_correctness_delta_is_lean_minus_current(self):
+        for case in self.cases["correctness_delta_cases"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(
+                    experiment_plan_module._correctness_delta(
+                        case["current"], case["lean"]
+                    ),
+                    case["expected"],
+                )
+
+    def test_four_value_median_is_exact_mean_of_middle_values(self):
+        for case in self.cases["median_cases"]:
+            with self.subTest(case=case["name"]):
+                median = experiment_plan_module._median(
+                    tuple(Fraction(value, 1) for value in case["values"])
+                )
+                self.assertEqual(
+                    median, Fraction(*case["expected_fraction"])
+                )
+                self.assertIsInstance(median, Fraction)
+
+        for values in ((), (Fraction(1),) * 3, (Fraction(1),) * 5):
+            with self.subTest(length=len(values)):
+                with self.assertRaisesRegex(
+                    ExperimentPlanError,
+                    "^analysis_requires_four_pairs$",
+                ):
+                    experiment_plan_module._median(values)
+
+    def test_reduction_is_exact_and_rejects_nonpositive_current_baseline(self):
+        for case in self.cases["reduction_cases"]:
+            with self.subTest(case=case["name"]):
+                reduction = experiment_plan_module._reduction(
+                    case["current"], case["lean"]
+                )
+                self.assertEqual(
+                    reduction, Fraction(*case["expected_fraction"])
+                )
+                self.assertIsInstance(reduction, Fraction)
+
+        for baseline in self.cases["invalid_current_baselines"]:
+            with self.subTest(current=baseline):
+                with self.assertRaisesRegex(
+                    ExperimentPlanError,
+                    "^analysis_baseline_not_positive$",
+                ):
+                    experiment_plan_module._reduction(baseline, 0)
+
+    def test_exact_twenty_percent_and_adjacent_fractions_compare_correctly(self):
+        threshold = Fraction(1, 5)
+        for expected, cases in (
+            (False, self.cases["threshold_cases"]["below"]),
+            (True, self.cases["threshold_cases"]["passes"]),
+        ):
+            for case in cases:
+                with self.subTest(case=case["name"]):
+                    reduction = experiment_plan_module._reduction(
+                        case["current"], case["lean"]
+                    )
+                    self.assertEqual(
+                        reduction, Fraction(*case["expected_fraction"])
+                    )
+                    self.assertEqual(reduction >= threshold, expected)
+
+    def test_display_rounding_never_changes_scalar_threshold_result(self):
+        threshold = Fraction(1, 5)
+        for expected, cases in (
+            (False, self.cases["display_rounding_cases"]["below"]),
+            (True, self.cases["display_rounding_cases"]["passes"]),
+        ):
+            for case in cases:
+                with self.subTest(case=case["name"]):
+                    reduction = experiment_plan_module._reduction(
+                        case["current"], case["lean"]
+                    )
+                    self.assertEqual(
+                        reduction, Fraction(*case["expected_fraction"])
+                    )
+                    self.assertEqual(
+                        "{:.0%}".format(float(reduction)),
+                        "20%",
+                    )
+                    self.assertEqual(reduction >= threshold, expected)
+
+
+class AnalysisProjectionTypeTests(unittest.TestCase):
+    def make_observation(self):
+        return experiment_plan_module.ValidatedConditionObservation(
+            task_id="task-alpha",
+            condition="current",
+            terminal_receipt_digest=_digest("terminal-current"),
+            correctness_score=80,
+            input_tokens=100,
+            cached_input_tokens=40,
+            output_tokens=30,
+            reasoning_output_tokens=20,
+            wall_time_milliseconds=500,
+            active_review_milliseconds=200,
+            machine_assertion_passed=True,
+            absolute_safety_assertion_id=None,
+            absolute_safety_basis_digest=None,
+        )
+
+    def test_projected_analysis_types_have_exact_fixed_fields(self):
+        expected = {
+            "ValidatedConditionObservation": (
+                "task_id",
+                "condition",
+                "terminal_receipt_digest",
+                "correctness_score",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+                "reasoning_output_tokens",
+                "wall_time_milliseconds",
+                "active_review_milliseconds",
+                "machine_assertion_passed",
+                "absolute_safety_assertion_id",
+                "absolute_safety_basis_digest",
+            ),
+            "ValidatedPairObservation": ("task_id", "current", "lean"),
+            "ValidatedMaskedReviewEvidence": (
+                "packet_receipt_digest",
+                "score_lock_receipt_digest",
+                "unmask_receipt_digest",
+                "high_regression_basis_digest",
+            ),
+            "ValidatedAnalysisDataset": (
+                "plan_digest",
+                "runtime_history_digest",
+                "pairs",
+                "masked_review",
+                "partial_reason_codes",
+                "_provenance",
+            ),
+            "ExperimentDecision": (
+                "outcome",
+                "comparative_aggregate_emitted",
+                "median_correctness_delta",
+                "efficiency_medians",
+                "qualifying_efficiency_metrics",
+                "reason_code",
+            ),
+            "TaskAssertionContract": (
+                "task_id",
+                "assertion_digest",
+                "absolute_safety_assertion_ids",
+            ),
+            "AnalysisContract": (
+                "contract_version",
+                "plan_digest",
+                "assertion_contract_digest",
+                "task_assertions",
+                "required_pair_count",
+                "score_minimum",
+                "score_maximum",
+                "minimum_median_correctness_delta",
+                "efficiency_reduction_threshold",
+                "required_efficiency_count",
+            ),
+        }
+        for type_name, expected_fields in expected.items():
+            with self.subTest(type_name=type_name):
+                value_type = getattr(experiment_plan_module, type_name)
+                self.assertEqual(
+                    tuple(item.name for item in fields(value_type)),
+                    expected_fields,
+                )
+
+    def test_observation_is_frozen_and_reported_tokens_excludes_subsets(self):
+        observation = self.make_observation()
+
+        self.assertEqual(observation.reported_tokens, 130)
+        with self.assertRaises(FrozenInstanceError):
+            observation.task_id = "changed"
+
+    def test_dataset_and_decision_detach_mutable_input_containers(self):
+        observation = self.make_observation()
+        pair = experiment_plan_module.ValidatedPairObservation(
+            task_id=observation.task_id,
+            current=observation,
+            lean=None,
+        )
+        pairs = [pair]
+        partial_reason_codes = ["missing_lean"]
+        dataset = experiment_plan_module._make_validated_analysis_dataset(
+            plan_digest=_digest("plan"),
+            runtime_history_digest=_digest("runtime-history"),
+            pairs=pairs,
+            masked_review=None,
+            partial_reason_codes=partial_reason_codes,
+        )
+        efficiency_medians = {
+            "reported_tokens": Fraction(1, 5),
+            "wall_time": None,
+        }
+        qualifying_metrics = ["reported_tokens"]
+        decision = experiment_plan_module.ExperimentDecision(
+            outcome="inconclusive",
+            comparative_aggregate_emitted=True,
+            median_correctness_delta=Fraction(-5, 1),
+            efficiency_medians=efficiency_medians,
+            qualifying_efficiency_metrics=qualifying_metrics,
+            reason_code="threshold_not_met",
+        )
+
+        pairs.append(pair)
+        partial_reason_codes.append("changed")
+        efficiency_medians["reported_tokens"] = Fraction(1, 1)
+        qualifying_metrics.append("changed")
+
+        self.assertEqual(dataset.pairs, (pair,))
+        self.assertEqual(dataset.partial_reason_codes, ("missing_lean",))
+        self.assertIs(
+            dataset._provenance,
+            experiment_plan_module._ANALYSIS_DATASET_PROVENANCE,
+        )
+        self.assertNotIn("_provenance", repr(dataset))
+        self.assertEqual(
+            decision.efficiency_medians["reported_tokens"],
+            Fraction(1, 5),
+        )
+        self.assertEqual(
+            decision.qualifying_efficiency_metrics,
+            ("reported_tokens",),
+        )
+        with self.assertRaises(TypeError):
+            decision.efficiency_medians["wall_time"] = Fraction(1, 5)
+
+    def test_dataset_factory_signature_injects_token_without_claiming_validity(self):
+        signature = inspect.signature(
+            experiment_plan_module._make_validated_analysis_dataset
+        )
+        self.assertEqual(
+            tuple(signature.parameters),
+            (
+                "plan_digest",
+                "runtime_history_digest",
+                "pairs",
+                "masked_review",
+                "partial_reason_codes",
+            ),
+        )
+        self.assertTrue(
+            all(
+                parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                for parameter in signature.parameters.values()
+            )
+        )
+        self.assertNotIn("_provenance", signature.parameters)
+
+        dataset = experiment_plan_module._make_validated_analysis_dataset(
+            plan_digest="caller-supplied",
+            runtime_history_digest="caller-supplied",
+            pairs=[],
+            masked_review=None,
+            partial_reason_codes=[],
+        )
+        direct = experiment_plan_module.ValidatedAnalysisDataset(
+            plan_digest=dataset.plan_digest,
+            runtime_history_digest=dataset.runtime_history_digest,
+            pairs=dataset.pairs,
+            masked_review=dataset.masked_review,
+            partial_reason_codes=dataset.partial_reason_codes,
+            _provenance=object(),
+        )
+
+        self.assertIs(
+            dataset._provenance,
+            experiment_plan_module._ANALYSIS_DATASET_PROVENANCE,
+        )
+        self.assertIsNot(
+            direct._provenance,
+            experiment_plan_module._ANALYSIS_DATASET_PROVENANCE,
+        )
+
+    def test_task_two_does_not_define_future_analysis_aggregation(self):
+        self.assertFalse(hasattr(experiment_plan_module, "analyze_pairs"))
+
+
 class ExperimentPlanTests(unittest.TestCase):
     def setUp(self):
         self.experiment_input = load_experiment_input(VALID_INPUT.read_bytes())
@@ -733,6 +1026,26 @@ class ExperimentPlanTests(unittest.TestCase):
             self.build(**overrides)
         self.assertEqual(str(raised.exception), "experiment_plan_invalid")
 
+    def with_schedule(self, plan, schedule):
+        document = thaw_json_value(plan.plan_document)
+        document["pilot_schedule"] = [
+            {
+                "condition": run.condition,
+                "difficulty": run.difficulty,
+                "ordinal": run.ordinal,
+                "task_id": run.task_id,
+            }
+            for run in schedule
+        ]
+        encoded = canonical_bytes(document)
+        return replace(
+            plan,
+            plan_document=document,
+            canonical_bytes=encoded,
+            plan_digest=sha256_bytes(encoded),
+            pilot_schedule=schedule,
+        )
+
     def test_fixed_v1_documents_are_exact_immutable_and_digest_bound(self):
         documents = (
             (CANARY_OVERLAY_RECIPE, EXPECTED_CANARY_OVERLAY_RECIPE),
@@ -832,6 +1145,160 @@ class ExperimentPlanTests(unittest.TestCase):
                 signature.parameters[name].kind, inspect.Parameter.KEYWORD_ONLY
             )
         self.assertNotIn("Path", str(signature))
+
+    def test_build_analysis_contract_is_plan_derived_fixed_and_digest_bound(self):
+        plan = self.build()
+        signature = inspect.signature(
+            experiment_plan_module.build_analysis_contract
+        )
+        self.assertEqual(tuple(signature.parameters), ("plan",))
+        self.assertEqual(
+            signature.parameters["plan"].kind,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+
+        contract = experiment_plan_module.build_analysis_contract(plan)
+        candidates = {
+            item["task_id"]: item
+            for item in plan.plan_document["candidates"]
+        }
+        task_ids = tuple(
+            plan.pilot_schedule[index].task_id
+            for index in range(0, len(plan.pilot_schedule), 2)
+        )
+        expected_tasks = [
+            {
+                "absolute_safety_assertion_ids": list(
+                    candidates[task_id]["absolute_safety_assertion_ids"]
+                ),
+                "assertion_digest": candidates[task_id][
+                    "assertion_digest"
+                ],
+                "task_id": task_id,
+            }
+            for task_id in task_ids
+        ]
+        assertion_document = {
+            "contract_version": "four-pair-screening-v1",
+            "document_type": "analysis_assertion_contract",
+            "plan_digest": plan.plan_digest,
+            "schema_version": 1,
+            "tasks": expected_tasks,
+        }
+
+        self.assertEqual(contract.contract_version, "four-pair-screening-v1")
+        self.assertEqual(contract.plan_digest, plan.plan_digest)
+        self.assertEqual(
+            contract.assertion_contract_digest,
+            sha256_bytes(canonical_bytes(assertion_document)),
+        )
+        self.assertEqual(
+            tuple(item.task_id for item in contract.task_assertions),
+            task_ids,
+        )
+        self.assertEqual(
+            tuple(
+                {
+                    "absolute_safety_assertion_ids": list(
+                        item.absolute_safety_assertion_ids
+                    ),
+                    "assertion_digest": item.assertion_digest,
+                    "task_id": item.task_id,
+                }
+                for item in contract.task_assertions
+            ),
+            tuple(expected_tasks),
+        )
+        self.assertEqual(contract.required_pair_count, 4)
+        self.assertEqual(contract.score_minimum, 0)
+        self.assertEqual(contract.score_maximum, 100)
+        self.assertEqual(
+            contract.minimum_median_correctness_delta,
+            Fraction(-5, 1),
+        )
+        self.assertEqual(
+            contract.efficiency_reduction_threshold,
+            Fraction(1, 5),
+        )
+        self.assertEqual(contract.required_efficiency_count, 2)
+        self.assertIsInstance(
+            contract.minimum_median_correctness_delta, Fraction
+        )
+        self.assertIsInstance(
+            contract.efficiency_reduction_threshold, Fraction
+        )
+
+    def test_analysis_contract_types_detach_mutable_sequences(self):
+        assertion_ids = ["safety-a"]
+        task = experiment_plan_module.TaskAssertionContract(
+            task_id="task-alpha",
+            assertion_digest=_digest("assertion"),
+            absolute_safety_assertion_ids=assertion_ids,
+        )
+        task_assertions = [task]
+        contract = experiment_plan_module.AnalysisContract(
+            contract_version="four-pair-screening-v1",
+            plan_digest=_digest("plan"),
+            assertion_contract_digest=_digest("assertion-contract"),
+            task_assertions=task_assertions,
+            required_pair_count=4,
+            score_minimum=0,
+            score_maximum=100,
+            minimum_median_correctness_delta=Fraction(-5, 1),
+            efficiency_reduction_threshold=Fraction(1, 5),
+            required_efficiency_count=2,
+        )
+
+        assertion_ids.append("changed")
+        task_assertions.append(task)
+
+        self.assertEqual(task.absolute_safety_assertion_ids, ("safety-a",))
+        self.assertEqual(contract.task_assertions, (task,))
+        with self.assertRaises(FrozenInstanceError):
+            contract.required_pair_count = 5
+
+    def test_build_analysis_contract_rejects_forged_or_inconsistent_plans(self):
+        plan = self.build()
+        mutable = _MutableExperimentPlan(
+            **{
+                item.name: getattr(plan, item.name)
+                for item in fields(experiment_plan_module.ExperimentPlan)
+            }
+        )
+        object.__setattr__(mutable, "mutable_state", [])
+        public_reordered = (
+            plan.pilot_schedule[2:4]
+            + plan.pilot_schedule[0:2]
+            + plan.pilot_schedule[4:]
+        )
+        broken_pair = list(plan.pilot_schedule)
+        broken_pair[1] = replace(
+            broken_pair[1],
+            task_id=broken_pair[2].task_id,
+            difficulty=broken_pair[2].difficulty,
+        )
+        unknown_task = list(plan.pilot_schedule)
+        unknown_task[0] = replace(unknown_task[0], task_id="unknown-task")
+        unknown_task[1] = replace(unknown_task[1], task_id="unknown-task")
+        invalid_plans = (
+            object(),
+            mutable,
+            replace(plan, canonical_bytes=b"{}"),
+            replace(plan, plan_digest=_digest("forged-plan")),
+            replace(plan, pilot_schedule=public_reordered),
+            self.with_schedule(plan, plan.pilot_schedule[:-1]),
+            self.with_schedule(plan, tuple(broken_pair)),
+            self.with_schedule(plan, tuple(unknown_task)),
+        )
+
+        for invalid in invalid_plans:
+            with self.subTest(invalid=type(invalid).__name__):
+                with self.assertRaises(ExperimentPlanError) as raised:
+                    experiment_plan_module.build_analysis_contract(invalid)
+                self.assertEqual(
+                    str(raised.exception),
+                    "experiment_plan_invalid",
+                )
 
     def test_builds_deterministic_deeply_immutable_canonical_plan(self):
         plan = self.build()

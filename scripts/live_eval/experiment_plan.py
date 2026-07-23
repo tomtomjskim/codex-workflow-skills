@@ -3,10 +3,11 @@
 from collections.abc import Mapping as ABCMapping
 from collections.abc import Sequence as ABCSequence
 from dataclasses import dataclass, field, fields
+from fractions import Fraction
 import hashlib
 import re
 from types import MappingProxyType
-from typing import Mapping, Sequence, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 import unicodedata
 
 from scripts.workflow_coordination.canonical_json import (
@@ -29,6 +30,7 @@ _CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
 _FORMATTING_ONLY_CATEGORIES = frozenset(
     {"formatting", "parsing", "syntax_only"}
 )
+_ANALYSIS_DATASET_PROVENANCE = object()
 
 _EXPERIMENT_KEYS = frozenset(
     {
@@ -472,6 +474,146 @@ class ExperimentPlan:
             "pilot_invocation_plans",
             tuple(self.pilot_invocation_plans),
         )
+
+
+@dataclass(frozen=True)
+class ValidatedConditionObservation:
+    task_id: str
+    condition: str
+    terminal_receipt_digest: str
+    correctness_score: Optional[int]
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_output_tokens: int
+    wall_time_milliseconds: int
+    active_review_milliseconds: Optional[int]
+    machine_assertion_passed: bool
+    absolute_safety_assertion_id: Optional[str]
+    absolute_safety_basis_digest: Optional[str]
+
+    @property
+    def reported_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
+class ValidatedPairObservation:
+    task_id: str
+    current: Optional[ValidatedConditionObservation]
+    lean: Optional[ValidatedConditionObservation]
+
+
+@dataclass(frozen=True)
+class ValidatedMaskedReviewEvidence:
+    packet_receipt_digest: str
+    score_lock_receipt_digest: str
+    unmask_receipt_digest: str
+    high_regression_basis_digest: Optional[str]
+
+
+@dataclass(frozen=True)
+class ValidatedAnalysisDataset:
+    plan_digest: str
+    runtime_history_digest: str
+    pairs: Tuple[ValidatedPairObservation, ...]
+    masked_review: Optional[ValidatedMaskedReviewEvidence]
+    partial_reason_codes: Tuple[str, ...]
+    _provenance: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pairs", tuple(self.pairs))
+        object.__setattr__(
+            self, "partial_reason_codes", tuple(self.partial_reason_codes)
+        )
+
+
+@dataclass(frozen=True)
+class ExperimentDecision:
+    outcome: str
+    comparative_aggregate_emitted: bool
+    median_correctness_delta: Optional[Fraction]
+    efficiency_medians: Mapping[str, Optional[Fraction]]
+    qualifying_efficiency_metrics: Tuple[str, ...]
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "efficiency_medians",
+            MappingProxyType(dict(self.efficiency_medians)),
+        )
+        object.__setattr__(
+            self,
+            "qualifying_efficiency_metrics",
+            tuple(self.qualifying_efficiency_metrics),
+        )
+
+
+@dataclass(frozen=True)
+class TaskAssertionContract:
+    task_id: str
+    assertion_digest: str
+    absolute_safety_assertion_ids: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "absolute_safety_assertion_ids",
+            tuple(self.absolute_safety_assertion_ids),
+        )
+
+
+@dataclass(frozen=True)
+class AnalysisContract:
+    contract_version: str
+    plan_digest: str
+    assertion_contract_digest: str
+    task_assertions: Tuple[TaskAssertionContract, ...]
+    required_pair_count: int
+    score_minimum: int
+    score_maximum: int
+    minimum_median_correctness_delta: Fraction
+    efficiency_reduction_threshold: Fraction
+    required_efficiency_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_assertions", tuple(self.task_assertions))
+
+
+def _make_validated_analysis_dataset(
+    *,
+    plan_digest: str,
+    runtime_history_digest: str,
+    pairs: Sequence[ValidatedPairObservation],
+    masked_review: Optional[ValidatedMaskedReviewEvidence],
+    partial_reason_codes: Sequence[str],
+) -> ValidatedAnalysisDataset:
+    return ValidatedAnalysisDataset(
+        plan_digest=plan_digest,
+        runtime_history_digest=runtime_history_digest,
+        pairs=tuple(pairs),
+        masked_review=masked_review,
+        partial_reason_codes=tuple(partial_reason_codes),
+        _provenance=_ANALYSIS_DATASET_PROVENANCE,
+    )
+
+
+def _correctness_delta(current: int, lean: int) -> int:
+    return lean - current
+
+
+def _median(values: Sequence[Fraction]) -> Fraction:
+    ordered = sorted(values)
+    if len(ordered) != 4:
+        raise ExperimentPlanError("analysis_requires_four_pairs")
+    return (ordered[1] + ordered[2]) / 2
+
+
+def _reduction(current: int, lean: int) -> Fraction:
+    if current <= 0:
+        raise ExperimentPlanError("analysis_baseline_not_positive")
+    return Fraction(current - lean, current)
 
 
 def _raise_input_error() -> None:
@@ -1347,6 +1489,149 @@ def build_experiment_plan(
             canary_templates=canary_templates,
             pilot_invocation_plans=pilot_invocation_plans,
         )
+    except ExperimentPlanError:
+        raise ExperimentPlanError(_PLAN_ERROR) from None
+    except (
+        AttributeError,
+        CanonicalJSONError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        raise ExperimentPlanError(_PLAN_ERROR) from None
+
+
+def _build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
+    if not _dataclass_has_exact_fields(plan, ExperimentPlan):
+        _raise_plan_error()
+
+    document = thaw_json_value(plan.plan_document)
+    expected_document_keys = _EXPERIMENT_KEYS.union(
+        {
+            "bundle_digest",
+            "call_allocation_digest",
+            "canary_template_digests",
+            "current_profile_digest",
+            "input_digest",
+            "lean_profile_digest",
+            "pilot_invocation_plan_digests",
+            "pilot_schedule",
+            "task_corpus_receipt_digest",
+            "task_selection_receipt_digest",
+            "task_source_trust_receipt_digests",
+        }
+    )
+    if not isinstance(document, ABCMapping):
+        _raise_plan_error()
+    if set(document) != expected_document_keys:
+        _raise_plan_error()
+
+    encoded = canonical_bytes(document)
+    if plan.canonical_bytes != encoded:
+        _raise_plan_error()
+    if plan.plan_digest != sha256_bytes(encoded):
+        _raise_plan_error()
+
+    input_document = {
+        key: document[key]
+        for key in _EXPERIMENT_KEYS
+    }
+    validated_input = _validate_experiment_document(input_document)
+    input_bytes = canonical_bytes(input_document)
+    if plan.input_digest != document["input_digest"]:
+        _raise_plan_error()
+    if plan.input_digest != sha256_bytes(input_bytes):
+        _raise_plan_error()
+
+    schedule = tuple(plan.pilot_schedule)
+    if len(schedule) != 8:
+        _raise_plan_error()
+    if any(
+        not _dataclass_has_exact_fields(run, PlannedRun)
+        for run in schedule
+    ):
+        _raise_plan_error()
+    projected_schedule = [
+        _planned_run_document(run)
+        for run in schedule
+    ]
+    if projected_schedule != document["pilot_schedule"]:
+        _raise_plan_error()
+
+    candidates = {
+        candidate["task_id"]: candidate
+        for candidate in validated_input["candidates"]
+    }
+    task_order = []
+    for index in range(0, len(schedule), 2):
+        current_pair = schedule[index : index + 2]
+        first, second = current_pair
+        if first.ordinal != index + 1 or second.ordinal != index + 2:
+            _raise_plan_error()
+        if type(first.ordinal) is not int or type(second.ordinal) is not int:
+            _raise_plan_error()
+        if first.task_id != second.task_id:
+            _raise_plan_error()
+        if first.difficulty != second.difficulty:
+            _raise_plan_error()
+        if {first.condition, second.condition} != {"current", "lean"}:
+            _raise_plan_error()
+        if first.task_id not in candidates:
+            _raise_plan_error()
+        if first.difficulty != candidates[first.task_id]["difficulty"]:
+            _raise_plan_error()
+        task_order.append(first.task_id)
+
+    if len(set(task_order)) != 4 or set(task_order) != set(candidates):
+        _raise_plan_error()
+
+    task_assertions = tuple(
+        TaskAssertionContract(
+            task_id=task_id,
+            assertion_digest=candidates[task_id]["assertion_digest"],
+            absolute_safety_assertion_ids=tuple(
+                candidates[task_id]["absolute_safety_assertion_ids"]
+            ),
+        )
+        for task_id in task_order
+    )
+    assertion_document = {
+        "contract_version": "four-pair-screening-v1",
+        "document_type": "analysis_assertion_contract",
+        "plan_digest": plan.plan_digest,
+        "schema_version": 1,
+        "tasks": [
+            {
+                "task_id": item.task_id,
+                "assertion_digest": item.assertion_digest,
+                "absolute_safety_assertion_ids": list(
+                    item.absolute_safety_assertion_ids
+                ),
+            }
+            for item in task_assertions
+        ],
+    }
+    return AnalysisContract(
+        contract_version="four-pair-screening-v1",
+        plan_digest=plan.plan_digest,
+        assertion_contract_digest=sha256_bytes(
+            canonical_bytes(assertion_document)
+        ),
+        task_assertions=task_assertions,
+        required_pair_count=4,
+        score_minimum=0,
+        score_maximum=100,
+        minimum_median_correctness_delta=Fraction(-5, 1),
+        efficiency_reduction_threshold=Fraction(1, 5),
+        required_efficiency_count=2,
+    )
+
+
+def build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
+    """Derive the fixed exact-rational analysis contract from one plan."""
+    try:
+        return _build_analysis_contract(plan)
     except ExperimentPlanError:
         raise ExperimentPlanError(_PLAN_ERROR) from None
     except (
