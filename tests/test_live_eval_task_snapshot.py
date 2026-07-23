@@ -16,6 +16,7 @@ from unittest.mock import patch
 import scripts.live_eval.task_snapshot as task_snapshot_module
 from scripts.live_eval.task_snapshot import (
     CapturedTaskObjects,
+    MaterializedTaskSnapshot,
     ObjectTopologySeal,
     PreparedTaskSource,
     TaskTreeEntry,
@@ -3621,6 +3622,701 @@ class TaskSnapshotCaptureTests(RepositoryFixture, unittest.TestCase):
             ):
                 TaskSnapshotMaterializer(policy).capture(prepared)
             make_receipt.assert_not_called()
+
+
+class TaskSnapshotMaterializedSurfaceTests(
+    RepositoryFixture,
+    unittest.TestCase,
+):
+    def captured_fixture(self):
+        repo, oid = self.make_repository()
+        policy = TaskSnapshotPolicy()
+        prepared = prepare_task_source(self.source_for(repo, oid), policy)
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+        return repo, policy, materializer, captured
+
+    def test_materialized_tree_builder_handles_empty_and_nested_entries(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        seal = materializer._operational_seal
+        empty = replace(
+            seal,
+            entries=(),
+            blobs=MappingProxyType({}),
+            file_count=0,
+            total_bytes=0,
+            unique_blob_count=0,
+            unique_blob_bytes=0,
+        )
+        self.assertEqual(
+            task_snapshot_module._expected_materialized_tree_document(empty),
+            {
+                "directory_count": 1,
+                "document_type": "task-materialized-tree-v1",
+                "entry_count": 1,
+                "file_count": 0,
+                "records": [
+                    {
+                        "content_digest": None,
+                        "kind": "directory",
+                        "mode": 365,
+                        "path": ".",
+                        "size": 0,
+                    }
+                ],
+                "schema_version": 1,
+                "total_bytes": 0,
+            },
+        )
+
+        nested_entries = (
+            TaskTreeEntry(
+                path="run.sh",
+                git_mode="100755",
+                blob_oid="a" * 40,
+                size=1,
+                content_digest="sha256:" + "1" * 64,
+            ),
+            TaskTreeEntry(
+                path="src/a.py",
+                git_mode="100644",
+                blob_oid="b" * 40,
+                size=2,
+                content_digest="sha256:" + "2" * 64,
+            ),
+        )
+        nested = replace(
+            seal,
+            entries=nested_entries,
+            file_count=2,
+            total_bytes=3,
+            unique_blob_count=2,
+            unique_blob_bytes=3,
+        )
+        nested_document = (
+            task_snapshot_module._expected_materialized_tree_document(nested)
+        )
+        self.assertEqual(
+            tuple(record["path"] for record in nested_document["records"]),
+            (".", "run.sh", "src", "src/a.py"),
+        )
+        self.assertEqual(
+            tuple(record["mode"] for record in nested_document["records"]),
+            (365, 365, 365, 292),
+        )
+        self.assertNotIn(captured.commit_oid, repr(nested_document))
+        materializer.close()
+
+    def test_materialized_snapshot_and_documents_are_exact_and_path_private(
+        self,
+    ):
+        repo, policy, materializer, captured = self.captured_fixture()
+        seal = materializer._operational_seal
+        document = task_snapshot_module._expected_materialized_tree_document(
+            seal
+        )
+        tree_digest = task_snapshot_module._digest(document)
+        receipt = task_snapshot_module._make_task_snapshot_receipt(
+            seal,
+            tree_digest,
+        )
+
+        self.assertEqual(
+            document,
+            {
+                "directory_count": 1,
+                "document_type": "task-materialized-tree-v1",
+                "entry_count": 2,
+                "file_count": 1,
+                "records": [
+                    {
+                        "content_digest": None,
+                        "kind": "directory",
+                        "mode": 365,
+                        "path": ".",
+                        "size": 0,
+                    },
+                    {
+                        "content_digest": (
+                            captured.entries[0].content_digest
+                        ),
+                        "kind": "file",
+                        "mode": 292,
+                        "path": "tracked.txt",
+                        "size": len(b"fixture\n"),
+                    },
+                ],
+                "schema_version": 1,
+                "total_bytes": len(b"fixture\n"),
+            },
+        )
+        self.assertNotIn(captured.commit_oid, repr(document))
+        self.assertNotIn(str(repo), repr(document))
+        self.assertEqual(
+            dict(receipt.payload),
+            {
+                "commit_oid": captured.commit_oid,
+                "entry_digest": captured.entry_digest,
+                "file_count": captured.file_count,
+                "materialized_tree_digest": tree_digest,
+                "materializer_policy_version": policy.policy_version,
+                "object_format": captured.object_format,
+                "source_trust_receipt_digest": (
+                    captured.source_trust_receipt.receipt_digest
+                ),
+                "task_id": captured.source.task_id,
+                "total_bytes": captured.total_bytes,
+                "tree_oid": captured.tree_oid,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target_root = Path(temporary).resolve()
+            snapshot = MaterializedTaskSnapshot(
+                snapshot_receipt=receipt,
+                target_root=target_root,
+                target_identity_digest="sha256:" + "3" * 64,
+                materialized_tree_digest=tree_digest,
+                file_count=captured.file_count,
+                total_bytes=captured.total_bytes,
+            )
+            self.assertEqual(
+                tuple(item.name for item in fields(snapshot)),
+                (
+                    "snapshot_receipt",
+                    "target_root",
+                    "target_identity_digest",
+                    "materialized_tree_digest",
+                    "file_count",
+                    "total_bytes",
+                ),
+            )
+            self.assertIs(type(snapshot.target_root), type(Path()))
+            self.assertIsNot(snapshot.snapshot_receipt, receipt)
+            self.assertNotIn(str(target_root), repr(snapshot))
+
+            os.chmod(target_root, 0o555)
+            try:
+                root_document = (
+                    task_snapshot_module._target_root_identity_document(
+                        os.stat(target_root, follow_symlinks=False),
+                        tree_digest,
+                    )
+                )
+            finally:
+                os.chmod(target_root, 0o700)
+            self.assertEqual(
+                frozenset(root_document),
+                frozenset(
+                    {
+                        "document_type",
+                        "materialized_tree_digest",
+                        "root_identity",
+                        "schema_version",
+                    }
+                ),
+            )
+            self.assertEqual(
+                root_document["document_type"],
+                "task-materialized-root-identity-v1",
+            )
+            self.assertEqual(root_document["root_identity"]["mode"], 365)
+            self.assertNotIn(str(target_root), repr(root_document))
+        materializer.close()
+
+    def test_materialized_snapshot_rejects_forged_scalars_and_receipt(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        seal = materializer._operational_seal
+        tree_digest = task_snapshot_module._digest(
+            task_snapshot_module._expected_materialized_tree_document(seal)
+        )
+        receipt = task_snapshot_module._make_task_snapshot_receipt(
+            seal,
+            tree_digest,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            base = {
+                "snapshot_receipt": receipt,
+                "target_root": Path(temporary).resolve(),
+                "target_identity_digest": "sha256:" + "3" * 64,
+                "materialized_tree_digest": tree_digest,
+                "file_count": captured.file_count,
+                "total_bytes": captured.total_bytes,
+            }
+
+            class DigestSubclass(str):
+                pass
+
+            class IntegerSubclass(int):
+                pass
+
+            attacks = (
+                ("target_root", Path("relative")),
+                (
+                    "target_identity_digest",
+                    DigestSubclass("sha256:" + "3" * 64),
+                ),
+                ("materialized_tree_digest", "sha256:" + "A" * 64),
+                ("file_count", True),
+                ("file_count", IntegerSubclass(1)),
+                ("total_bytes", -1),
+            )
+            for field_name, value in attacks:
+                with self.subTest(
+                    field_name=field_name,
+                    value_type=type(value),
+                ), self.assertRaisesRegex(
+                    TaskSnapshotError,
+                    "^task_snapshot_receipt_invalid$",
+                ) as caught:
+                    MaterializedTaskSnapshot(
+                        **dict(base, **{field_name: value})
+                    )
+                self.assertIsNone(caught.exception.__context__)
+                self.assertIsNone(caught.exception.__cause__)
+
+            forged_receipt = replace(receipt, canonical_bytes=b"forged")
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+            ):
+                MaterializedTaskSnapshot(
+                    **dict(base, snapshot_receipt=forged_receipt)
+                )
+
+            mismatched_payload = dict(receipt.payload)
+            mismatched_payload["file_count"] += 1
+            mismatched_receipt = task_snapshot_module.make_receipt(
+                "task_snapshot",
+                receipt.input_digest,
+                None,
+                None,
+                mismatched_payload,
+            )
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+            ):
+                MaterializedTaskSnapshot(
+                    **dict(base, snapshot_receipt=mismatched_receipt)
+                )
+        materializer.close()
+
+    def test_materialized_snapshot_receipt_snapshot_is_schema_bounded(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        seal = materializer._operational_seal
+        tree_digest = task_snapshot_module._digest(
+            task_snapshot_module._expected_materialized_tree_document(seal)
+        )
+        receipt = task_snapshot_module._make_task_snapshot_receipt(
+            seal,
+            tree_digest,
+        )
+        original_payload = dict(receipt.payload)
+
+        class FloodMapping(ABCMapping):
+            def __init__(self):
+                self.reads = 0
+                self.keys = tuple(original_payload)
+
+            def __getitem__(self, key):
+                return original_payload.get(key, "x")
+
+            def __iter__(self):
+                while True:
+                    self.reads += 1
+                    if self.reads > 11:
+                        raise AssertionError(
+                            "snapshot receipt exceeded schema plus one"
+                        )
+                    if self.reads <= len(self.keys):
+                        yield self.keys[self.reads - 1]
+                    else:
+                        yield "extra"
+
+            def __len__(self):
+                return 1000
+
+        flood = FloodMapping()
+        forged = replace(receipt)
+        object.__setattr__(forged, "payload", MappingProxyType(flood))
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "scripts.live_eval.task_snapshot.make_receipt",
+            side_effect=AssertionError(
+                "invalid snapshot receipt reached canonicalization"
+            ),
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            MaterializedTaskSnapshot(
+                snapshot_receipt=forged,
+                target_root=Path(temporary).resolve(),
+                target_identity_digest="sha256:" + "4" * 64,
+                materialized_tree_digest=tree_digest,
+                file_count=captured.file_count,
+                total_bytes=captured.total_bytes,
+            )
+        make_receipt.assert_not_called()
+        self.assertEqual(flood.reads, 11)
+        materializer.close()
+
+    def test_snapshot_receipt_builder_sanitizes_factory_failure(self):
+        unused_repo, unused_policy, materializer, unused_captured = (
+            self.captured_fixture()
+        )
+        seal = materializer._operational_seal
+        tree_digest = task_snapshot_module._digest(
+            task_snapshot_module._expected_materialized_tree_document(seal)
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot.make_receipt",
+            side_effect=RuntimeError("private receipt detail"),
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ) as caught:
+            task_snapshot_module._make_task_snapshot_receipt(
+                seal,
+                tree_digest,
+            )
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        materializer.close()
+
+    def test_target_names_and_parent_gate_are_read_only(self):
+        unused_repo, policy, materializer, unused_captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            with patch(
+                "scripts.live_eval.task_snapshot.os.mkdir"
+            ) as mkdir, patch(
+                "scripts.live_eval.task_snapshot.os.fchmod"
+            ) as fchmod, patch(
+                "scripts.live_eval.task_snapshot.os.unlink"
+            ) as unlink, patch(
+                "scripts.live_eval.task_snapshot.os.rmdir"
+            ) as rmdir:
+                gate = task_snapshot_module._open_target_parent_gate(
+                    parent,
+                    "current",
+                    "lean",
+                    materializer._source_root,
+                    materializer._git_dir,
+                    materializer._protected_identity_keys,
+                    policy,
+                )
+            self.assertTrue(
+                task_snapshot_module._close_fd_once(gate.descriptor)
+            )
+            mkdir.assert_not_called()
+            fchmod.assert_not_called()
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+
+            (parent / "current").mkdir()
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ):
+                task_snapshot_module._open_target_parent_gate(
+                    parent,
+                    "current",
+                    "lean",
+                    materializer._source_root,
+                    materializer._git_dir,
+                    materializer._protected_identity_keys,
+                    policy,
+                )
+            (parent / "current").rmdir()
+            (parent / "lean").symlink_to(
+                parent / "missing",
+                target_is_directory=True,
+            )
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ):
+                task_snapshot_module._open_target_parent_gate(
+                    parent,
+                    "current",
+                    "lean",
+                    materializer._source_root,
+                    materializer._git_dir,
+                    materializer._protected_identity_keys,
+                    policy,
+                )
+        materializer.close()
+
+    def test_target_gate_rechecks_parent_after_absence_lookups(self):
+        unused_repo, policy, materializer, unused_captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            original_stat = task_snapshot_module.os.stat
+            mutated = {"value": False}
+
+            def mutate_parent(path, *args, **kwargs):
+                if (
+                    path == "lean"
+                    and kwargs.get("dir_fd") is not None
+                    and not mutated["value"]
+                ):
+                    os.chmod(parent, 0o755)
+                    mutated["value"] = True
+                return original_stat(path, *args, **kwargs)
+
+            gate = None
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot.os.stat",
+                    side_effect=mutate_parent,
+                ), self.assertRaisesRegex(
+                    TaskSnapshotError, "^task_target_invalid$"
+                ):
+                    gate = task_snapshot_module._open_target_parent_gate(
+                        parent,
+                        "current",
+                        "lean",
+                        materializer._source_root,
+                        materializer._git_dir,
+                        materializer._protected_identity_keys,
+                        policy,
+                    )
+            finally:
+                if gate is not None:
+                    task_snapshot_module._close_fd_once(gate.descriptor)
+                os.chmod(parent, 0o700)
+        materializer.close()
+
+    def test_target_gate_rechecks_each_ancestor_before_close(self):
+        unused_repo, policy, materializer, unused_captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            outer = Path(temporary).resolve()
+            inner = outer / "inner"
+            inner.mkdir(mode=0o700)
+            os.chmod(outer, 0o700)
+            original_open = task_snapshot_module.os.open
+            mutated = {"value": False}
+
+            def mutate_ancestor(path, flags, *args, **kwargs):
+                descriptor = original_open(path, flags, *args, **kwargs)
+                if (
+                    path == "inner"
+                    and kwargs.get("dir_fd") is not None
+                    and not mutated["value"]
+                ):
+                    os.chmod(outer, 0o755)
+                    mutated["value"] = True
+                return descriptor
+
+            gate = None
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot.os.open",
+                    side_effect=mutate_ancestor,
+                ), self.assertRaisesRegex(
+                    TaskSnapshotError, "^task_target_invalid$"
+                ):
+                    gate = task_snapshot_module._open_target_parent_gate(
+                        inner,
+                        "current",
+                        "lean",
+                        materializer._source_root,
+                        materializer._git_dir,
+                        materializer._protected_identity_keys,
+                        policy,
+                    )
+            finally:
+                if gate is not None:
+                    task_snapshot_module._close_fd_once(gate.descriptor)
+                os.chmod(outer, 0o700)
+        materializer.close()
+
+    def test_target_gate_close_uncertainty_overrides_original_failure(self):
+        unused_repo, policy, materializer, unused_captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o755)
+            parent_identity = os.stat(
+                parent,
+                follow_symlinks=False,
+            ).st_ino
+            original_close = task_snapshot_module._close_fd_once
+            reported = {"value": False}
+
+            def report_target_close_failure(descriptor):
+                is_target = os.fstat(descriptor).st_ino == parent_identity
+                closed = original_close(descriptor)
+                if is_target:
+                    reported["value"] = True
+                    return False
+                return closed
+
+            with patch(
+                "scripts.live_eval.task_snapshot._close_fd_once",
+                side_effect=report_target_close_failure,
+            ), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_snapshot_cleanup_required$"
+            ) as caught:
+                task_snapshot_module._open_target_parent_gate(
+                    parent,
+                    "current",
+                    "lean",
+                    materializer._source_root,
+                    materializer._git_dir,
+                    materializer._protected_identity_keys,
+                    policy,
+                )
+            self.assertTrue(reported["value"])
+            self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
+            os.chmod(parent, 0o700)
+        materializer.close()
+
+    def test_target_gate_rejects_names_modes_symlinks_and_source_overlap(self):
+        repo, policy, materializer, unused_captured = self.captured_fixture()
+
+        class RaisingPath:
+            def __fspath__(self):
+                raise RuntimeError("/private/target/detail")
+
+        class SpoofingPath:
+            def __fspath__(self):
+                raise TaskSnapshotError("/private/target/spoof")
+
+        for target_parent in (RaisingPath(), SpoofingPath()):
+            with self.subTest(
+                target_type=type(target_parent),
+            ), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ) as caught:
+                task_snapshot_module._open_target_parent_gate(
+                    target_parent,
+                    "current",
+                    "lean",
+                    materializer._source_root,
+                    materializer._git_dir,
+                    materializer._protected_identity_keys,
+                    policy,
+                )
+            self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
+
+        bad_names = (
+            ("", "lean"),
+            (".", "lean"),
+            ("current/child", "lean"),
+            ("current", "CURRENT"),
+            ("a" * (policy.max_component_bytes + 1), "lean"),
+            ("current.", "lean"),
+            ("current", "current"),
+            ("Straße", "STRASSE"),
+        )
+        for current_name, lean_name in bad_names:
+            with self.subTest(
+                current_name=current_name,
+                lean_name=lean_name,
+            ), patch(
+                "scripts.live_eval.task_snapshot.os.open"
+            ) as open_path, self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ):
+                task_snapshot_module._validate_target_names(
+                    current_name,
+                    lean_name,
+                    policy,
+                )
+            open_path.assert_not_called()
+
+        source_subdirectory = repo / "ordinary-source-directory"
+        source_subdirectory.mkdir(mode=0o700)
+        for target_parent in (
+            repo,
+            repo / ".git",
+            repo / ".git" / "objects",
+            source_subdirectory,
+        ):
+            with self.subTest(
+                protected_target=target_parent,
+            ), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ):
+                task_snapshot_module._open_target_parent_gate(
+                    target_parent,
+                    "current",
+                    "lean",
+                    materializer._source_root,
+                    materializer._git_dir,
+                    materializer._protected_identity_keys,
+                    policy,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o755)
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ):
+                task_snapshot_module._open_target_parent_gate(
+                    parent,
+                    "current",
+                    "lean",
+                    materializer._source_root,
+                    materializer._git_dir,
+                    materializer._protected_identity_keys,
+                    policy,
+                )
+            os.chmod(parent, 0o700)
+            parent_metadata = os.stat(parent, follow_symlinks=False)
+            alias_keys = (
+                (
+                    parent_metadata.st_dev,
+                    parent_metadata.st_ino,
+                    "directory",
+                ),
+                materializer._protected_identity_keys[1],
+            )
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ):
+                task_snapshot_module._open_target_parent_gate(
+                    parent,
+                    "current",
+                    "lean",
+                    Path("/lexically-unrelated-source"),
+                    Path("/lexically-unrelated-source/.git"),
+                    alias_keys,
+                    policy,
+                )
+            link = parent.parent / (parent.name + "-link")
+            try:
+                link.symlink_to(parent, target_is_directory=True)
+                with self.assertRaisesRegex(
+                    TaskSnapshotError, "^task_target_invalid$"
+                ):
+                    task_snapshot_module._open_target_parent_gate(
+                        link,
+                        "current",
+                        "lean",
+                        materializer._source_root,
+                        materializer._git_dir,
+                        materializer._protected_identity_keys,
+                        policy,
+                    )
+            finally:
+                if link.is_symlink():
+                    link.unlink()
+        materializer.close()
 
 
 class TaskSnapshotPreparationTests(RepositoryFixture, unittest.TestCase):

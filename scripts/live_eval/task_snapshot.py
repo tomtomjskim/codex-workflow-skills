@@ -169,6 +169,19 @@ class CapturedTaskObjects:
 
 
 @dataclass(frozen=True)
+class MaterializedTaskSnapshot:
+    snapshot_receipt: CanonicalReceipt
+    target_root: Path = field(repr=False)
+    target_identity_digest: str
+    materialized_tree_digest: str
+    file_count: int
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        _detach_and_validate_materialized_snapshot(self)
+
+
+@dataclass(frozen=True)
 class ObjectTopologySeal:
     object_topology_digest: str
     entry_count: int
@@ -249,6 +262,16 @@ class _CapturedOperationalSeal:
     unique_blob_count: int
     unique_blob_bytes: int
     protected_identity_keys: Tuple[Tuple[int, int, str], ...]
+
+
+@dataclass(frozen=True)
+class _TargetParentGate:
+    descriptor: int = field(repr=False)
+    target_parent: Path = field(repr=False)
+    metadata: os.stat_result = field(repr=False)
+    device: int
+    current_name: str
+    lean_name: str
 
 
 def _fail(code: str) -> None:
@@ -1317,6 +1340,52 @@ def _detach_and_validate_captured_objects(
         object.__setattr__(captured, "blobs", blobs)
         receipt = _validate_captured_objects(captured)
         object.__setattr__(captured, "source_trust_receipt", receipt)
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+
+
+def _detach_and_validate_materialized_snapshot(
+    snapshot: MaterializedTaskSnapshot,
+) -> None:
+    try:
+        if not _exact_fields(snapshot, MaterializedTaskSnapshot):
+            _fail("task_snapshot_receipt_invalid")
+        raw_root = os.fspath(snapshot.target_root)
+        if (
+            type(raw_root) is not str
+            or not os.path.isabs(raw_root)
+            or os.path.normpath(raw_root) != raw_root
+            or type(snapshot.target_identity_digest) is not str
+            or not _valid_digest(snapshot.target_identity_digest)
+            or type(snapshot.materialized_tree_digest) is not str
+            or not _valid_digest(snapshot.materialized_tree_digest)
+            or type(snapshot.file_count) is not int
+            or snapshot.file_count < 0
+            or snapshot.file_count
+            > _PUBLIC_TASK_TREE_PATH_POLICY.max_files
+            or type(snapshot.total_bytes) is not int
+            or snapshot.total_bytes < 0
+            or snapshot.total_bytes
+            > _PUBLIC_TASK_TREE_PATH_POLICY.max_total_bytes
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        receipt = _reconstruct_receipt(
+            snapshot.snapshot_receipt,
+            "task_snapshot",
+            _PUBLIC_TASK_TREE_PATH_POLICY,
+        )
+        payload = receipt.payload
+        if (
+            receipt.plan_digest is not None
+            or receipt.previous_record_hash is not None
+            or payload["materialized_tree_digest"]
+            != snapshot.materialized_tree_digest
+            or payload["file_count"] != snapshot.file_count
+            or payload["total_bytes"] != snapshot.total_bytes
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        object.__setattr__(snapshot, "target_root", Path(raw_root))
+        object.__setattr__(snapshot, "snapshot_receipt", receipt)
     except Exception:
         _fail("task_snapshot_receipt_invalid")
 
@@ -3482,6 +3551,373 @@ def _make_operational_seal(
         unique_blob_bytes=captured.unique_blob_bytes,
         protected_identity_keys=tuple(protected_identity_keys),
     )
+
+
+def _expected_materialized_tree_document(
+    seal: _CapturedOperationalSeal,
+) -> Dict[str, object]:
+    try:
+        if (
+            not _exact_fields(seal, _CapturedOperationalSeal)
+            or type(seal.entries) is not tuple
+            or len(seal.entries) > seal.policy.max_files
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        directories = {"."}
+        records = []
+        total_bytes = 0
+        for entry in seal.entries:
+            if not _exact_fields(entry, TaskTreeEntry):
+                _fail("task_snapshot_receipt_invalid")
+            components = _task_path_components(entry.path, seal.policy)
+            prefix = []
+            for component in components[:-1]:
+                prefix.append(component)
+                directories.add("/".join(prefix))
+            target_mode = 0o444 if entry.git_mode == "100644" else 0o555
+            records.append(
+                {
+                    "content_digest": entry.content_digest,
+                    "kind": "file",
+                    "mode": target_mode,
+                    "path": entry.path,
+                    "size": entry.size,
+                }
+            )
+            total_bytes += entry.size
+        if (
+            len(seal.entries) != seal.file_count
+            or total_bytes != seal.total_bytes
+            or len(directories) + len(seal.entries)
+            > seal.policy.max_tree_entries
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        records.extend(
+            {
+                "content_digest": None,
+                "kind": "directory",
+                "mode": 0o555,
+                "path": path,
+                "size": 0,
+            }
+            for path in directories
+        )
+        records.sort(key=lambda item: item["path"].encode("utf-8"))
+        return {
+            "directory_count": len(directories),
+            "document_type": "task-materialized-tree-v1",
+            "entry_count": len(records),
+            "file_count": seal.file_count,
+            "records": records,
+            "schema_version": 1,
+            "total_bytes": seal.total_bytes,
+        }
+    except TaskSnapshotError:
+        raise
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+
+
+def _target_root_identity_document(
+    metadata: os.stat_result,
+    materialized_tree_digest: str,
+) -> Dict[str, object]:
+    try:
+        if (
+            type(metadata) is not os.stat_result
+            or not _valid_digest(materialized_tree_digest)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o555
+        ):
+            _fail("task_target_changed")
+        return {
+            "document_type": "task-materialized-root-identity-v1",
+            "materialized_tree_digest": materialized_tree_digest,
+            "root_identity": _identity(metadata, "directory"),
+            "schema_version": 1,
+        }
+    except Exception:
+        _fail("task_target_changed")
+
+
+def _make_task_snapshot_receipt(
+    seal: _CapturedOperationalSeal,
+    materialized_tree_digest: str,
+) -> CanonicalReceipt:
+    try:
+        if (
+            not _exact_fields(seal, _CapturedOperationalSeal)
+            or not _valid_digest(materialized_tree_digest)
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        receipt = make_receipt(
+            "task_snapshot",
+            seal.source.input_digest,
+            None,
+            None,
+            {
+                "task_id": seal.source.task_id,
+                "object_format": seal.object_format,
+                "commit_oid": seal.commit_oid,
+                "tree_oid": seal.tree_oid,
+                "entry_digest": seal.entry_digest,
+                "materialized_tree_digest": materialized_tree_digest,
+                "materializer_policy_version": seal.policy.policy_version,
+                "file_count": seal.file_count,
+                "total_bytes": seal.total_bytes,
+                "source_trust_receipt_digest": (
+                    seal.source_trust_receipt.receipt_digest
+                ),
+            },
+        )
+        return _reconstruct_receipt(
+            receipt,
+            "task_snapshot",
+            seal.policy,
+        )
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+
+
+def _validate_target_names(
+    current_name: str,
+    lean_name: str,
+    policy: TaskSnapshotPolicy,
+) -> Tuple[str, str]:
+    _validate_policy(policy)
+    checked = []
+    for value in (current_name, lean_name):
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > policy.max_component_bytes
+        ):
+            _fail("task_target_invalid")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeError:
+            _fail("task_target_invalid")
+        if (
+            len(encoded) > policy.max_component_bytes
+            or value in (".", "..")
+            or "/" in value
+            or "\\" in value
+            or "\0" in value
+            or unicodedata.normalize("NFC", value) != value
+            or value.endswith(".")
+            or value.endswith(" ")
+            or any(
+                unicodedata.category(character) in ("Cc", "Cf", "Cs")
+                for character in value
+            )
+        ):
+            _fail("task_target_invalid")
+        checked.append(value)
+    if (
+        checked[0] == checked[1]
+        or unicodedata.normalize("NFC", checked[0])
+        == unicodedata.normalize("NFC", checked[1])
+        or _task_name_key(checked[0]) == _task_name_key(checked[1])
+    ):
+        _fail("task_target_invalid")
+    return (checked[0], checked[1])
+
+
+def _target_paths_overlap(first: str, second: str) -> bool:
+    try:
+        common = os.path.commonpath((first, second))
+    except (OSError, TypeError, ValueError):
+        _fail("task_target_invalid")
+    return common == first or common == second
+
+
+def _target_directory_identity_key(
+    metadata: os.stat_result,
+) -> Tuple[int, int, str]:
+    if (
+        type(metadata.st_dev) is not int
+        or metadata.st_dev < 0
+        or type(metadata.st_ino) is not int
+        or metadata.st_ino < 0
+    ):
+        _fail("task_target_invalid")
+    return (metadata.st_dev, metadata.st_ino, "directory")
+
+
+def _require_target_ancestor(
+    metadata: os.stat_result,
+    next_metadata: os.stat_result,
+) -> None:
+    uid = os.getuid()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid not in (0, uid)
+    ):
+        _fail("task_target_invalid")
+    if metadata.st_mode & 0o022:
+        sticky_exception = (
+            metadata.st_uid == 0
+            and bool(metadata.st_mode & stat.S_ISVTX)
+            and next_metadata.st_uid == uid
+            and not next_metadata.st_mode & 0o022
+        )
+        if not sticky_exception:
+            _fail("task_target_invalid")
+
+
+def _open_target_parent_gate(
+    target_parent: Path,
+    current_name: str,
+    lean_name: str,
+    source_root: Path,
+    git_dir: Path,
+    protected_identity_keys: Tuple[Tuple[int, int, str], ...],
+    policy: TaskSnapshotPolicy,
+) -> _TargetParentGate:
+    descriptor = -1
+    child_descriptor = -1
+    try:
+        checked_names = _validate_target_names(
+            current_name,
+            lean_name,
+            policy,
+        )
+        try:
+            raw_parent = os.fspath(target_parent)
+        except Exception:
+            _fail("task_target_invalid")
+        raw_source = os.fspath(source_root)
+        raw_git_dir = os.fspath(git_dir)
+        if (
+            type(raw_parent) is not str
+            or not os.path.isabs(raw_parent)
+            or os.path.normpath(raw_parent) != raw_parent
+            or os.path.realpath(raw_parent) != raw_parent
+            or type(raw_source) is not str
+            or type(raw_git_dir) is not str
+            or type(protected_identity_keys) is not tuple
+            or len(protected_identity_keys) != 2
+        ):
+            _fail("task_target_invalid")
+        for identity_key in protected_identity_keys:
+            _validate_identity_key(identity_key, "task_target_invalid")
+        planned_paths = (
+            raw_parent,
+            os.path.join(raw_parent, checked_names[0]),
+            os.path.join(raw_parent, checked_names[1]),
+        )
+        for planned in planned_paths:
+            for protected_path in (raw_source, raw_git_dir):
+                if _target_paths_overlap(planned, protected_path):
+                    _fail("task_target_invalid")
+
+        components = Path(raw_parent).parts[1:]
+        if not components:
+            _fail("task_target_invalid")
+        descriptor = os.open(os.sep, _directory_flags())
+        current_metadata = os.fstat(descriptor)
+        if (
+            _target_directory_identity_key(current_metadata)
+            in protected_identity_keys
+        ):
+            _fail("task_target_invalid")
+        for component in components:
+            observed = os.stat(
+                component,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or stat.S_ISLNK(observed.st_mode)
+            ):
+                _fail("task_target_invalid")
+            _require_target_ancestor(current_metadata, observed)
+            child_descriptor = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=descriptor,
+            )
+            opened = os.fstat(child_descriptor)
+            if not _same_identity(observed, opened):
+                _fail("task_target_invalid")
+            if (
+                _target_directory_identity_key(opened)
+                in protected_identity_keys
+            ):
+                _fail("task_target_invalid")
+            if (
+                _stable_ancestor_identity(current_metadata)
+                != _stable_ancestor_identity(os.fstat(descriptor))
+            ):
+                _fail("task_target_invalid")
+            owned_parent = descriptor
+            descriptor = child_descriptor
+            child_descriptor = -1
+            if not _close_fd_once(owned_parent):
+                _fail("task_snapshot_cleanup_required")
+            current_metadata = opened
+        if (
+            current_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(current_metadata.st_mode) != 0o700
+            or not stat.S_ISDIR(current_metadata.st_mode)
+            or stat.S_ISLNK(current_metadata.st_mode)
+        ):
+            _fail("task_target_invalid")
+        for name in checked_names:
+            try:
+                os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except (OSError, TypeError, ValueError, OverflowError):
+                _fail("task_target_invalid")
+            _fail("task_target_invalid")
+        final_metadata = os.fstat(descriptor)
+        if (
+            not _same_identity(current_metadata, final_metadata)
+            or final_metadata.st_uid != os.getuid()
+            or final_metadata.st_dev != current_metadata.st_dev
+            or stat.S_IMODE(final_metadata.st_mode) != 0o700
+            or not stat.S_ISDIR(final_metadata.st_mode)
+            or stat.S_ISLNK(final_metadata.st_mode)
+        ):
+            _fail("task_target_invalid")
+        current_metadata = final_metadata
+        gate = _TargetParentGate(
+            descriptor=descriptor,
+            target_parent=Path(raw_parent),
+            metadata=current_metadata,
+            device=current_metadata.st_dev,
+            current_name=checked_names[0],
+            lean_name=checked_names[1],
+        )
+        descriptor = -1
+        return gate
+    except TaskSnapshotError:
+        raise
+    except Exception:
+        _fail("task_target_invalid")
+    finally:
+        cleanup_ok = True
+        if child_descriptor >= 0:
+            owned_child = child_descriptor
+            child_descriptor = -1
+            try:
+                cleanup_ok = _close_fd_once(owned_child) and cleanup_ok
+            except Exception:
+                cleanup_ok = False
+        if descriptor >= 0:
+            owned_descriptor = descriptor
+            descriptor = -1
+            try:
+                cleanup_ok = _close_fd_once(owned_descriptor) and cleanup_ok
+            except Exception:
+                cleanup_ok = False
+        if not cleanup_ok:
+            _fail("task_snapshot_cleanup_required")
 
 
 class TaskSnapshotMaterializer:
