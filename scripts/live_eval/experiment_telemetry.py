@@ -200,32 +200,32 @@ def _raise_invalid() -> None:
     raise TelemetryError(_ERROR)
 
 
-def _raise_code(code: str) -> None:
-    raise TelemetryError(code)
-
-
 def _stream_invalid() -> None:
     raise _StreamInvalid()
 
 
 def _validate_telemetry_limits(limits: object) -> TelemetryLimits:
+    valid = False
     try:
-        if type(limits) is not TelemetryLimits:
-            _raise_code("telemetry_limits_invalid")
-        values = vars(limits)
-        if set(values) != _LIMIT_FIELDS:
-            _raise_code("telemetry_limits_invalid")
-        for field_name, ceiling in _LIMIT_CEILINGS.items():
-            value = values[field_name]
-            if type(value) is not int or value < 1 or value > ceiling:
-                _raise_code("telemetry_limits_invalid")
-        if values["max_line_bytes"] > values["max_total_bytes"]:
-            _raise_code("telemetry_limits_invalid")
-        return limits
-    except TelemetryError:
-        raise
+        if type(limits) is TelemetryLimits:
+            values = vars(limits)
+            valid = set(values) == _LIMIT_FIELDS
+            if valid:
+                valid = all(
+                    type(values[field_name]) is int
+                    and 1 <= values[field_name] <= ceiling
+                    for field_name, ceiling in _LIMIT_CEILINGS.items()
+                )
+            if valid:
+                valid = (
+                    values["max_line_bytes"]
+                    <= values["max_total_bytes"]
+                )
     except Exception:
-        raise TelemetryError("telemetry_limits_invalid") from None
+        valid = False
+    if not valid:
+        raise TelemetryError("telemetry_limits_invalid")
+    return limits
 
 
 def _is_nfc_text(value: object, *, nonempty: bool = False) -> bool:
@@ -355,6 +355,7 @@ def _validate_semantic_json_value(value: object, depth: int = 0) -> None:
 
 
 def _load_bounded_semantic_json(data: bytes) -> dict:
+    invalid = False
     try:
         if data.startswith(b"\xef\xbb\xbf"):
             _stream_invalid()
@@ -370,11 +371,11 @@ def _load_bounded_semantic_json(data: bytes) -> dict:
         if type(value) is not dict:
             _stream_invalid()
         _validate_semantic_json_value(value)
-        return value
-    except _StreamInvalid:
-        raise
     except Exception:
+        invalid = True
+    if invalid:
         _stream_invalid()
+    return value
 
 
 def _require_stream_keys(value: object, expected: frozenset) -> dict:
@@ -386,15 +387,17 @@ def _require_stream_keys(value: object, expected: frozenset) -> dict:
 def _structured_response_digest(text: object) -> str:
     if not _is_nfc_text(text):
         _stream_invalid()
+    invalid = False
     try:
         response = _load_bounded_semantic_json(text.encode("utf-8"))
-        return "sha256:{}".format(
+        digest = "sha256:{}".format(
             hashlib.sha256(canonical_bytes(response)).hexdigest()
         )
-    except _StreamInvalid:
-        raise
     except Exception:
+        invalid = True
+    if invalid:
         _stream_invalid()
+    return digest
 
 
 def _validate_wire_usage(
@@ -717,6 +720,7 @@ def _validate_price_snapshot(price_snapshot: object) -> dict:
 
 
 def _snapshot_price_mapping(price_snapshot: object) -> dict:
+    invalid = False
     try:
         if not isinstance(price_snapshot, ABCMapping):
             _raise_invalid()
@@ -737,9 +741,11 @@ def _snapshot_price_mapping(price_snapshot: object) -> dict:
         detached = {}
         for key in PRICE_SNAPSHOT_READ_ORDER:
             detached[key] = price_snapshot[key]
-        return detached
     except Exception:
-        raise TelemetryError(_ERROR) from None
+        invalid = True
+    if invalid:
+        raise TelemetryError(_ERROR)
+    return detached
 
 
 def _validate_summary_document(document: object) -> dict:
@@ -813,6 +819,7 @@ def parse_terminal_telemetry(
         if not line or len(line) > checked_limits.max_line_bytes:
             raise TelemetryError("telemetry_line_invalid")
 
+    stream_invalid = False
     try:
         state = _TelemetryState()
         for line in lines:
@@ -825,8 +832,11 @@ def parse_terminal_telemetry(
         ):
             _stream_invalid()
     except Exception:
-        raise TelemetryError("telemetry_stream_invalid") from None
+        stream_invalid = True
+    if stream_invalid:
+        raise TelemetryError("telemetry_stream_invalid")
 
+    summary_invalid = False
     try:
         price = _validate_price_snapshot(
             _snapshot_price_mapping(price_snapshot)
@@ -855,9 +865,12 @@ def parse_terminal_telemetry(
             "event_count": len(lines),
             "raw_retention": "discard",
         }
-        return telemetry_summary_from_document(document, price)
+        summary = telemetry_summary_from_document(document, price)
     except Exception:
-        raise TelemetryError(_ERROR) from None
+        summary_invalid = True
+    if summary_invalid:
+        raise TelemetryError(_ERROR)
+    return summary
 
 
 def telemetry_summary_from_document(
@@ -865,6 +878,7 @@ def telemetry_summary_from_document(
     price_snapshot: Mapping[str, object],
 ) -> TelemetrySummary:
     """Validate a price-bound exact document and return its typed summary."""
+    invalid = False
     try:
         checked = _validate_summary_document(document)
         usage = checked["usage"]
@@ -874,7 +888,7 @@ def telemetry_summary_from_document(
             != _estimated_cost_microunits(usage, price)
         ):
             _raise_invalid()
-        return TelemetrySummary(
+        summary = TelemetrySummary(
             classification=checked["classification"],
             response_digest=checked["response_digest"],
             usage=UsageSummary(
@@ -891,16 +905,20 @@ def telemetry_summary_from_document(
             raw_retention=checked["raw_retention"],
         )
     except Exception:
-        raise TelemetryError(_ERROR) from None
+        invalid = True
+    if invalid:
+        raise TelemetryError(_ERROR)
+    return summary
 
 
 def telemetry_summary_document(
     summary: TelemetrySummary,
 ) -> Mapping[str, object]:
     """Return the exact canonical-document projection of a typed summary."""
+    invalid = False
     try:
         checked = _validate_typed_summary(summary)
-        return {
+        document = {
             "classification": checked.classification,
             "response_digest": checked.response_digest,
             "usage": {
@@ -921,14 +939,20 @@ def telemetry_summary_document(
             "raw_retention": checked.raw_retention,
         }
     except Exception:
-        raise TelemetryError(_ERROR) from None
+        invalid = True
+    if invalid:
+        raise TelemetryError(_ERROR)
+    return document
 
 
 def telemetry_summary_digest(summary: TelemetrySummary) -> str:
     """Return the canonical SHA-256 identity of a typed summary."""
+    invalid = False
     try:
         document = telemetry_summary_document(summary)
         digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
-        return "sha256:{}".format(digest)
     except Exception:
-        raise TelemetryError(_ERROR) from None
+        invalid = True
+    if invalid:
+        raise TelemetryError(_ERROR)
+    return "sha256:{}".format(digest)

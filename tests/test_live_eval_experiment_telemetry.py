@@ -290,6 +290,17 @@ class _TrackingPriceMapping(Mapping):
         return len(self._iteration_keys)
 
 
+class _ExplodingPriceMapping(Mapping):
+    def __getitem__(self, _key):
+        raise ValueError("SENTINEL-PRICE-CONTEXT")
+
+    def __iter__(self):
+        raise ValueError("SENTINEL-PRICE-CONTEXT")
+
+    def __len__(self):
+        return len(_PRICE_KEYS)
+
+
 class _ArithmeticSentinel:
     def __init__(self):
         self.touched = False
@@ -305,6 +316,8 @@ class TelemetrySummaryCodecTests(unittest.TestCase):
             function(*args)
         self.assertIs(type(raised.exception), TelemetryError)
         self.assertEqual(str(raised.exception), "telemetry_summary_invalid")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_typed_values_have_exact_fields_and_are_frozen(self):
         self.assertEqual(
@@ -962,6 +975,7 @@ class _TelemetryParserTestCase(unittest.TestCase):
         self.assertEqual(str(raised.exception), expected)
         self.assertEqual(raised.exception.args, (expected,))
         self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
         return raised.exception
 
     def parse_data(self, data, *, limits=None, price=None):
@@ -2152,6 +2166,30 @@ class TelemetryParserFixtureIntegrationTests(_TelemetryParserTestCase):
 
     def fixture_bytes(self, name):
         return (self.fixtures / name).read_bytes()
+
+    def test_public_failures_detach_internal_exception_contexts(self):
+        valid = self.fixture_bytes("valid-terminal.jsonl")
+        malformed = (
+            b'{"type":"thread.started","SENTINEL-JSON-CONTEXT":\n'
+            + b"".join(valid.splitlines(keepends=True)[1:])
+        )
+        stream_error = self.assertTelemetryCode(
+            "telemetry_stream_invalid",
+            self.parse_data,
+            malformed,
+        )
+        price_error = self.assertTelemetryCode(
+            "telemetry_summary_invalid",
+            self.parse_data,
+            valid,
+            price=_ExplodingPriceMapping(),
+        )
+
+        for error in (stream_error, price_error):
+            self.assertIsNone(error.__cause__)
+            self.assertIsNone(error.__context__)
+            exposed = str(error) + repr(error) + repr(error.args)
+            self.assertNotIn("SENTINEL", exposed)
 
     def test_invalid_price_scalars_are_rejected_before_any_arithmetic(self):
         sentinel = _ArithmeticSentinel()
