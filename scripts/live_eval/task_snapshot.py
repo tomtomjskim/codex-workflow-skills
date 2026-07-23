@@ -421,7 +421,13 @@ def _open_root_descriptor(
                     component, _directory_flags(), dir_fd=descriptor
                 )
                 opened = os.fstat(child_descriptor)
-                if not _same_identity(observed, opened):
+                if index == len(components) - 1:
+                    if not _same_identity(observed, opened):
+                        _fail("task_source_changed")
+                elif (
+                    _stable_ancestor_identity(observed)
+                    != _stable_ancestor_identity(opened)
+                ):
                     _fail("task_source_changed")
                 if (
                     _stable_ancestor_identity(parent_metadata)

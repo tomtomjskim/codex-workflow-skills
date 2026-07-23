@@ -620,6 +620,62 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
         finally:
             os.close(descriptor)
 
+    def test_nonfinal_private_tmp_sibling_churn_is_stable(self):
+        private_temp_root = Path("/private/tmp")
+        physical_temp_root = (
+            private_temp_root
+            if private_temp_root.is_dir()
+            else Path(tempfile.gettempdir()).resolve()
+        )
+        temporary_directory = tempfile.TemporaryDirectory(
+            dir=str(physical_temp_root)
+        )
+        self.addCleanup(temporary_directory.cleanup)
+        repo = Path(temporary_directory.name).resolve() / "repo"
+        repo.mkdir(mode=0o700)
+        real_open = os.open
+        sibling_directories = []
+        descriptor = -1
+
+        def opening_with_temp_sibling_churn(path, flags, *args, **kwargs):
+            opened_descriptor = real_open(path, flags, *args, **kwargs)
+            if (
+                path == physical_temp_root.name
+                and not sibling_directories
+            ):
+                sibling_directories.append(
+                    Path(
+                        tempfile.mkdtemp(
+                            prefix="task-snapshot-sibling-",
+                            dir=str(physical_temp_root),
+                        )
+                    )
+                )
+            return opened_descriptor
+
+        try:
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot.os.open",
+                    side_effect=opening_with_temp_sibling_churn,
+                ):
+                    descriptor, metadata, ancestors = (
+                        _open_root_descriptor(repo)
+                    )
+            except TaskSnapshotError as error:
+                self.fail(
+                    "non-final ancestor sibling churn was rejected: "
+                    + str(error)
+                )
+            self.assertEqual(len(sibling_directories), 1)
+            self.assertEqual(metadata.st_ino, os.stat(repo).st_ino)
+            self.assertTrue(ancestors)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            for sibling in sibling_directories:
+                sibling.rmdir()
+
 
 class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
     def test_real_config_and_storage_operations_are_bounded(self):
