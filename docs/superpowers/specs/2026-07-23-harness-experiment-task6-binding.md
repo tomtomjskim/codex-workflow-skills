@@ -74,8 +74,13 @@ reject every symbolic link. Every ancestor is a plain directory, has
 sticky directory whose immediate child on the accepted path is
 current-user-owned and has `st_mode & 0o022 == 0`; this permits a private
 `TemporaryDirectory` below `/tmp` without trusting another user's entry.
-Capture the ordered, name-free ancestor identity records in each filesystem
-seal. On macOS, tests created below `/var` pass the physical
+Capture the ordered, name-free stable ancestor identity records in each
+filesystem seal. These records bind only `kind`, `mode`, `dev`, `ino`, `uid`,
+and `gid`. They intentionally exclude `nlink`, `size`, `mtime_ns`, and
+`ctime_ns`: unrelated sibling churn in a permitted shared sticky ancestor
+must not change the source seal. The repository root and every in-repository
+record continue to bind the full identity record. On macOS, tests created
+below `/var` pass the physical
 `/private/var/...` result explicitly.
 
 The repository root, its in-tree `.git` directory, `.git/objects`, every
@@ -195,7 +200,7 @@ Task 7 must reject a forged or mutated prepared value by revalidating the
 exact type, fields, nested values, policy, and fresh source seals.
 
 Public failures contain one fixed message and no path, config value, stdout,
-stderr, exception text, or exception context:
+stderr, exception text, exception context, or exception cause:
 
 ```text
 task_source_spec_invalid
@@ -262,7 +267,10 @@ direct no-follow lookup of its `replace` child; do not walk the ref tree.
 Enumerate at most `max_object_entries + 1` hook entries, with exactly
 `max_object_entries` accepted and one over rejected. For `worktrees` and
 `modules`, request only the first directory entry and reject immediately when
-one exists; an empty directory is accepted without a full traversal.
+one exists; an empty directory is accepted without a full traversal. The
+preflight scan of `.git/objects/pack` for `.promisor` markers also inspects at
+most `max_object_entries + 1` entries and rejects one over the cap; the later
+topology walk remains independently bounded by the same policy.
 
 ## 5. Exact local-config policy
 
@@ -274,12 +282,14 @@ git <fixed-global-prefix>
 ```
 
 The stdout is non-empty, ends in NUL, and consists of non-empty NUL-delimited
-records. Split each record at its first LF into key and value. Require exactly
-one LF, valid UTF-8, NFC, no remaining control character, an ASCII config key,
-and no duplicate key. Sort semantic records by `(key UTF-8 bytes, value UTF-8
-bytes)` for the semantic config digest. Bind both the exact raw-config digest
-and semantic digest into `local_config_digest`; retain neither raw bytes nor
-values.
+records. Require exactly one ASCII LF record separator, split at that LF into
+key and value, and then require that neither decoded field contains a
+character for which `unicodedata.category(character) == "Cc"`. CR, NUL,
+U+0085, and any additional LF therefore fail. Also require valid UTF-8, NFC,
+an ASCII config key, and no duplicate key. Sort semantic records by `(key
+UTF-8 bytes, value UTF-8 bytes)` for the semantic config digest. Bind both the
+exact raw-config digest and semantic digest into `local_config_digest`; retain
+neither raw bytes nor values.
 
 The closed allowlist is:
 
@@ -337,6 +347,16 @@ The displayed numbers are shape examples. `kind` is `directory` or `file`;
 `mode` is the exact integer `stat.S_IMODE(st_mode)`; the other values are the
 corresponding nonnegative exact `stat` integers.
 
+A stable ancestor identity record has exactly:
+
+```json
+{"dev":0,"gid":0,"ino":0,"kind":"directory","mode":493,"uid":0}
+```
+
+It is used only for the physical anchor-through-parent sequence. The displayed
+numbers are shape examples and have the same meanings as the corresponding
+full identity fields.
+
 ### 6.1 Filesystem and control seal `F`
 
 `F = D(filesystem_document)` where the document has exactly:
@@ -368,9 +388,11 @@ corresponding nonnegative exact `stat` integers.
 }
 ```
 
-The identity placeholders are exact identity records.
-`ancestor_identities` is the anchor-through-parent sequence in traversal
-order and contains no names. `expected_object_format` is `sha1` or `sha256`.
+The repository, Git-directory, objects-directory, config, and packed-refs
+identity placeholders are exact full identity records. `ancestor_identities`
+is the anchor-through-parent sequence of exact stable ancestor identity
+records in traversal order and contains no names.
+`expected_object_format` is `sha1` or `sha256`.
 When packed refs are present, its exact alternative is:
 
 ```json
@@ -633,9 +655,12 @@ Use `cwd="/"`, `shell=False`, `stdin=DEVNULL`, stdout and stderr pipes,
 with bounded reads. A stream of exactly its cap succeeds; reading one byte
 beyond a cap terminates the process and fails.
 
-Use one monotonic deadline. On timeout, cap failure, or an internal drain
-failure, send `SIGTERM` to the process group, wait at most the fixed grace
-period, send `SIGKILL` when needed, reap the process, and close every pipe.
+Use one monotonic deadline established immediately before `Popen`, so process
+spawn, reader-thread startup, draining, and leader wait all consume the same
+operation budget. On timeout, cap failure, reader-start failure, monitor
+failure, or an internal drain failure, send `SIGTERM` to the process group,
+wait at most the fixed grace period, send `SIGKILL` when needed, reap the
+process, and close every pipe.
 Nonzero exit is `task_git_failed`. Spawn, output, timeout, and operation
 failures use their fixed codes and discard raw stderr.
 
@@ -709,15 +734,20 @@ Use table-driven tests for:
 
 - valid SHA-1 and SHA-256 temporary repositories;
 - source scalar, platform, ancestor symlink, gitfile, ownership, permission,
-  and cross-device rejection before Git spawn;
+  cross-device rejection before Git spawn, and permitted sticky-ancestor
+  sibling churn without a false source-change result;
 - config/control symlink, hardlink, FIFO, include, hook, fsmonitor, filter,
   submodule, replace, alternate, promisor, partial-clone, duplicate, malformed
   record, cap, and format-pairing attacks;
 - every allowed object family plus unknown, alias, symlink, hardlink, special
   file, pairing, depth, component, path, entry, and byte boundary attacks;
+- descriptor ownership-transfer faults immediately after child `open()` and
+  before or during `fstat()`, identity comparison, and `scandir()` creation;
+  assert the open-FD set is unchanged and no descriptor is double-closed;
 - exact Git argv/environment, forbidden operations, simultaneous pipe
-  saturation, cap and cap-plus-one, timeout, process-group termination, reap,
-  pipe close, and sanitized errors;
+  saturation, cap and cap-plus-one, spawn-inclusive timeout, partial
+  reader-start and monitor failure, process-group termination, reap, pipe
+  close, and sanitized errors with null exception context and cause;
 - immutable path-private preparation, operation ordering, seal mutation,
   absence of object reads, and absence of receipts.
 
