@@ -1,5 +1,12 @@
 from collections import OrderedDict
-from dataclasses import FrozenInstanceError, dataclass, fields, replace
+from collections.abc import Mapping
+from dataclasses import (
+    FrozenInstanceError,
+    dataclass,
+    fields,
+    is_dataclass,
+    replace,
+)
 import hashlib
 from types import MappingProxyType
 import unittest
@@ -102,9 +109,37 @@ class _StringSubclass(str):
     pass
 
 
+class _IntSubclass(int):
+    pass
+
+
 class _WrongTelemetryErrorMapping(dict):
     def keys(self):
         raise TelemetryError("wrong_error")
+
+
+class _ChangingValueMapping(Mapping):
+    def __init__(self, initial, changed):
+        self._initial = dict(initial)
+        self._changed = dict(changed)
+        self._read_counts = {}
+
+    def __getitem__(self, key):
+        read_count = self._read_counts.get(key, 0)
+        self._read_counts[key] = read_count + 1
+        if read_count == 0:
+            return self._initial[key]
+        return self._changed.get(key, self._initial[key])
+
+    def __iter__(self):
+        return iter(self._initial)
+
+    def __len__(self):
+        return len(self._initial)
+
+    @property
+    def read_counts(self):
+        return dict(self._read_counts)
 
 
 class TelemetrySummaryCodecTests(unittest.TestCase):
@@ -143,6 +178,34 @@ class TelemetrySummaryCodecTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             summary.usage.input_tokens = 12
 
+    def test_type_annotations_dataclass_metadata_and_error_base_are_exact(self):
+        self.assertEqual(
+            tuple(UsageSummary.__annotations__.items()),
+            (
+                ("input_tokens", int),
+                ("cached_input_tokens", int),
+                ("output_tokens", int),
+                ("reasoning_output_tokens", int),
+                ("total_reported_tokens", int),
+                ("estimated_cost_microunits", int),
+            ),
+        )
+        self.assertEqual(
+            tuple(TelemetrySummary.__annotations__.items()),
+            (
+                ("classification", str),
+                ("response_digest", str),
+                ("usage", UsageSummary),
+                ("event_count", int),
+                ("raw_retention", str),
+            ),
+        )
+        for value_type in (UsageSummary, TelemetrySummary):
+            with self.subTest(value_type=value_type.__name__):
+                self.assertTrue(is_dataclass(value_type))
+                self.assertIs(value_type.__dataclass_params__.frozen, True)
+        self.assertEqual(TelemetryError.__bases__, (ValueError,))
+
     def test_from_document_round_trips_to_deeply_immutable_typed_value(self):
         source_document = _summary_document()
         source_price = _price_snapshot()
@@ -175,6 +238,54 @@ class TelemetrySummaryCodecTests(unittest.TestCase):
         source_document["usage"]["input_tokens"] = 999
         source_price["input_microunits_per_million"] = 999
         self.assertEqual(summary, _typed_summary())
+
+    def test_from_document_snapshots_stateful_top_level_mapping_once(self):
+        document = _ChangingValueMapping(
+            _summary_document(), {"classification": "failed"}
+        )
+
+        summary = telemetry_summary_from_document(
+            document, _price_snapshot()
+        )
+
+        self.assertEqual(summary, _typed_summary())
+        self.assertEqual(
+            document.read_counts,
+            {key: 1 for key in _SUMMARY_KEYS},
+        )
+
+    def test_from_document_snapshots_stateful_nested_usage_mapping_once(self):
+        document = _summary_document()
+        usage = _ChangingValueMapping(
+            document["usage"], {"estimated_cost_microunits": 34}
+        )
+        document["usage"] = usage
+
+        summary = telemetry_summary_from_document(
+            document, _price_snapshot()
+        )
+
+        self.assertEqual(summary, _typed_summary())
+        self.assertEqual(
+            usage.read_counts,
+            {key: 1 for key in _USAGE_KEYS},
+        )
+
+    def test_from_document_snapshots_stateful_price_mapping_once(self):
+        price = _ChangingValueMapping(
+            _price_snapshot(),
+            {"input_microunits_per_million": 3_000_000},
+        )
+
+        summary = telemetry_summary_from_document(
+            _summary_document(), price
+        )
+
+        self.assertEqual(summary, _typed_summary())
+        self.assertEqual(
+            price.read_counts,
+            {key: 1 for key in _PRICE_KEYS},
+        )
 
     def test_document_has_only_exact_typed_allowlist_keys(self):
         document = telemetry_summary_document(_typed_summary())
@@ -241,6 +352,68 @@ class TelemetrySummaryCodecTests(unittest.TestCase):
                         document,
                         _price_snapshot(),
                     )
+
+    def test_integer_subclasses_are_rejected_at_every_integer_boundary(self):
+        typed = _typed_summary()
+        for field_name in sorted(_USAGE_KEYS):
+            with self.subTest(boundary="document_usage", field=field_name):
+                document = _summary_document()
+                document["usage"][field_name] = _IntSubclass(
+                    document["usage"][field_name]
+                )
+                self.assertTelemetryInvalid(
+                    telemetry_summary_from_document,
+                    document,
+                    _price_snapshot(),
+                )
+
+            with self.subTest(boundary="typed_usage", field=field_name):
+                invalid_usage = replace(
+                    typed.usage,
+                    **{
+                        field_name: _IntSubclass(
+                            getattr(typed.usage, field_name)
+                        )
+                    }
+                )
+                invalid_summary = replace(typed, usage=invalid_usage)
+                for serializer in (
+                    telemetry_summary_document,
+                    telemetry_summary_digest,
+                ):
+                    self.assertTelemetryInvalid(
+                        serializer, invalid_summary
+                    )
+
+        document = _summary_document()
+        document["event_count"] = _IntSubclass(document["event_count"])
+        self.assertTelemetryInvalid(
+            telemetry_summary_from_document,
+            document,
+            _price_snapshot(),
+        )
+        invalid_summary = replace(
+            typed, event_count=_IntSubclass(typed.event_count)
+        )
+        for serializer in (
+            telemetry_summary_document,
+            telemetry_summary_digest,
+        ):
+            self.assertTelemetryInvalid(serializer, invalid_summary)
+
+        for rate_name in (
+            "input_microunits_per_million",
+            "cached_input_microunits_per_million",
+            "output_microunits_per_million",
+        ):
+            with self.subTest(boundary="price", field=rate_name):
+                price = _price_snapshot()
+                price[rate_name] = _IntSubclass(price[rate_name])
+                self.assertTelemetryInvalid(
+                    telemetry_summary_from_document,
+                    _summary_document(),
+                    price,
+                )
 
     def test_usage_enforces_subset_and_total_invariants(self):
         mutations = (

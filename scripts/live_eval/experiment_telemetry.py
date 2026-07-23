@@ -86,12 +86,13 @@ def _raise_invalid() -> None:
     raise TelemetryError(_ERROR)
 
 
-def _require_mapping(value: object, exact_keys: frozenset) -> ABCMapping:
+def _require_mapping(value: object, exact_keys: frozenset) -> dict:
     if not isinstance(value, ABCMapping):
         _raise_invalid()
-    if set(value.keys()) != set(exact_keys):
+    snapshot = dict(value)
+    if set(snapshot) != set(exact_keys):
         _raise_invalid()
-    return value
+    return snapshot
 
 
 def _require_non_negative_integer(value: object) -> int:
@@ -131,7 +132,7 @@ def _require_digest(value: object) -> str:
     return value
 
 
-def _validate_usage(usage: object) -> ABCMapping:
+def _validate_usage(usage: object) -> dict:
     checked = _require_mapping(usage, _USAGE_KEYS)
     for field_name in _USAGE_INTEGER_FIELDS:
         _require_non_negative_integer(checked[field_name])
@@ -147,7 +148,7 @@ def _validate_usage(usage: object) -> ABCMapping:
     return checked
 
 
-def _validate_price_snapshot(price_snapshot: object) -> ABCMapping:
+def _validate_price_snapshot(price_snapshot: object) -> dict:
     price = _require_mapping(price_snapshot, _PRICE_KEYS)
     for field_name in _PRICE_RATE_FIELDS:
         _require_non_negative_integer(price[field_name])
@@ -162,11 +163,11 @@ def _validate_price_snapshot(price_snapshot: object) -> ABCMapping:
     return price
 
 
-def _validate_summary_document(document: object) -> ABCMapping:
+def _validate_summary_document(document: object) -> dict:
     checked = _require_mapping(document, _SUMMARY_KEYS)
     _require_exact_text(checked["classification"], "completed")
     _require_digest(checked["response_digest"])
-    _validate_usage(checked["usage"])
+    checked["usage"] = _validate_usage(checked["usage"])
     _require_positive_integer(checked["event_count"])
     _require_exact_text(checked["raw_retention"], "discard")
     return checked
