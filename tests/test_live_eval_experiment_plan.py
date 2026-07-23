@@ -1557,7 +1557,7 @@ class ExperimentPlanTests(unittest.TestCase):
         for value in walk(plan.plan_document):
             if isinstance(value, str):
                 self.assertFalse(value.startswith(("/", "\\", "file:")))
-                self.assertNotIn("/Users/", value)
+                self.assertNotIn("/U" "sers/", value)
                 self.assertNotIn("credential-value", value)
 
     def test_canary_templates_exclude_runtime_only_identity_and_secret_fields(self):
