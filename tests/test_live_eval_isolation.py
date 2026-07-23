@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.live_eval.isolation import (
@@ -463,6 +464,95 @@ class IsolationTests(unittest.TestCase):
             unsealed, probe=lambda item: self.capabilities(item)
         )
         self.assertEqual(blocked.classification, "blocked_isolation")
+
+    def test_codex_home_seal_allows_atime_only_drift_during_file_read(self):
+        invocation = build_invocation(self.config)
+        skills = invocation.codex_home / "skills"
+        skills.mkdir(mode=0o700)
+        policy = skills / "SKILL.md"
+        policy.write_text("sealed\n", encoding="utf-8")
+        original_lstat = Path.lstat
+        policy_calls = []
+
+        def lstat_with_atime_drift(path):
+            metadata = original_lstat(path)
+            if path == policy:
+                policy_calls.append(True)
+                if len(policy_calls) == 2:
+                    return self._stat_view(
+                        metadata,
+                        st_atime_ns=metadata.st_atime_ns + 1,
+                    )
+            return metadata
+
+        with patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=lstat_with_atime_drift,
+        ):
+            seal = seal_codex_home(invocation.codex_home, ("skills",))
+
+        self.assertIsInstance(seal, CodexHomeSeal)
+        self.assertRegex(seal.content_digest, r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(len(policy_calls), 2)
+
+    def test_codex_home_seal_rejects_identity_or_content_metadata_drift(self):
+        for field in (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        ):
+            with self.subTest(field=field):
+                invocation = build_invocation(self.config)
+                skills = invocation.codex_home / "skills"
+                skills.mkdir(mode=0o700)
+                policy = skills / "SKILL.md"
+                policy.write_text("sealed\n", encoding="utf-8")
+                original_lstat = Path.lstat
+                policy_calls = []
+
+                def lstat_with_relevant_drift(path):
+                    metadata = original_lstat(path)
+                    if path == policy:
+                        policy_calls.append(True)
+                        if len(policy_calls) == 2:
+                            return self._stat_view(
+                                metadata,
+                                **{field: getattr(metadata, field) + 1}
+                            )
+                    return metadata
+
+                with patch.object(
+                    Path,
+                    "lstat",
+                    autospec=True,
+                    side_effect=lstat_with_relevant_drift,
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "^CODEX_HOME changed while sealing$",
+                    ):
+                        seal_codex_home(invocation.codex_home, ("skills",))
+
+    @staticmethod
+    def _stat_view(metadata, **overrides):
+        fields = {
+            "st_atime_ns": metadata.st_atime_ns,
+            "st_ctime_ns": metadata.st_ctime_ns,
+            "st_dev": metadata.st_dev,
+            "st_ino": metadata.st_ino,
+            "st_mode": metadata.st_mode,
+            "st_mtime_ns": metadata.st_mtime_ns,
+            "st_nlink": metadata.st_nlink,
+            "st_size": metadata.st_size,
+        }
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
 
     def test_sealed_codex_home_mutation_is_blocked_before_consumption(self):
         invocation = build_invocation(self.config)

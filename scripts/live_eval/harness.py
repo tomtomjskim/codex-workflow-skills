@@ -229,14 +229,6 @@ def materialize_harness_home(
             role_count=snapshot.manifest.role_count,
         )
         _verify_materialized_harness_tree(home, provisional)
-        preseal_checkout = _verify_loaded_checkout_inventory(
-            skill_repo, home, _HOME_ENTRIES
-        )
-        if (
-            preseal_checkout.result != "pass"
-            or preseal_checkout.manifest != checkout
-        ):
-            raise HarnessError("skill_checkout_mismatch")
         seal = seal_codex_home(home, tuple(sorted(_HOME_ENTRIES)))
         manifest = replace(provisional, home_digest=seal.content_digest)
     except HarnessError:
@@ -244,9 +236,6 @@ def materialize_harness_home(
     except (OSError, TypeError, ValueError):
         raise HarnessError("materialized_harness_mismatch") from None
 
-    result = verify_loaded_harness(skill_repo, home, manifest)
-    if result.result != "pass":
-        raise HarnessError(result.reason)
     try:
         if (
             _stat_token(home.parent.lstat()) != parent_token
@@ -259,12 +248,16 @@ def materialize_harness_home(
 
 
 def verify_loaded_harness(
-    skill_repo: Path, codex_home: Path, expected: HarnessManifest
+    skill_repo: Path,
+    bundle_root: Path,
+    codex_home: Path,
+    expected: HarnessManifest,
 ) -> HarnessPreflightResult:
     """Fail closed unless the fixed materialized harness still matches its manifest."""
     try:
         if not isinstance(expected, HarnessManifest):
             raise HarnessError("materialized_harness_mismatch")
+        _require_matching_source_identity(bundle_root, expected)
         home = _private_home(codex_home)
         parent_token = _stat_token(home.parent.lstat())
         home_identity = _identity_token(home.lstat())
@@ -302,6 +295,27 @@ def verify_loaded_harness(
         reason="fixed_inventory_verified",
         manifest=expected,
     )
+
+
+def _require_matching_source_identity(
+    bundle_root: Path, expected: HarnessManifest
+) -> None:
+    try:
+        actual = _load_source_snapshot(bundle_root, expected.profile).manifest
+    except (HarnessError, OSError, TypeError, ValueError):
+        raise HarnessError("source_changed") from None
+    if (
+        actual.bundle_id != expected.bundle_id
+        or actual.bundle_digest != expected.bundle_digest
+        or actual.profile != expected.profile
+        or actual.agents_hash != expected.agents_hash
+        or actual.adapter_source_hash != expected.adapter_source_hash
+        or actual.adapter_materialized_hash != expected.adapter_materialized_hash
+        or actual.common_role_hash != expected.common_role_hash
+        or actual.adapter_count != expected.adapter_count
+        or actual.role_count != expected.role_count
+    ):
+        raise HarnessError("source_changed")
 
 
 def _load_source_snapshot_sanitized(

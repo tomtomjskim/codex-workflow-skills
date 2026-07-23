@@ -505,14 +505,361 @@ class CheckoutTests(unittest.TestCase):
         self.assertFalse(leaked.exists())
         self.assertTrue(git_environments)
         for environment in git_environments:
+            self.assertEqual(environment["GIT_ATTR_NOSYSTEM"], "1")
             self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
             self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
             self.assertNotIn("HARNESS_TEST_SECRET", environment)
+
+    def test_external_core_files_are_rejected_before_git_root_lookup(self):
+        external_attributes = self.root / "external-attributes"
+        external_attributes.write_text("*.md filter=external\n", encoding="utf-8")
+        external_excludes = self.root / "external-excludes"
+        external_excludes.write_text("hidden-untracked\n", encoding="utf-8")
+        cases = (
+            ("core.attributesFile", str(external_attributes)),
+            ("core.excludesFile", str(external_excludes)),
+        )
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(key=key):
+                home = self.new_home("external-core-home-{}".format(index))
+                self.git("config", "--local", key, value)
+                try:
+                    with patch(
+                        "scripts.live_eval.checkout._require_git_root",
+                        side_effect=AssertionError("ordinary Git root lookup occurred"),
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "^unsupported local Git configuration$",
+                        ) as raised:
+                            install_checkout_skills(self.repo, home)
+                    self.assertNotIn(str(self.root), str(raised.exception))
+                finally:
+                    self.git("config", "--local", "--unset-all", key)
+
+    def test_local_filter_drivers_are_rejected_before_git_root_lookup(self):
+        cases = (
+            ("filter.external.clean", "cat"),
+            ("filter.external.smudge", "cat"),
+            ("filter.external.process", "cat"),
+            ("filter.external.required", "false"),
+        )
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(key=key):
+                home = self.new_home("filter-home-{}".format(index))
+                self.git("config", "--local", key, value)
+                try:
+                    with patch(
+                        "scripts.live_eval.checkout._require_git_root",
+                        side_effect=AssertionError("ordinary Git root lookup occurred"),
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "^unsupported local Git configuration$",
+                        ) as raised:
+                            install_checkout_skills(self.repo, home)
+                    self.assertNotIn(str(self.root), str(raised.exception))
+                finally:
+                    self.git("config", "--local", "--unset-all", key)
+
+    def test_tracked_attributes_filter_never_executes_before_policy_rejection(self):
+        sentinel = self.root / "filter-ran"
+        filter_driver = self.root / "filter-driver.sh"
+        filter_driver.write_text(
+            "#!/bin/sh\n"
+            'touch "$(dirname "$0")/filter-ran"\n'
+            "cat\n",
+            encoding="utf-8",
+        )
+        filter_driver.chmod(0o700)
+        (self.repo / ".gitattributes").write_text(
+            "skills/workflow/SKILL.md filter=external\n",
+            encoding="utf-8",
+        )
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "attributes fixture")
+        self.git(
+            "config",
+            "--local",
+            "filter.external.clean",
+            str(filter_driver),
+        )
+        try:
+            with patch(
+                "scripts.live_eval.checkout._require_git_root",
+                side_effect=AssertionError("ordinary Git root lookup occurred"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^unsupported local Git configuration$",
+                ):
+                    install_checkout_skills(self.repo, self.codex_home)
+        finally:
+            self.git(
+                "config",
+                "--local",
+                "--unset-all",
+                "filter.external.clean",
+            )
+
+        self.assertFalse(sentinel.exists())
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
+
+    def test_raw_local_include_directives_are_rejected_before_git_root_or_object_reads(self):
+        included = self.root / "included-config"
+        included.write_text(
+            '[remote "included"]\n\tpromisor = true\n',
+            encoding="utf-8",
+        )
+        cases = (
+            ("include.path", str(included)),
+            (
+                "includeIf.gitdir:{}/.path".format(self.repo),
+                str(included),
+            ),
+        )
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(key=key):
+                home = self.new_home("include-home-{}".format(index))
+                self.git("config", "--local", "--add", key, value)
+                try:
+                    with patch(
+                        "scripts.live_eval.checkout._require_git_root",
+                        side_effect=AssertionError("ordinary Git root lookup occurred"),
+                    ), patch(
+                        "scripts.live_eval.checkout._cat_blob",
+                        side_effect=AssertionError("object read occurred"),
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "^unsupported local Git configuration$",
+                        ) as raised:
+                            install_checkout_skills(self.repo, home)
+                    self.assertNotIn(str(self.root), str(raised.exception))
+                    self.assertNotIn("promisor", str(raised.exception))
+                finally:
+                    self.git("config", "--local", "--unset-all", key)
+
+    def test_external_promisor_include_is_not_expanded_by_raw_config_snapshot(self):
+        included = self.root / "external-promisor-config"
+        included.write_text(
+            '[remote "external"]\n\tpromisor = true\n',
+            encoding="utf-8",
+        )
+        self.git("config", "--local", "--add", "include.path", str(included))
+        original_run = checkout_module._run_git
+        calls = []
+
+        def capture_raw_config(repo, *arguments):
+            calls.append(arguments)
+            return original_run(repo, *arguments)
+
+        try:
+            with patch(
+                "scripts.live_eval.checkout._run_git",
+                side_effect=capture_raw_config,
+            ), patch(
+                "scripts.live_eval.checkout._require_git_root",
+                side_effect=AssertionError("ordinary Git root lookup occurred"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^unsupported local Git configuration$",
+                ):
+                    install_checkout_skills(self.repo, self.codex_home)
+        finally:
+            self.git("config", "--local", "--unset-all", "include.path")
+
+        self.assertEqual(
+            calls,
+            [("config", "--local", "--no-includes", "--null", "--list")],
+        )
+
+    def test_worktree_config_extension_is_rejected_before_git_root_lookup(self):
+        self.git(
+            "config",
+            "--local",
+            "extensions.worktreeConfig",
+            "true",
+        )
+        try:
+            with patch(
+                "scripts.live_eval.checkout._require_git_root",
+                side_effect=AssertionError("ordinary Git root lookup occurred"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^unsupported local Git configuration$",
+                ):
+                    install_checkout_skills(self.repo, self.codex_home)
+        finally:
+            self.git(
+                "config",
+                "--local",
+                "--unset-all",
+                "extensions.worktreeConfig",
+            )
+
+    def test_local_config_mutation_during_snapshot_is_rejected(self):
+        original_cat_blob = checkout_module._cat_blob
+        mutated = []
+
+        def mutate_after_object_read(repo, oid):
+            content = original_cat_blob(repo, oid)
+            if not mutated:
+                self.git("config", "--local", "harness.snapshot", "changed")
+                mutated.append(True)
+            return content
+
+        try:
+            with patch(
+                "scripts.live_eval.checkout._cat_blob",
+                side_effect=mutate_after_object_read,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^local Git configuration changed$",
+                ) as raised:
+                    install_checkout_skills(self.repo, self.codex_home)
+        finally:
+            self.git("config", "--local", "--unset-all", "harness.snapshot")
+
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
+        self.assertNotIn(str(self.root), str(raised.exception))
+
+    def test_forbidden_config_mutation_is_normalized_as_local_config_change(self):
+        original_cat_blob = checkout_module._cat_blob
+        included = self.root / "late-included-config"
+        included.write_text(
+            '[remote "late"]\n\tpromisor = true\n',
+            encoding="utf-8",
+        )
+        mutated = []
+
+        def add_forbidden_key_after_object_read(repo, oid):
+            content = original_cat_blob(repo, oid)
+            if not mutated:
+                self.git(
+                    "config",
+                    "--local",
+                    "include.path",
+                    str(included),
+                )
+                mutated.append(True)
+            return content
+
+        try:
+            with patch(
+                "scripts.live_eval.checkout._cat_blob",
+                side_effect=add_forbidden_key_after_object_read,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^local Git configuration changed$",
+                ):
+                    install_checkout_skills(self.repo, self.codex_home)
+        finally:
+            self.git(
+                "config",
+                "--local",
+                "--unset-all",
+                "include.path",
+            )
+
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
+
+    def test_local_config_mutation_before_publication_is_rejected(self):
+        original_identity = checkout_module._require_install_identity
+        mutated = []
+
+        def mutate_before_identity_check(repo, captured):
+            if not mutated:
+                self.git("config", "--local", "harness.publication", "changed")
+                mutated.append(True)
+            return original_identity(repo, captured)
+
+        try:
+            with patch(
+                "scripts.live_eval.checkout._require_install_identity",
+                side_effect=mutate_before_identity_check,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^local Git configuration changed$",
+                ) as raised:
+                    install_checkout_skills(self.repo, self.codex_home)
+        finally:
+            self.git("config", "--local", "--unset-all", "harness.publication")
+
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
+        self.assertNotIn(str(self.root), str(raised.exception))
+
+    def test_local_config_mutation_during_publication_identity_git_reads_is_rejected(self):
+        original_identity = checkout_module._require_install_identity
+        original_git_text = checkout_module._git_text
+        checking_identity = []
+        mutated = []
+
+        def mutate_after_identity_git_read(repo, *arguments):
+            value = original_git_text(repo, *arguments)
+            if checking_identity and not mutated:
+                self.git(
+                    "config",
+                    "--local",
+                    "harness.identity-read",
+                    "changed",
+                )
+                mutated.append(True)
+            return value
+
+        def check_identity(repo, captured):
+            checking_identity.append(True)
+            try:
+                return original_identity(repo, captured)
+            finally:
+                checking_identity.pop()
+
+        try:
+            with patch(
+                "scripts.live_eval.checkout._require_install_identity",
+                side_effect=check_identity,
+            ), patch(
+                "scripts.live_eval.checkout._git_text",
+                side_effect=mutate_after_identity_git_read,
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "^local Git configuration changed$",
+                ):
+                    install_checkout_skills(self.repo, self.codex_home)
+        finally:
+            self.git("config", "--local", "--unset-all", "harness.identity-read")
+
+        self.assertEqual(tuple(self.codex_home.iterdir()), ())
+
+    def test_raw_config_fixture_rejects_empty_remote_promisor_key(self):
+        raw = subprocess.CompletedProcess(
+            args=("git", "config"),
+            returncode=0,
+            stdout=b"remote..promisor\nfalse\0",
+            stderr=b"",
+        )
+
+        with patch(
+            "scripts.live_eval.checkout._run_git",
+            return_value=raw,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "^unsupported partial or promisor Git repository$",
+            ):
+                checkout_module._raw_local_config_snapshot(self.repo)
 
     def test_partial_or_promisor_repository_is_rejected_before_object_reads(self):
         cases = (
             ("extensions.partialClone", "origin"),
             ("remote.origin.promisor", "true"),
+            ("remote.backup.promisor", "false"),
         )
         for index, (key, value) in enumerate(cases):
             with self.subTest(key=key):

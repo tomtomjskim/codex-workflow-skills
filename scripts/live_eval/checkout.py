@@ -41,6 +41,10 @@ _GIT_CONFIG_ARGUMENTS = (
     "-c",
     "core.fsmonitor=false",
     "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
     "core.hooksPath=/dev/null",
     "-c",
     "submodule.recurse=false",
@@ -84,10 +88,17 @@ class _GitEntry:
 
 
 @dataclass(frozen=True)
+class _LocalConfigSnapshot:
+    digest: str
+    keys: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _CheckoutSnapshot:
     manifest: CheckoutManifest
     entries: Mapping[str, Tuple[_GitEntry, ...]]
     blobs: Mapping[str, bytes]
+    local_config: _LocalConfigSnapshot
 
 
 def canonical_name_key(name: str) -> str:
@@ -130,7 +141,7 @@ def install_checkout_skills(repo: Path, codex_home: Path) -> CheckoutManifest:
         _materialize_snapshot(staged, snapshot)
         _verify_materialized(staged, snapshot, directory_mode=0o700)
         _fsync_tree(staged)
-        _require_install_identity(root, snapshot.manifest)
+        _require_install_identity(root, snapshot)
         _publish_directory_noreplace(staged, published)
         staging_published = True
         published_token = staged_token
@@ -193,8 +204,8 @@ def _verify_loaded_checkout_inventory(
 
 
 def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
+    local_config = _raw_local_config_snapshot(repo)
     _require_git_root(repo)
-    _reject_partial_or_promisor_repository(repo)
     if require_clean and _git_text(
         repo,
         "status",
@@ -245,6 +256,7 @@ def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
         "--ignore-submodules=all",
     ):
         raise ValueError("repository checkout changed while capturing snapshot")
+    _require_matching_local_config(repo, local_config)
 
     manifest = CheckoutManifest(
         object_format=object_format,
@@ -259,6 +271,7 @@ def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
         manifest=manifest,
         entries=MappingProxyType(entries),
         blobs=MappingProxyType(blobs),
+        local_config=local_config,
     )
 
 
@@ -719,9 +732,13 @@ def _private_empty_home(path: Path) -> Path:
     return home
 
 
-def _require_install_identity(repo: Path, manifest: CheckoutManifest) -> None:
+def _require_install_identity(repo: Path, snapshot: _CheckoutSnapshot) -> None:
+    _require_matching_local_config(repo, snapshot.local_config)
     tree_oid = _git_text(repo, "rev-parse", "--verify", "HEAD^{tree}")
-    if _domain_oid(manifest.object_format, tree_oid) != manifest.tree_hash:
+    if (
+        _domain_oid(snapshot.manifest.object_format, tree_oid)
+        != snapshot.manifest.tree_hash
+    ):
         raise ValueError("HEAD changed before checkout publication")
     if _git_text(
         repo,
@@ -731,6 +748,7 @@ def _require_install_identity(repo: Path, manifest: CheckoutManifest) -> None:
         "--ignore-submodules=all",
     ):
         raise ValueError("repository checkout changed before publication")
+    _require_matching_local_config(repo, snapshot.local_config)
 
 
 def _private_home(path: Path) -> Path:
@@ -786,6 +804,7 @@ def _git_bytes(repo: Path, *arguments: str) -> bytes:
 
 def _run_git(repo: Path, *arguments: str) -> subprocess.CompletedProcess:
     environment = {
+        "GIT_ATTR_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_NO_LAZY_FETCH": "1",
@@ -807,33 +826,85 @@ def _run_git(repo: Path, *arguments: str) -> subprocess.CompletedProcess:
     return result
 
 
-def _reject_partial_or_promisor_repository(repo: Path) -> None:
-    partial_clone = _local_config_query(repo, "--get", "extensions.partialClone")
-    promisor = _local_config_query(
-        repo,
-        "--null",
-        "--bool",
-        "--get-regexp",
-        r"^remote\..*\.promisor$",
-    )
-    if partial_clone is not None or (
-        promisor is not None
-        and any(
-            record.endswith(b"\ntrue")
-            for record in promisor.split(b"\0")
-            if record
-        )
+def _raw_local_config_snapshot(repo: Path) -> _LocalConfigSnapshot:
+    snapshot = _capture_raw_local_config_snapshot(repo)
+    if any(
+        _is_include_config_key(key)
+        or key.casefold() == "extensions.worktreeconfig"
+        or _is_external_git_behavior_config_key(key)
+        for key in snapshot.keys
     ):
+        raise ValueError("unsupported local Git configuration")
+    if any(_is_partial_or_promisor_config_key(key) for key in snapshot.keys):
         raise ValueError("unsupported partial or promisor Git repository")
+    return snapshot
 
 
-def _local_config_query(repo: Path, *arguments: str) -> Optional[bytes]:
-    result = _run_git(repo, "config", "--local", "--no-includes", *arguments)
-    if result.returncode == 1:
-        return None
+def _capture_raw_local_config_snapshot(repo: Path) -> _LocalConfigSnapshot:
+    result = _run_git(
+        repo,
+        "config",
+        "--local",
+        "--no-includes",
+        "--null",
+        "--list",
+    )
     if result.returncode != 0:
         raise ValueError("local Git configuration inspection failed")
-    return result.stdout
+    keys = []
+    try:
+        for record in result.stdout.split(b"\0"):
+            if not record:
+                continue
+            key, separator, _value = record.partition(b"\n")
+            if not separator or not key:
+                raise ValueError("malformed local Git configuration")
+            keys.append(key.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("local Git configuration inspection failed") from None
+    snapshot = _LocalConfigSnapshot(
+        digest=_sha256(result.stdout),
+        keys=tuple(keys),
+    )
+    return snapshot
+
+
+def _is_include_config_key(key: str) -> bool:
+    normalized = key.casefold()
+    return (
+        normalized == "include.path"
+        or (
+            normalized.startswith("includeif.")
+            and normalized.endswith(".path")
+        )
+    )
+
+
+def _is_partial_or_promisor_config_key(key: str) -> bool:
+    normalized = key.casefold()
+    return normalized == "extensions.partialclone" or (
+        normalized.startswith("remote.")
+        and normalized.endswith(".promisor")
+    )
+
+
+def _is_external_git_behavior_config_key(key: str) -> bool:
+    normalized = key.casefold()
+    return normalized in {"core.attributesfile", "core.excludesfile"} or (
+        normalized.startswith("filter.")
+        and normalized.endswith((".clean", ".smudge", ".process", ".required"))
+    )
+
+
+def _require_matching_local_config(
+    repo: Path, expected: _LocalConfigSnapshot
+) -> None:
+    try:
+        current = _capture_raw_local_config_snapshot(repo)
+    except (OSError, TypeError, ValueError):
+        raise ValueError("local Git configuration changed") from None
+    if current != expected:
+        raise ValueError("local Git configuration changed")
 
 
 def _require_exact_names(directory: Path, expected: set, label: str) -> None:

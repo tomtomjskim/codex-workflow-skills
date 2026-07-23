@@ -316,6 +316,8 @@ These sources are not broad-scanned by default. They are used only when relevant
 
 ## Validation
 
+During implementation, run the smallest focused test; run `./scripts/validate_repo.sh` at branch completion or release, not after every edit.
+
 Run the repository validation script for the standard public-release checks:
 
 ```bash

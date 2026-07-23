@@ -365,7 +365,10 @@ def run_harness_dry_run(request: HarnessDryRunRequest) -> HarnessDryRunResult:
             codex_home,
         )
         verification = verify_loaded_harness(
-            request.skill_repo, codex_home, manifest
+            request.skill_repo,
+            request.bundle_root,
+            codex_home,
+            manifest,
         )
         if (
             verification.classification == "ready"

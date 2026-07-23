@@ -14,6 +14,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 import scripts.run_live_eval as live_runner
+import scripts.live_eval.checkout as checkout_module
 from scripts.live_eval.isolation import CliCapabilities
 from scripts.live_eval.isolation import EvalConfig, build_invocation
 from scripts.live_eval.budget import BudgetPolicy
@@ -1326,6 +1327,63 @@ class RunnerTests(unittest.TestCase):
                 payloads["lean"]["manifest"][name],
             )
 
+    def test_harness_dry_run_uses_one_install_and_one_final_verification_snapshot(self):
+        bundle = self._create_harness_bundle_fixture()
+        request = live_runner.HarnessDryRunRequest(
+            planning_request=EvalRequest.dry_run(
+                tags=("workflow-intake",), scenario_path=self.scenarios
+            ),
+            profile="current",
+            bundle_root=bundle,
+            skill_repo=self.repo,
+        )
+
+        with mock.patch(
+            "scripts.live_eval.checkout._checkout_snapshot",
+            wraps=checkout_module._checkout_snapshot,
+        ) as snapshots:
+            result = live_runner.run_harness_dry_run(request)
+
+        self.assertEqual(result.status, "harness_preflight_only")
+        self.assertEqual(result.reason, "fixed_inventory_verified")
+        self.assertEqual(result.model_calls, 0)
+        self.assertEqual(snapshots.call_count, 2)
+
+    def test_harness_source_mutation_between_materialization_and_verification_blocks(self):
+        bundle = self._create_harness_bundle_fixture()
+        materialize = live_runner.materialize_harness_home
+
+        def materialize_then_mutate_source(
+            skill_repo, bundle_root, profile, codex_home
+        ):
+            manifest = materialize(skill_repo, bundle_root, profile, codex_home)
+            source = bundle_root / "profiles" / profile / "AGENTS.md"
+            source.write_text("# Mutated\nSource changed.\n", encoding="utf-8")
+            source.chmod(0o600)
+            return manifest
+
+        request = live_runner.HarnessDryRunRequest(
+            planning_request=EvalRequest.dry_run(
+                tags=("workflow-intake",), scenario_path=self.scenarios
+            ),
+            profile="current",
+            bundle_root=bundle,
+            skill_repo=self.repo,
+        )
+        with mock.patch(
+            "scripts.run_live_eval.materialize_harness_home",
+            side_effect=materialize_then_mutate_source,
+        ):
+            result = live_runner.run_harness_dry_run(request)
+
+        self.assertEqual(result.status, "blocked_isolation")
+        self.assertEqual(result.materialization_result, "blocked")
+        self.assertEqual(result.reason, "source_changed")
+        self.assertEqual(result.model_conformance, "not_run")
+        self.assertEqual(result.model_calls, 0)
+        self.assertIsNone(result.manifest)
+        self.assertNotIn(str(self.root), repr(result))
+
     def test_harness_tamper_is_blocked_and_never_serialized_as_pass(self):
         bundle = self._create_harness_bundle_fixture()
         materialize = live_runner.materialize_harness_home
@@ -1727,6 +1785,12 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--harness-profile", readme)
         self.assertIn("model_calls=0", readme)
         self.assertIn("model_conformance=not_run", readme)
+        self.assertIn(
+            "During implementation, run the smallest focused test; run "
+            "`./scripts/validate_repo.sh` at branch completion or release, "
+            "not after every edit.",
+            readme,
+        )
         self.assertIn("harness materialization preflight", report)
         self.assertIn("live model execution: not_run", report)
 

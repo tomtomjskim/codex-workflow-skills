@@ -403,11 +403,44 @@ class HarnessTests(unittest.TestCase):
                     extra.write_text("x", encoding="utf-8")
                     extra.chmod(0o400)
 
-                result = verify_loaded_harness(self.repo, home, manifest)
+                result = verify_loaded_harness(
+                    self.repo, self.bundle, home, manifest
+                )
 
                 self.assertEqual(result.classification, "blocked_isolation")
                 self.assertEqual(result.result, "blocked")
                 self.assertEqual(result.reason, "materialized_harness_mismatch")
+                self.assertIsNone(result.manifest)
+                self.assertSanitized(result)
+
+    def test_source_identity_fields_cannot_be_forged_for_a_verified_home(self):
+        home, manifest = self._materialize()
+        replacements = (
+            dataclasses.replace(manifest, bundle_id="forged-v1"),
+            dataclasses.replace(manifest, profile="lean"),
+            dataclasses.replace(
+                manifest,
+                bundle_digest="sha256:" + ("0" * 64),
+            ),
+            dataclasses.replace(
+                manifest,
+                adapter_source_hash="sha256:" + ("0" * 64),
+            ),
+        )
+
+        for forged in replacements:
+            with self.subTest(forged=forged):
+                result = verify_loaded_harness(
+                    self.repo,
+                    self.bundle,
+                    home,
+                    forged,
+                )
+
+                self.assertEqual(result.classification, "blocked_isolation")
+                self.assertEqual(result.result, "blocked")
+                self.assertEqual(result.reason, "source_changed")
+                self.assertNotEqual(result.reason, "fixed_inventory_verified")
                 self.assertIsNone(result.manifest)
                 self.assertSanitized(result)
 
@@ -418,7 +451,10 @@ class HarnessTests(unittest.TestCase):
         skill.write_text("tampered\n", encoding="utf-8")
         skill.chmod(0o444)
         checkout_result = verify_loaded_harness(
-            self.repo, checkout_home, checkout_manifest
+            self.repo,
+            self.bundle,
+            checkout_home,
+            checkout_manifest,
         )
         self.assertEqual(checkout_result.reason, "skill_checkout_mismatch")
 
@@ -426,13 +462,20 @@ class HarnessTests(unittest.TestCase):
         wrong_seal = dataclasses.replace(
             seal_manifest, home_digest="sha256:" + ("0" * 64)
         )
-        seal_result = verify_loaded_harness(self.repo, seal_home, wrong_seal)
+        seal_result = verify_loaded_harness(
+            self.repo,
+            self.bundle,
+            seal_home,
+            wrong_seal,
+        )
         self.assertEqual(seal_result.reason, "home_seal_mismatch")
 
     def test_verified_manifest_is_returned_without_path_or_content_leakage(self):
         home, manifest = self._materialize()
 
-        result = verify_loaded_harness(self.repo, home, manifest)
+        result = verify_loaded_harness(
+            self.repo, self.bundle, home, manifest
+        )
 
         self.assertEqual(result.classification, "ready")
         self.assertEqual(result.result, "pass")

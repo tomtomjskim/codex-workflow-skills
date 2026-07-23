@@ -671,7 +671,7 @@ def _directory_content_digest(root: Path) -> str:
         elif stat.S_ISREG(metadata.st_mode):
             kind = b"file"
             content = path.read_bytes()
-            if path.lstat() != metadata:
+            if _seal_metadata_token(path.lstat()) != _seal_metadata_token(metadata):
                 raise ValueError("CODEX_HOME changed while sealing")
         else:
             raise ValueError("CODEX_HOME seal accepts only files and directories")
@@ -680,6 +680,20 @@ def _directory_content_digest(root: Path) -> str:
         digest.update(oct(stat.S_IMODE(metadata.st_mode)).encode("ascii") + b"\0")
         digest.update(len(content).to_bytes(8, "big") + content)
     return "sha256:" + digest.hexdigest()
+
+
+def _seal_metadata_token(
+    metadata: os.stat_result,
+) -> Tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _path_integrity_is_intact(
