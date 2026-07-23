@@ -488,12 +488,73 @@ class CheckoutTests(unittest.TestCase):
         )
         hook.chmod(0o700)
         self.git("config", "core.fsmonitor", str(hook))
+        original_run = checkout_module.subprocess.run
+        git_environments = []
 
-        with patch.dict(os.environ, {"HARNESS_TEST_SECRET": "do-not-leak"}):
+        def capture_git_environment(*arguments, **keywords):
+            git_environments.append(dict(keywords["env"]))
+            return original_run(*arguments, **keywords)
+
+        with patch.dict(os.environ, {"HARNESS_TEST_SECRET": "do-not-leak"}), patch(
+            "scripts.live_eval.checkout.subprocess.run",
+            side_effect=capture_git_environment,
+        ):
             install_checkout_skills(self.repo, self.codex_home)
 
         self.assertFalse(sentinel.exists())
         self.assertFalse(leaked.exists())
+        self.assertTrue(git_environments)
+        for environment in git_environments:
+            self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+            self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+            self.assertNotIn("HARNESS_TEST_SECRET", environment)
+
+    def test_partial_or_promisor_repository_is_rejected_before_object_reads(self):
+        cases = (
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.promisor", "true"),
+        )
+        for index, (key, value) in enumerate(cases):
+            with self.subTest(key=key):
+                home = self.new_home("partial-home-{}".format(index))
+                if key == "extensions.partialClone":
+                    self.git("config", "core.repositoryFormatVersion", "1")
+                self.git("config", key, value)
+                try:
+                    with patch(
+                        "scripts.live_eval.checkout._cat_blob",
+                        side_effect=AssertionError("object read occurred"),
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "^unsupported partial or promisor Git repository$",
+                        ):
+                            install_checkout_skills(self.repo, home)
+                finally:
+                    self.git("config", "--unset-all", key)
+                    if key == "extensions.partialClone":
+                        self.git("config", "core.repositoryFormatVersion", "0")
+
+    def test_replace_ref_cannot_change_materialized_head_blob_bytes(self):
+        source = self.repo / "skills/workflow/SKILL.md"
+        original = source.read_bytes()
+        original_oid = self.git("rev-parse", "HEAD:skills/workflow/SKILL.md")
+        replacement = subprocess.run(
+            ("git", "hash-object", "-w", "--stdin"),
+            cwd=str(self.repo),
+            check=True,
+            input=b"replacement bytes\n",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+        self.git("replace", original_oid, replacement)
+
+        install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertEqual(
+            (self.codex_home / "skills/workflow/SKILL.md").read_bytes(),
+            original,
+        )
 
 
 if __name__ == "__main__":

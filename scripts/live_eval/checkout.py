@@ -194,6 +194,7 @@ def _verify_loaded_checkout_inventory(
 
 def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
     _require_git_root(repo)
+    _reject_partial_or_promisor_repository(repo)
     if require_clean and _git_text(
         repo,
         "status",
@@ -773,9 +774,22 @@ def _git_text(repo: Path, *arguments: str) -> str:
 
 
 def _git_bytes(repo: Path, *arguments: str) -> bytes:
+    result = _run_git(repo, *arguments)
+    if result.returncode != 0:
+        raise ValueError(
+            "Git object lookup failed: {}".format(
+                result.stderr.decode("utf-8", errors="replace").strip()
+            )
+        )
+    return result.stdout
+
+
+def _run_git(repo: Path, *arguments: str) -> subprocess.CompletedProcess:
     environment = {
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_TERMINAL_PROMPT": "0",
         "LANG": "C",
@@ -790,12 +804,35 @@ def _git_bytes(repo: Path, *arguments: str) -> bytes:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    if result.returncode != 0:
-        raise ValueError(
-            "Git object lookup failed: {}".format(
-                result.stderr.decode("utf-8", errors="replace").strip()
-            )
+    return result
+
+
+def _reject_partial_or_promisor_repository(repo: Path) -> None:
+    partial_clone = _local_config_query(repo, "--get", "extensions.partialClone")
+    promisor = _local_config_query(
+        repo,
+        "--null",
+        "--bool",
+        "--get-regexp",
+        r"^remote\..*\.promisor$",
+    )
+    if partial_clone is not None or (
+        promisor is not None
+        and any(
+            record.endswith(b"\ntrue")
+            for record in promisor.split(b"\0")
+            if record
         )
+    ):
+        raise ValueError("unsupported partial or promisor Git repository")
+
+
+def _local_config_query(repo: Path, *arguments: str) -> Optional[bytes]:
+    result = _run_git(repo, "config", "--local", "--no-includes", *arguments)
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        raise ValueError("local Git configuration inspection failed")
     return result.stdout
 
 

@@ -105,16 +105,17 @@ class HarnessTests(unittest.TestCase):
             "profiles/lean/AGENTS.md": "# Lean\nUse the compact policy.\n",
         }
         for role in EXPECTED_ROLES:
-            description = (
-                'description = "Uses ~/.agents/common-agents/{}.md."\n'.format(role)
-                if role == "developer"
-                else ""
-            )
             files["shared/agents/{}.toml".format(role)] = (
                 'name = "{}"\n'.format(role)
-                + description
-                + 'developer_instructions = "Before acting, read and follow '
-                '`/private/fixture/.agents/common-agents/{}.md`."\n'.format(role)
+                + 'description = "Common {} role. Uses '
+                '~/.agents/common-agents/{}.md."\n'.format(role, role)
+                + 'model_reasoning_effort = "medium"\n'
+                + 'developer_instructions = """\n'
+                + "# {} Adapter\n\n".format(role)
+                + 'Before acting, read and follow '
+                '`/private/fixture/.agents/common-agents/{}.md`.\n\n'.format(role)
+                + "Project-local instructions override this adapter.\n"
+                + '"""\n'
             )
             files["shared/common-agents/{}.md".format(role)] = (
                 "# {}\nRole policy.\n".format(role)
@@ -192,6 +193,22 @@ class HarnessTests(unittest.TestCase):
             ),
         )
         self.assertEqual(materialized.count("~/.agents/common-agents/developer.md"), 2)
+
+    def test_realistic_multiline_adapter_schema_is_accepted(self):
+        manifest = load_harness_source(self.bundle, "current")
+
+        self.assertEqual(manifest.adapter_count, len(EXPECTED_ROLES))
+
+    def test_trailing_adapter_content_is_rejected(self):
+        adapter = self.bundle / "shared/agents/developer.toml"
+        adapter.write_text(
+            adapter.read_text(encoding="utf-8") + 'unexpected = "value"\n',
+            encoding="utf-8",
+        )
+        adapter.chmod(0o600)
+
+        with self.assertRaisesRegex(ValueError, "^invalid_bundle$"):
+            load_harness_source(self.bundle, "current")
 
     def test_missing_duplicate_and_wrong_role_includes_are_rejected(self):
         adapter = self.bundle / "shared/agents/developer.toml"

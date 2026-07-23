@@ -10,11 +10,6 @@ import stat
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Tuple
 
-try:
-    import tomllib as _tomllib
-except ImportError:  # pragma: no cover - exercised by the Python 3.9 test runtime
-    _tomllib = None
-
 from scripts.live_eval.checkout import (
     CheckoutManifest,
     _verify_loaded_checkout_inventory,
@@ -62,6 +57,20 @@ _READ_ONLY_DIRECTORY_MODE = 0o555
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _BUNDLE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _BACKTICK_PATH_PATTERN = re.compile(r"`([^`\r\n]*)`")
+_ADAPTER_SCHEMA_PATTERN = re.compile(
+    r"\A(?:[ \t]*\r?\n)*"
+    r"[ \t]*name[ \t]*=[ \t]*(?P<name>\"(?:\\.|[^\"\\\r\n])*\")"
+    r"[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    r"[ \t]*description[ \t]*=[ \t]*"
+    r"(?P<description>\"(?:\\.|[^\"\\\r\n])*\")"
+    r"[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    r"[ \t]*model_reasoning_effort[ \t]*=[ \t]*"
+    r"(?P<effort>\"(?:\\.|[^\"\\\r\n])*\")"
+    r"[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+    r"[ \t]*developer_instructions[ \t]*=[ \t]*\"\"\""
+    r"(?P<instructions>.*?)\"\"\"[ \t]*(?:\r?\n)?\Z",
+    re.DOTALL,
+)
 _REASONS = frozenset(
     {
         "fixed_inventory_verified",
@@ -645,22 +654,34 @@ def _rewrite_adapter(name: str, content: bytes) -> bytes:
 
 
 def _parse_toml(text: str) -> Mapping[str, object]:
-    if _tomllib is not None:
-        value = _tomllib.loads(text)
-        if not isinstance(value, dict):
-            raise ValueError("invalid TOML")
-        return value
-    # Python 3.9 compatibility for the two required top-level string fields.
-    result = {}
-    for key in ("name", "developer_instructions"):
-        matches = re.findall(
-            r"(?m)^{}\s*=\s*(\"(?:\\.|[^\"\\])*\")\s*(?:#.*)?$".format(key),
-            text,
-        )
-        if len(matches) != 1:
-            raise ValueError("invalid TOML")
-        result[key] = json.loads(matches[0])
-    return result
+    match = _ADAPTER_SCHEMA_PATTERN.fullmatch(text)
+    if match is None:
+        raise ValueError("invalid adapter schema")
+    name = json.loads(match.group("name"))
+    description = json.loads(match.group("description"))
+    effort = json.loads(match.group("effort"))
+    instructions = match.group("instructions")
+    if instructions.startswith("\r\n"):
+        instructions = instructions[2:]
+    elif instructions.startswith("\n"):
+        instructions = instructions[1:]
+    if (
+        not isinstance(name, str)
+        or not name
+        or not isinstance(description, str)
+        or not description
+        or effort not in ("low", "medium", "high")
+        or not instructions
+    ):
+        raise ValueError("invalid adapter fields")
+    return MappingProxyType(
+        {
+            "name": name,
+            "description": description,
+            "model_reasoning_effort": effort,
+            "developer_instructions": instructions,
+        }
+    )
 
 
 def _validate_absolute_posix_path(value: str) -> None:

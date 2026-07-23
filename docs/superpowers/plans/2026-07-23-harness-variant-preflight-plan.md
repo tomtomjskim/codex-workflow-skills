@@ -6,7 +6,7 @@
 
 **Design source:** The approved research and experiment design in the personal wiki, plus independent local runner audit and adversarial review. This plan implements experiment plumbing only. It does not select a winning harness, edit global configuration, or claim model-quality evidence.
 
-**Architecture:** Keep `run_eval()` and its legacy dry-run/live JSON contract unchanged. Add a separate harness module that reads only a fixed bundle inventory, safely snapshots `AGENTS.md` and shared role files, rewrites the one expected absolute role include to an isolated-home include, installs the existing three clean-HEAD skills, seals the resulting home, and returns path-free digests. Git object snapshot subprocesses are allowed only through a filtered environment and disabled system/global config, fsmonitor, hooks, and recursive submodules; Codex/model subprocesses remain forbidden. Expose the core through an all-or-none CLI option group that is valid only with `--dry-run`; the result must always report `model_calls=0` and `model_conformance=not_run`.
+**Architecture:** Keep `run_eval()` and its legacy dry-run/live JSON contract unchanged. Add a separate harness module that reads only a fixed bundle inventory, safely snapshots `AGENTS.md` and shared role files, rewrites the one expected absolute role include to an isolated-home include, installs the existing three clean-HEAD skills, seals the resulting home, and returns path-free digests. Git object snapshot subprocesses are allowed only through a filtered environment with lazy fetch and replacement objects disabled, rejected partial/promisor repositories, and disabled system/global config, fsmonitor, hooks, and recursive submodules; Codex/model subprocesses remain forbidden. Expose the core through an all-or-none CLI option group that is valid only with `--dry-run`; the result must always report `model_calls=0` and `model_conformance=not_run`.
 
 **Technology:** Python standard library, existing `scripts.live_eval.checkout` Git-object materializer, existing isolation seal, `unittest`, repository validation script.
 
@@ -57,6 +57,8 @@ Cover at minimum:
 - returned manifests and exceptions do not expose absolute source paths or source contents;
 - matched role-pair deletion/addition, invalid bundle IDs, identical profile hashes, and same-ID/different-content bundle digests are covered;
 - malicious local Git fsmonitor configuration is disabled, parent secrets are not forwarded, and materialized checkout hardlinks are rejected;
+- realistic four-field multiline adapters are accepted identically on Python 3.9 and 3.12, while unknown or trailing adapter content is rejected;
+- partial/promisor repositories are rejected before object reads, lazy fetch is disabled, and replacement refs cannot alter materialized HEAD bytes;
 
 Run:
 
@@ -77,7 +79,7 @@ Expected: fail because the harness module and fixed harness verifier do not exis
 - Compute a canonical skill-routing digest from plugin hash, skill names, and materialized skill hashes.
 - Return immutable source/materialized manifests containing no `Path` fields.
 - Fail closed with sanitized reason codes.
-- Run Git with a minimal environment, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, and command-local disabling of fsmonitor, hooks, and recursive submodules.
+- Run Git with a minimal environment, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_NO_LAZY_FETCH=1`, `GIT_NO_REPLACE_OBJECTS=1`, `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, and command-local disabling of fsmonitor, hooks, and recursive submodules. Inspect only local config without includes and reject `extensions.partialClone` or true `remote.*.promisor` before object reads.
 - Bind the source with `bundle_digest`, require different current/lean agent hashes, and pin the exact 16-role inventory.
 - Compare harness parent/home identities around materialization and verification. Full fd-based seal walking and defense against an active same-UID process replacing a parent directory during the final seal are explicitly out of scope; the boundary is a private `0700` owned temporary home followed by immediate verification.
 
