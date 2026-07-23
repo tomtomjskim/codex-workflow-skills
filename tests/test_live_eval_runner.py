@@ -1400,6 +1400,95 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(replacements[0][1].is_dir())
         self.assertNotIn(str(self.root), repr(result))
 
+    def test_harness_cleanup_preserves_replaced_descendant_directory(self):
+        bundle = self._create_harness_bundle_fixture()
+        snapshot = live_runner._snapshot_harness_cleanup_tree
+        replacement_target = self.root / "replacement-directory-target"
+        replacement_target.mkdir(mode=0o700)
+        marker = replacement_target / "marker"
+        marker.write_text("preserve\n", encoding="utf-8")
+        marker.chmod(0o600)
+        replacements = []
+
+        def replace_after_snapshot(
+            temp_root, root_identity, codex_home, home_identity
+        ):
+            captured = snapshot(
+                temp_root, root_identity, codex_home, home_identity
+            )
+            target = codex_home / "agents"
+            moved = self.root / "preserved-agents"
+            target.chmod(0o700)
+            target.rename(moved)
+            target.symlink_to(replacement_target, target_is_directory=True)
+            replacements.append((target, moved))
+            return captured
+
+        request = live_runner.HarnessDryRunRequest(
+            planning_request=EvalRequest.dry_run(
+                tags=("workflow-intake",), scenario_path=self.scenarios
+            ),
+            profile="current",
+            bundle_root=bundle,
+            skill_repo=self.repo,
+        )
+        with mock.patch(
+            "scripts.run_live_eval._snapshot_harness_cleanup_tree",
+            side_effect=replace_after_snapshot,
+        ):
+            result = live_runner.run_harness_dry_run(request)
+
+        self.assertEqual(result.status, "blocked_cleanup")
+        self.assertEqual(result.materialization_result, "blocked")
+        self.assertEqual(result.reason, "cleanup_unverified")
+        self.assertTrue(result.manual_cleanup_required)
+        self.assertTrue(replacements[0][0].is_symlink())
+        self.assertTrue(replacements[0][1].is_dir())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_harness_cleanup_preserves_replaced_descendant_file(self):
+        bundle = self._create_harness_bundle_fixture()
+        snapshot = live_runner._snapshot_harness_cleanup_tree
+        replacements = []
+
+        def replace_after_snapshot(
+            temp_root, root_identity, codex_home, home_identity
+        ):
+            captured = snapshot(
+                temp_root, root_identity, codex_home, home_identity
+            )
+            target = codex_home / "AGENTS.md"
+            moved = self.root / "preserved-AGENTS.md"
+            target.rename(moved)
+            target.write_text("replacement\n", encoding="utf-8")
+            target.chmod(0o400)
+            replacements.append((target, moved))
+            return captured
+
+        request = live_runner.HarnessDryRunRequest(
+            planning_request=EvalRequest.dry_run(
+                tags=("workflow-intake",), scenario_path=self.scenarios
+            ),
+            profile="current",
+            bundle_root=bundle,
+            skill_repo=self.repo,
+        )
+        with mock.patch(
+            "scripts.run_live_eval._snapshot_harness_cleanup_tree",
+            side_effect=replace_after_snapshot,
+        ):
+            result = live_runner.run_harness_dry_run(request)
+
+        self.assertEqual(result.status, "blocked_cleanup")
+        self.assertEqual(result.materialization_result, "blocked")
+        self.assertEqual(result.reason, "cleanup_unverified")
+        self.assertTrue(result.manual_cleanup_required)
+        self.assertEqual(
+            replacements[0][0].read_text(encoding="utf-8"),
+            "replacement\n",
+        )
+        self.assertTrue(replacements[0][1].is_file())
+
     def test_legacy_request_result_and_json_contracts_are_golden(self):
         self.assertEqual(
             tuple(EvalRequest.__dataclass_fields__),

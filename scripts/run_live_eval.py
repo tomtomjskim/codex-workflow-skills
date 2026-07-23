@@ -482,53 +482,411 @@ def _harness_directory_identity(path: Path) -> Tuple[int, int, int]:
     return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
 
 
+@dataclass(frozen=True)
+class _HarnessCleanupEntry:
+    relative_path: Tuple[str, ...]
+    kind: str
+    dev: int
+    ino: int
+    mode: int
+    nlink: int
+
+
+_HarnessCleanupSnapshot = Tuple[_HarnessCleanupEntry, ...]
+
+
+def _harness_cleanup_open_flags(*, directory: bool) -> int:
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        if directory:
+            flags |= os.O_DIRECTORY
+    except AttributeError as error:
+        raise OSError("required no-follow cleanup flags are unavailable") from error
+    return flags
+
+
+def _harness_cleanup_paths(temp_root: Path, codex_home: Path) -> Tuple[Path, Path]:
+    root = Path(temp_root)
+    home = Path(codex_home)
+    if (
+        not root.is_absolute()
+        or root.parent == root
+        or root.name in ("", ".", "..")
+        or home != root / "home"
+    ):
+        raise ValueError("invalid harness cleanup paths")
+    return root, home
+
+
+def _harness_cleanup_entry(
+    relative_path: Tuple[str, ...], metadata: os.stat_result
+) -> _HarnessCleanupEntry:
+    if metadata.st_uid != os.getuid():
+        raise ValueError("harness cleanup entry is not owned")
+    if stat.S_ISDIR(metadata.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+        kind = "file"
+    else:
+        raise ValueError("harness cleanup rejects links and special files")
+    return _HarnessCleanupEntry(
+        relative_path=relative_path,
+        kind=kind,
+        dev=metadata.st_dev,
+        ino=metadata.st_ino,
+        mode=metadata.st_mode,
+        nlink=metadata.st_nlink,
+    )
+
+
+def _harness_cleanup_entry_matches(
+    entry: _HarnessCleanupEntry, metadata: os.stat_result
+) -> bool:
+    if entry.kind == "directory":
+        kind_matches = stat.S_ISDIR(metadata.st_mode)
+    elif entry.kind == "file":
+        kind_matches = stat.S_ISREG(metadata.st_mode)
+    else:
+        return False
+    return (
+        kind_matches
+        and metadata.st_uid == os.getuid()
+        and metadata.st_dev == entry.dev
+        and metadata.st_ino == entry.ino
+        and metadata.st_mode == entry.mode
+        and metadata.st_nlink == entry.nlink
+    )
+
+
+def _harness_cleanup_mutated_directory_matches(
+    entry: _HarnessCleanupEntry, metadata: os.stat_result
+) -> bool:
+    return (
+        entry.kind == "directory"
+        and stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_dev == entry.dev
+        and metadata.st_ino == entry.ino
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+    )
+
+
+def _open_harness_cleanup_entry(
+    parent_fd: int, name: str, entry: _HarnessCleanupEntry
+) -> int:
+    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not _harness_cleanup_entry_matches(entry, metadata):
+        raise ValueError("harness cleanup entry identity changed")
+    descriptor = os.open(
+        name,
+        _harness_cleanup_open_flags(directory=entry.kind == "directory"),
+        dir_fd=parent_fd,
+    )
+    try:
+        if not _harness_cleanup_entry_matches(entry, os.fstat(descriptor)):
+            raise ValueError("opened harness cleanup identity changed")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _snapshot_harness_cleanup_children(
+    directory_fd: int,
+    relative_path: Tuple[str, ...],
+    entries: list,
+) -> None:
+    for name in sorted(os.listdir(directory_fd)):
+        if not isinstance(name, str) or Path(name).name != name or name in (".", ".."):
+            raise ValueError("invalid harness cleanup entry name")
+        child_path = relative_path + (name,)
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        entry = _harness_cleanup_entry(child_path, metadata)
+        entries.append(entry)
+        descriptor = _open_harness_cleanup_entry(directory_fd, name, entry)
+        try:
+            if entry.kind == "directory":
+                _snapshot_harness_cleanup_children(
+                    descriptor, child_path, entries
+                )
+        finally:
+            os.close(descriptor)
+
+
+def _snapshot_harness_cleanup_tree(
+    temp_root: Path,
+    root_identity: Tuple[int, int, int],
+    codex_home: Path,
+    home_identity: Optional[Tuple[int, int, int]],
+) -> _HarnessCleanupSnapshot:
+    """Capture the exact owned cleanup tree through no-follow descriptors."""
+    root, _home = _harness_cleanup_paths(temp_root, codex_home)
+    parent_fd = os.open(
+        os.fspath(root.parent), _harness_cleanup_open_flags(directory=True)
+    )
+    try:
+        root_metadata = os.stat(
+            root.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        root_entry = _harness_cleanup_entry((), root_metadata)
+        if (
+            root_entry.kind != "directory"
+            or stat.S_IMODE(root_entry.mode) != 0o700
+            or (root_entry.dev, root_entry.ino, stat.S_IFMT(root_entry.mode))
+            != root_identity
+        ):
+            raise ValueError("owned harness root identity changed")
+        root_fd = _open_harness_cleanup_entry(parent_fd, root.name, root_entry)
+        try:
+            root_names = tuple(sorted(os.listdir(root_fd)))
+            expected_names = () if home_identity is None else ("home",)
+            if root_names != expected_names:
+                raise ValueError("harness root inventory changed")
+            entries = [root_entry]
+            if home_identity is not None:
+                home_metadata = os.stat(
+                    "home", dir_fd=root_fd, follow_symlinks=False
+                )
+                home_entry = _harness_cleanup_entry(("home",), home_metadata)
+                if (
+                    home_entry.kind != "directory"
+                    or stat.S_IMODE(home_entry.mode) != 0o700
+                    or (
+                        home_entry.dev,
+                        home_entry.ino,
+                        stat.S_IFMT(home_entry.mode),
+                    )
+                    != home_identity
+                ):
+                    raise ValueError("owned harness home identity changed")
+                entries.append(home_entry)
+                home_fd = _open_harness_cleanup_entry(
+                    root_fd, "home", home_entry
+                )
+                try:
+                    _snapshot_harness_cleanup_children(
+                        home_fd, ("home",), entries
+                    )
+                finally:
+                    os.close(home_fd)
+            return tuple(entries)
+        finally:
+            os.close(root_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _harness_cleanup_snapshot_index(snapshot: _HarnessCleanupSnapshot):
+    if not isinstance(snapshot, tuple) or not snapshot:
+        raise TypeError("harness cleanup snapshot must be a non-empty tuple")
+    entries = {}
+    for entry in snapshot:
+        if not isinstance(entry, _HarnessCleanupEntry):
+            raise TypeError("invalid harness cleanup snapshot entry")
+        relative_path = entry.relative_path
+        if (
+            not isinstance(relative_path, tuple)
+            or relative_path in entries
+            or any(
+                not isinstance(name, str)
+                or Path(name).name != name
+                or name in ("", ".", "..")
+                for name in relative_path
+            )
+        ):
+            raise ValueError("invalid harness cleanup snapshot path")
+        entries[relative_path] = entry
+    root_entry = entries.get(())
+    if root_entry is None or root_entry.kind != "directory":
+        raise ValueError("harness cleanup snapshot has no root")
+    children = {path: [] for path, entry in entries.items() if entry.kind == "directory"}
+    for path in entries:
+        if not path:
+            continue
+        parent = path[:-1]
+        if parent not in children:
+            raise ValueError("harness cleanup snapshot parent is invalid")
+        children[parent].append(path[-1])
+    return entries, {
+        path: tuple(sorted(names)) for path, names in children.items()
+    }
+
+
+def _validate_harness_cleanup_snapshot_anchors(
+    entries,
+    children,
+    root_identity: Tuple[int, int, int],
+    home_identity: Optional[Tuple[int, int, int]],
+) -> None:
+    root_entry = entries[()]
+    if (
+        stat.S_IMODE(root_entry.mode) != 0o700
+        or (root_entry.dev, root_entry.ino, stat.S_IFMT(root_entry.mode))
+        != root_identity
+    ):
+        raise ValueError("harness cleanup root snapshot is invalid")
+    expected_root_children = () if home_identity is None else ("home",)
+    if children[()] != expected_root_children:
+        raise ValueError("harness cleanup root inventory is invalid")
+    if home_identity is not None:
+        home_entry = entries.get(("home",))
+        if (
+            home_entry is None
+            or home_entry.kind != "directory"
+            or stat.S_IMODE(home_entry.mode) != 0o700
+            or (
+                home_entry.dev,
+                home_entry.ino,
+                stat.S_IFMT(home_entry.mode),
+            )
+            != home_identity
+        ):
+            raise ValueError("harness cleanup home snapshot is invalid")
+
+
+def _verify_harness_cleanup_directory(
+    directory_fd: int, relative_path: Tuple[str, ...], entries, children
+) -> None:
+    entry = entries[relative_path]
+    if not _harness_cleanup_entry_matches(entry, os.fstat(directory_fd)):
+        raise ValueError("harness cleanup directory identity changed")
+    expected_names = children[relative_path]
+    if tuple(sorted(os.listdir(directory_fd))) != expected_names:
+        raise ValueError("harness cleanup directory inventory changed")
+    for name in expected_names:
+        child = entries[relative_path + (name,)]
+        descriptor = _open_harness_cleanup_entry(directory_fd, name, child)
+        try:
+            if child.kind == "directory":
+                _verify_harness_cleanup_directory(
+                    descriptor, child.relative_path, entries, children
+                )
+        finally:
+            os.close(descriptor)
+    if tuple(sorted(os.listdir(directory_fd))) != expected_names:
+        raise ValueError("harness cleanup directory changed during verification")
+
+
+def _harness_cleanup_name_is_absent(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _remove_harness_cleanup_directory(
+    directory_fd: int, relative_path: Tuple[str, ...], entries, children
+) -> None:
+    entry = entries[relative_path]
+    if not _harness_cleanup_entry_matches(entry, os.fstat(directory_fd)):
+        raise ValueError("harness cleanup directory identity changed")
+    expected_names = children[relative_path]
+    if tuple(sorted(os.listdir(directory_fd))) != expected_names:
+        raise ValueError("harness cleanup directory inventory changed")
+    os.fchmod(directory_fd, 0o700)
+    chmod_metadata = os.fstat(directory_fd)
+    if (
+        not _harness_cleanup_mutated_directory_matches(entry, chmod_metadata)
+        or chmod_metadata.st_nlink != entry.nlink
+    ):
+        raise ValueError("harness cleanup directory changed during chmod")
+    for name in expected_names:
+        child = entries[relative_path + (name,)]
+        descriptor = _open_harness_cleanup_entry(directory_fd, name, child)
+        try:
+            if child.kind == "directory":
+                _remove_harness_cleanup_directory(
+                    descriptor, child.relative_path, entries, children
+                )
+                if tuple(os.listdir(descriptor)):
+                    raise ValueError("harness cleanup directory is not empty")
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not _harness_cleanup_mutated_directory_matches(
+                        child, os.fstat(descriptor)
+                    )
+                    or not _harness_cleanup_mutated_directory_matches(
+                        child, current
+                    )
+                ):
+                    raise ValueError("harness cleanup directory was replaced")
+                os.rmdir(name, dir_fd=directory_fd)
+                if not _harness_cleanup_name_is_absent(directory_fd, name):
+                    raise ValueError("harness cleanup directory removal is unverified")
+            else:
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (
+                    not _harness_cleanup_entry_matches(child, current)
+                    or not _harness_cleanup_entry_matches(
+                        child, os.fstat(descriptor)
+                    )
+                ):
+                    raise ValueError("harness cleanup file was replaced")
+                os.unlink(name, dir_fd=directory_fd)
+                if (
+                    os.fstat(descriptor).st_nlink != 0
+                    or not _harness_cleanup_name_is_absent(directory_fd, name)
+                ):
+                    raise ValueError("harness cleanup file removal is unverified")
+        finally:
+            os.close(descriptor)
+    if tuple(os.listdir(directory_fd)):
+        raise ValueError("harness cleanup directory removal is incomplete")
+
+
 def _cleanup_harness_temp_root(
     temp_root: Path,
     root_identity: Tuple[int, int, int],
     codex_home: Path,
     home_identity: Optional[Tuple[int, int, int]],
 ) -> bool:
-    """Remove only the still-owned home/root identities and prove absence."""
+    """Remove only an exact, still-owned no-follow cleanup snapshot."""
     try:
-        if _harness_directory_identity(temp_root) != root_identity:
-            return False
-        if home_identity is None:
-            if not _path_is_absent(codex_home):
-                return False
-        else:
-            if _harness_directory_identity(codex_home) != home_identity:
-                return False
-            _remove_harness_tree(codex_home)
-            if not _path_is_absent(codex_home):
-                return False
-        if _harness_directory_identity(temp_root) != root_identity:
-            return False
-        temp_root.rmdir()
-        return _path_is_absent(temp_root)
+        root, _home = _harness_cleanup_paths(temp_root, codex_home)
+        snapshot = _snapshot_harness_cleanup_tree(
+            root, root_identity, codex_home, home_identity
+        )
+        entries, children = _harness_cleanup_snapshot_index(snapshot)
+        _validate_harness_cleanup_snapshot_anchors(
+            entries, children, root_identity, home_identity
+        )
+        parent_fd = os.open(
+            os.fspath(root.parent), _harness_cleanup_open_flags(directory=True)
+        )
+        try:
+            root_fd = _open_harness_cleanup_entry(
+                parent_fd, root.name, entries[()]
+            )
+            try:
+                _verify_harness_cleanup_directory(root_fd, (), entries, children)
+                _remove_harness_cleanup_directory(root_fd, (), entries, children)
+                if tuple(os.listdir(root_fd)):
+                    return False
+                current = os.stat(
+                    root.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    not _harness_cleanup_mutated_directory_matches(
+                        entries[()], os.fstat(root_fd)
+                    )
+                    or not _harness_cleanup_mutated_directory_matches(
+                        entries[()], current
+                    )
+                ):
+                    return False
+                os.rmdir(root.name, dir_fd=parent_fd)
+                return _harness_cleanup_name_is_absent(parent_fd, root.name)
+            finally:
+                os.close(root_fd)
+        finally:
+            os.close(parent_fd)
     except (FileNotFoundError, OSError, TypeError, ValueError):
         return False
-
-
-def _remove_harness_tree(path: Path) -> None:
-    metadata = path.lstat()
-    if stat.S_ISDIR(metadata.st_mode):
-        path.chmod(0o700)
-        names = tuple(entry.name for entry in os.scandir(str(path)))
-        for name in names:
-            _remove_harness_tree(path / name)
-        path.rmdir()
-    else:
-        path.unlink()
-
-
-def _path_is_absent(path: Path) -> bool:
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    return False
 
 
 def run_eval(request: EvalRequest, codex: CodexProcess) -> EvalResult:
