@@ -1,0 +1,2098 @@
+# Harness Experiment Phase A Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Implement the approved zero-model-call Phase A foundation for a future `current` versus `lean` harness experiment, with immutable plan identities, hardened task snapshots, synthetic telemetry and receipt validation, and a preflight-only CLI.
+
+**Architecture:** Add a new experiment module family and CLI beside the legacy live-eval runner. Canonical plan bytes are authoritative, task repositories are read only through a separately hardened full-OID Git-object adapter, and every retained output is a path-free typed projection. Phase A materializes and verifies both harness profiles and distinct condition task trees, constructs two future canary templates and eight pilot invocation plans, validates future runtime transitions with synthetic records, emits a `static_only` preflight receipt, and contains no path that can authenticate or launch Codex.
+
+**Tech Stack:** Python 3.9 standard library, existing canonical JSON and fixed harness public APIs, `unittest`, local temporary Git repositories, GitHub Actions.
+
+**Design source:** `docs/superpowers/specs/2026-07-23-harness-experiment-readiness-design.md`
+
+## Global Constraints
+
+- Phase A supports only `preflight` and always reports `model_calls=0`.
+- Do not import or call `build_invocation()`, `preflight_auth()`, `preflight_isolation()`, `run_eval()`, or `run_harness_dry_run()` from the new experiment path.
+- Do not modify the public behavior, fields, serializers, argv, JSON bytes, classifications, reasons, or exit codes in:
+  - `scripts/live_eval/isolation.py`
+  - `scripts/live_eval/checkout.py`
+  - `scripts/live_eval/harness.py`
+  - `scripts/workflow_coordination/canonical_json.py`
+  - `scripts/run_live_eval.py`
+- Reuse only these existing public helpers:
+  - `load_canonical_input()` and `canonical_bytes()`
+  - `canonical_name_key()` and `require_unique_canonical_names()`
+  - `load_harness_source()`, `materialize_harness_home()`, and `verify_loaded_harness()`
+  - `seal_codex_home()`
+- Do not import private helpers from the legacy modules. The task loader requires its own absolute-`--git-dir`, bounded subprocess, topology-seal, and no-worktree implementation.
+- Use `@dataclass(frozen=True)`, tuples, `frozenset`, and `MappingProxyType` for immutable public values. Avoid Python features introduced after 3.9.
+- Canonical input digests are SHA-256 over the exact accepted input bytes. A parsed-and-reserialized value is not a substitute for the authoritative bytes.
+- All durable JSON contains opaque identifiers, fixed classifications, counts, and `sha256:` digests only. It contains no local paths, private policy text, prompts, raw model output, or raw reasoning.
+- No production dependency, model/API call, credential lookup, executable resolution, network access, or live ledger write is permitted.
+- Focused tests run after each small implementation slice. Full live-eval discovery runs at the task-snapshot security checkpoint and final integration; `./scripts/validate_repo.sh` runs only at branch-completion checkpoints.
+- The untracked `.serena/` directory is user state and must not be staged or modified.
+
+## File and Dependency Map
+
+| File | Responsibility | Allowed dependencies |
+|---|---|---|
+| `scripts/live_eval/experiment_plan.py` | Exact canonical input schema, immutable plan, deterministic schedule, analysis rules, invocation-plan schema | `canonical_json`, Python standard library |
+| `scripts/live_eval/experiment_receipts.py` | Static receipts, runtime record schemas, pure transition validator | `experiment_plan`, `experiment_telemetry`, `canonical_json`, standard library |
+| `scripts/live_eval/experiment_telemetry.py` | Bounded JSONL parsing, usage projection, token and estimated-cost arithmetic | `experiment_plan`, `canonical_json`, standard library |
+| `scripts/live_eval/task_snapshot.py` | Operator-source gate, object-DB inventory, bounded Git object loading, regular-file materialization and sealing | Public name-collision helpers, receipt constructors, standard library |
+| `scripts/live_eval/experiment.py` | Phase A orchestration, owned temporary state, harness and task composition, preflight result | All four new core modules plus public harness and seal APIs |
+| `scripts/run_harness_experiment.py` | Thin `preflight` CLI and canonical result printing | `experiment`, `experiment_plan`, standard library |
+| `tests/fixtures/harness_experiment/` | Canonical plan and telemetry bytes that are safe to publish | No Git administration directories or private policy text |
+
+Import direction is:
+
+```text
+experiment_plan -> experiment_telemetry
+experiment_plan + experiment_telemetry -> experiment_receipts
+experiment_plan + experiment_receipts -> task_snapshot
+experiment_plan + experiment_telemetry + experiment_receipts + task_snapshot
+  -> experiment -> run_harness_experiment
+```
+
+`experiment_plan.py` must not import receipts, telemetry, snapshots, orchestration, or either runner. This keeps plan identity free of runtime outcomes and prevents an import cycle.
+
+## Exact Phase A Data Contract
+
+The canonical plan input has these top-level keys and no others:
+
+| Key | Contract |
+|---|---|
+| `schema_version` | integer `1`; boolean is invalid |
+| `experiment_id` | NFC opaque identifier matching `[a-z0-9][a-z0-9._-]{0,63}` |
+| `selection_seed` | NFC opaque string of 16 through 128 ASCII bytes |
+| `selection_rule` | exact value `sha256-rank-paired-v1` |
+| `model` | exact model object described below |
+| `candidates` | exactly four qualified task objects, two `low` and two `medium`, with unique task IDs |
+| `analysis_contract_version` | exact value `four-pair-screening-v1` |
+| `masking_contract_version` | exact value `masked-review-chain-v1` |
+| `containment_policy_version` | non-empty opaque identifier; Phase A records the policy but does not implement it |
+| `retention` | exact value `{"durable_summary":"typed_allowlist","raw_jsonl":"discard"}` |
+| `budgets` | exact budget object described below |
+| `price_snapshot` | exact price object described below |
+| `provider_cap_evidence` | `not_supplied`, `operator_attested_only`, or `independently_verified` |
+| `external_prerequisite_receipt_digests` | sorted unique tuple of `sha256:` digests; Phase A permits an empty tuple |
+| `invocation_policy` | exact future invocation policy described below |
+
+The exact `model` object is:
+
+```json
+{"model_id":"gpt-5.6-sol","reasoning_effort":"high","required_cli_version":"0.145.0","required_cli_capability_policy":"codex-experiment-cli-v1"}
+```
+
+The fixture may use another non-empty NFC model ID, reasoning effort, or CLI version, but all four keys are required and unknown keys are rejected.
+
+Each candidate has these keys and no others:
+
+| Key | Contract |
+|---|---|
+| `task_id` | unique opaque identifier matching the experiment-ID pattern |
+| `difficulty` | `low` or `medium` |
+| `commit_oid` | full lowercase 40- or 64-hex object ID, never a ref |
+| `prompt_digest` | `sha256:` digest |
+| `validator_digest` | `sha256:` digest |
+| `assertion_digest` | `sha256:` digest |
+| `allowed_write_paths` | sorted unique literal repository-relative NFC paths |
+| `provenance_id` | non-empty opaque NFC identifier |
+| `inclusion_rule_ids` | non-empty sorted unique opaque identifiers |
+| `exclusion_rule_ids` | sorted unique opaque identifiers |
+| `offline_executable` | exact boolean `true` |
+| `reference_result` | exact value `pass` |
+| `negative_controls` | non-empty tuple of `{control_id, result}`, with `result=fail` |
+| `behavior_mutants` | non-empty tuple of `{category, mutant_digest, result}`, with unique non-formatting categories, `sha256:` digest, and `result=fail` |
+| `difficulty_rubric_digest` | `sha256:` digest |
+| `qualification_evidence_classification` | exact value `operator_attested_static` |
+| `source_provisioning_class` | exact value `operator_owned_trusted_git_local_clone` |
+| `operator_attested` | exact boolean `true` |
+| `local_clone_policy` | exact value `remote_or_no_local_or_no_hardlinks` |
+| `absolute_safety_assertion_ids` | sorted unique opaque identifiers; may be empty |
+
+The first pilot requires at least one behavioral mutant category per candidate. Categories equal to `formatting`, `parsing`, or `syntax_only` do not satisfy this requirement.
+
+Phase A validates the shape, internal consistency, and plan binding of the qualification claims; it does not execute a private validator. `operator_attested_static` is therefore retained in the corpus receipt and preflight evidence. Independent validator execution remains blocked on the future containment backend.
+
+The exact budget object keys are:
+
+```text
+total_calls
+canary_calls
+pilot_calls
+retry_calls
+concurrency
+max_elapsed_seconds
+max_retained_bytes
+max_reported_tokens
+max_output_tokens_per_call
+max_estimated_cost_microunits
+currency
+```
+
+The loader requires `10`, `2`, `8`, `0`, and `1` for the first five fields. Remaining counts are non-negative integers, with positive elapsed, token, and per-call output limits. `currency` is a three-letter uppercase ISO-style code and must equal the price snapshot currency.
+
+The exact price snapshot keys are:
+
+```text
+model_id
+currency
+input_microunits_per_million
+cached_input_microunits_per_million
+output_microunits_per_million
+effective_at
+source_label
+```
+
+The model and currency must match their top-level counterparts. Rates are non-negative integers. Timestamp and source label are retained as opaque NFC strings; Phase A does not claim provider billing authority.
+
+The exact invocation policy keys are:
+
+```text
+canary_sandbox
+pilot_sandbox
+approval_policy
+ignore_user_config
+ignore_rules
+provider_transport_allowed
+tool_network_disabled
+web_search_disabled
+mcp_disabled
+plugins_disabled
+hooks_disabled
+skills_disabled
+child_process_policy
+validator_policy
+executable_identity_policy
+```
+
+The required values are `read-only`, `workspace-write`, `never`, nine exact booleans matching the approved design, and non-empty policy identifiers for the final three fields. The serializer binds policy and path-identity digests, never local path strings.
+
+---
+
+## Task 1: Canonical Input, Immutable Plan, and Deterministic Schedule
+
+**Files:**
+
+- Create: `scripts/live_eval/experiment_plan.py`
+- Create: `tests/test_live_eval_experiment_plan.py`
+- Create: `tests/fixtures/harness_experiment/valid-plan-input.json`
+- Create: `tests/fixtures/harness_experiment/analysis-boundaries.json`
+
+### Step 1: Add failing authoritative-byte and schema tests
+
+- [ ] Write tests proving:
+  - the tracked valid input is already canonical UTF-8 JSON and round-trips byte-for-byte;
+  - whitespace, reordered keys, duplicate keys, floats, non-NFC strings, and unknown or missing keys fail;
+  - booleans fail in every integer field;
+  - input `dict` and `list` values cannot be mutated after loading;
+  - mutating each nested bound field changes the input digest;
+  - task IDs, write paths, and receipt digests are unique and canonically sorted;
+  - exactly two low and two medium candidates are required;
+  - qualification fails for a reference failure, a passing negative control, or formatting-only mutants.
+  - canary templates contain no marker, derived-home, executable, credential, or runtime-root identity;
+  - pilot plans contain the four explicit capability-root digest sets and reject an unknown or `danger-full-access` sandbox.
+
+Use this test shape:
+
+```python
+class CanonicalExperimentInputTests(unittest.TestCase):
+    def test_accepts_only_authoritative_canonical_bytes_and_freezes_nested_values(self):
+        data = FIXTURE.joinpath("valid-plan-input.json").read_bytes()
+
+        loaded = load_experiment_input(data)
+
+        self.assertEqual(loaded.canonical_bytes, data)
+        self.assertEqual(experiment_input_bytes(loaded), data)
+        self.assertEqual(
+            loaded.input_digest,
+            "sha256:" + hashlib.sha256(data).hexdigest(),
+        )
+        with self.assertRaises(TypeError):
+            loaded.value["schema_version"] = 2
+        with self.assertRaises(TypeError):
+            loaded.value["candidates"][0]["task_id"] = "changed"
+```
+
+### Step 2: Run the focused test and confirm the expected failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_plan -v
+```
+
+Expected: import failure because `scripts.live_eval.experiment_plan` does not exist.
+
+### Step 3: Implement the authoritative experiment codec
+
+- [ ] Add the immutable wrapper and experiment-only freeze logic. Keep the legacy codec unchanged.
+
+```python
+@dataclass(frozen=True)
+class CanonicalExperimentInput:
+    canonical_bytes: bytes = field(repr=False)
+    value: Mapping[str, object]
+    input_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "canonical_bytes", bytes(self.canonical_bytes))
+        object.__setattr__(self, "value", freeze_json_value(self.value))
+
+
+def freeze_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: freeze_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_json_value(item) for item in value)
+    return value
+
+
+def thaw_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: thaw_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [thaw_json_value(item) for item in value]
+    return value
+
+
+def sha256_bytes(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def load_experiment_input(data: bytes) -> CanonicalExperimentInput:
+    if not isinstance(data, bytes):
+        raise ExperimentPlanError("experiment_input_not_bytes")
+    value = load_canonical_input(data)
+    if canonical_bytes(value) != data:
+        raise ExperimentPlanError("experiment_input_not_canonical")
+    _validate_experiment_document(value)
+    return CanonicalExperimentInput(
+        canonical_bytes=data,
+        value=value,
+        input_digest=sha256_bytes(data),
+    )
+
+
+def experiment_input_bytes(value: CanonicalExperimentInput) -> bytes:
+    if not isinstance(value, CanonicalExperimentInput):
+        raise TypeError("value must be CanonicalExperimentInput")
+    encoded = canonical_bytes(thaw_json_value(value.value))
+    if encoded != value.canonical_bytes:
+        raise ExperimentPlanError("experiment_input_changed")
+    return encoded
+```
+
+- [ ] Implement exact-schema validators with these properties:
+  - `_require_mapping(value, exact_keys, label)` compares exact key sets;
+  - `_require_integer()` checks `isinstance(value, int) and not isinstance(value, bool)`;
+  - `_require_identifier()`, `_require_digest()`, `_require_full_oid()`, and `_require_relative_path()` enforce the contract above;
+  - `_require_sorted_unique()` compares the provided order with a UTF-8 byte sort and rejects canonical aliases;
+  - errors expose one fixed reason code, never the rejected value or local path.
+
+### Step 4: Add immutable plan and invocation-plan types
+
+- [ ] Implement these public types:
+
+```python
+@dataclass(frozen=True)
+class PlannedRun:
+    ordinal: int
+    task_id: str
+    difficulty: str
+    condition: str
+
+
+@dataclass(frozen=True)
+class CanaryInvocationTemplate:
+    ordinal: int
+    profile: str
+    model_id: str
+    reasoning_effort: str
+    sandbox: str
+    approval_policy: str
+    provider_transport_allowed: bool
+    tool_network_disabled: bool
+    base_profile_digest: str
+    overlay_recipe_policy_digest: str
+    root_capability_policy_digest: str
+    child_process_policy: str
+    validator_policy: str
+    output_schema_digest: str
+    environment_policy_digest: str
+    argv_template_digest: str
+    containment_policy_version: str
+
+
+@dataclass(frozen=True)
+class PilotInvocationPlan:
+    ordinal: int
+    run: PlannedRun
+    model_id: str
+    reasoning_effort: str
+    sandbox: str
+    approval_policy: str
+    provider_transport_allowed: bool
+    tool_network_disabled: bool
+    codex_home_identity_digest: str
+    task_root_identity_digest: str
+    temp_root_identity_digest: str
+    tool_read_root_identity_digests: Tuple[str, ...]
+    tool_write_root_identity_digests: Tuple[str, ...]
+    validator_read_root_identity_digests: Tuple[str, ...]
+    validator_write_root_identity_digests: Tuple[str, ...]
+    child_process_policy: str
+    validator_policy: str
+    output_schema_digest: str
+    environment_policy_digest: str
+    argv_template_digest: str
+    containment_policy_version: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "tool_read_root_identity_digests",
+            "tool_write_root_identity_digests",
+            "validator_read_root_identity_digests",
+            "validator_write_root_identity_digests",
+        ):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+
+
+@dataclass(frozen=True)
+class ExperimentPlan:
+    input_digest: str
+    plan_document: Mapping[str, object]
+    canonical_bytes: bytes = field(repr=False)
+    plan_digest: str
+    pilot_schedule: Tuple[PlannedRun, ...]
+    canary_templates: Tuple[CanaryInvocationTemplate, ...]
+    pilot_invocation_plans: Tuple[PilotInvocationPlan, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "plan_document", freeze_json_value(self.plan_document)
+        )
+        object.__setattr__(self, "canonical_bytes", bytes(self.canonical_bytes))
+        object.__setattr__(self, "pilot_schedule", tuple(self.pilot_schedule))
+        object.__setattr__(
+            self, "canary_templates", tuple(self.canary_templates)
+        )
+        object.__setattr__(
+            self,
+            "pilot_invocation_plans",
+            tuple(self.pilot_invocation_plans),
+        )
+```
+
+`plan_document` contains the exact approved contracts plus:
+
+```text
+input_digest
+bundle_digest
+current_profile_digest
+lean_profile_digest
+task_source_trust_receipt_digests
+task_selection_receipt_digest
+task_corpus_receipt_digest
+pilot_schedule
+canary_template_digests
+pilot_invocation_plan_digests
+call_allocation_digest
+```
+
+It does not contain runtime containment, canary, pilot, review, unmask, stop, or decision outcomes.
+
+The argv template includes `--ignore-user-config` and `--ignore-rules`. The latter is documented and tested as ignoring execpolicy `.rules`; it must not be represented as disabling `AGENTS.md`.
+
+Canary templates use ordinals 1 and 2 for `current` and `lean`. They bind a base profile and the approved overlay, root-capability, argv, and containment policies, but not a marker, derived-home identity, executable identity, or runtime task root. Those values exist only in future runtime child receipts after Phase B approval. Pilot plans use ordinals 3 through 10 and carry the corresponding scheduled task, condition, sealed local root identities, and capability-root sets.
+
+The module owns fixed V1 canonical documents for the canary append-only overlay recipe, canary response schema, pilot response schema, argv templates, and root-capability policy. Their digests enter the template or pilot plan. A policy-document change changes the plan digest.
+
+### Step 5: Implement deterministic pair scheduling
+
+- [ ] Use SHA-256 ranking instead of `random.shuffle()` so ordering is stable across supported Python versions.
+
+```python
+def _rank(seed: str, domain: str, task_id: str) -> bytes:
+    payload = {
+        "domain": domain,
+        "seed": seed,
+        "task_id": task_id,
+    }
+    return hashlib.sha256(canonical_bytes(payload)).digest()
+
+
+def build_pilot_schedule(
+    seed: str, candidates: Sequence[Mapping[str, object]]
+) -> Tuple[PlannedRun, ...]:
+    by_difficulty = {"low": [], "medium": []}
+    for candidate in candidates:
+        by_difficulty[candidate["difficulty"]].append(candidate)
+    orientations = {}
+    for difficulty, values in by_difficulty.items():
+        ordered = sorted(
+            values,
+            key=lambda item: _rank(
+                seed, "condition-order:" + difficulty, item["task_id"]
+            ),
+        )
+        orientations[ordered[0]["task_id"]] = ("current", "lean")
+        orientations[ordered[1]["task_id"]] = ("lean", "current")
+    pair_order = sorted(
+        candidates,
+        key=lambda item: _rank(seed, "pair-order", item["task_id"]),
+    )
+    runs = []
+    for candidate in pair_order:
+        for condition in orientations[candidate["task_id"]]:
+            runs.append(
+                PlannedRun(
+                    ordinal=len(runs) + 1,
+                    task_id=candidate["task_id"],
+                    difficulty=candidate["difficulty"],
+                    condition=condition,
+                )
+            )
+    return tuple(runs)
+```
+
+- [ ] Test pair adjacency, ordinals 1 through 8, one current-first and one lean-first task per stratum, deterministic repetition, and a changed seed changing the sealed order.
+
+### Step 6: Run focused tests and commit the slice
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_plan -v
+git diff --check
+```
+
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/experiment_plan.py tests/test_live_eval_experiment_plan.py tests/fixtures/harness_experiment/valid-plan-input.json tests/fixtures/harness_experiment/analysis-boundaries.json
+git commit -m "feat(eval): add immutable experiment plans"
+```
+
+---
+
+## Task 2: Exact-Rational Analysis and Decision Rules
+
+**Files:**
+
+- Modify: `scripts/live_eval/experiment_plan.py`
+- Modify: `tests/test_live_eval_experiment_plan.py`
+- Modify: `tests/fixtures/harness_experiment/analysis-boundaries.json`
+
+### Step 1: Add failing analysis boundary tests
+
+- [ ] Add table-driven tests for:
+  - correctness delta is `lean - current`;
+  - four-value median is the arithmetic mean of the middle two values;
+  - `_reduction()` rejects a zero or negative current baseline;
+  - exactly 20 percent passes and the adjacent exact fractions fall on the correct side;
+  - display rounding never changes a scalar threshold result.
+
+Use `fractions.Fraction` in expectations:
+
+```python
+with self.subTest(case=case["name"]):
+    reduction = _reduction(case["current"], case["lean"])
+    self.assertEqual(reduction, Fraction(*case["expected_fraction"]))
+```
+
+`analysis-boundaries.json` contains only scalar integer inputs and expected
+fractions. It must not serialize or directly construct a
+`ValidatedAnalysisDataset`. Receipt-source decision tests begin in Task 4
+after `project_analysis_dataset()` exists.
+
+### Step 2: Run the focused test and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_plan -v
+```
+
+Expected: analysis types and functions are missing.
+
+### Step 3: Implement the fixed analysis types
+
+- [ ] Add:
+
+```python
+@dataclass(frozen=True)
+class ValidatedConditionObservation:
+    task_id: str
+    condition: str
+    terminal_receipt_digest: str
+    correctness_score: Optional[int]
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_output_tokens: int
+    wall_time_milliseconds: int
+    active_review_milliseconds: Optional[int]
+    machine_assertion_passed: bool
+    absolute_safety_assertion_id: Optional[str]
+    absolute_safety_basis_digest: Optional[str]
+
+    @property
+    def reported_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
+class ValidatedPairObservation:
+    task_id: str
+    current: Optional[ValidatedConditionObservation]
+    lean: Optional[ValidatedConditionObservation]
+
+
+@dataclass(frozen=True)
+class ValidatedMaskedReviewEvidence:
+    packet_receipt_digest: str
+    score_lock_receipt_digest: str
+    unmask_receipt_digest: str
+    high_regression_basis_digest: Optional[str]
+
+
+@dataclass(frozen=True)
+class ValidatedAnalysisDataset:
+    plan_digest: str
+    runtime_history_digest: str
+    pairs: Tuple[ValidatedPairObservation, ...]
+    masked_review: Optional[ValidatedMaskedReviewEvidence]
+    partial_reason_codes: Tuple[str, ...]
+    _provenance: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pairs", tuple(self.pairs))
+        object.__setattr__(
+            self, "partial_reason_codes", tuple(self.partial_reason_codes)
+        )
+
+
+@dataclass(frozen=True)
+class ExperimentDecision:
+    outcome: str
+    comparative_aggregate_emitted: bool
+    median_correctness_delta: Optional[Fraction]
+    efficiency_medians: Mapping[str, Optional[Fraction]]
+    qualifying_efficiency_metrics: Tuple[str, ...]
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "efficiency_medians",
+            MappingProxyType(dict(self.efficiency_medians)),
+        )
+        object.__setattr__(
+            self,
+            "qualifying_efficiency_metrics",
+            tuple(self.qualifying_efficiency_metrics),
+        )
+```
+
+`experiment_plan.py` owns `_ANALYSIS_DATASET_PROVENANCE` and the module-private
+`_make_validated_analysis_dataset(...)` factory. The factory supplies the
+identity token above after coercing tuples. `analyze_pairs()` requires identity
+with that token. Task 4's `experiment_receipts.project_analysis_dataset()` is
+the only supported public producer and calls this plan-owned private factory
+after canonical replay. This is a misuse barrier, not a security boundary.
+
+The fixed `AnalysisContract` uses a 0-to-100 integer score, minimum median correctness delta `Fraction(-5, 1)`, efficiency threshold `Fraction(1, 5)`, and required efficiency count `2`. It also carries the plan digest, plan-bound assertion digest, and registered absolute-safety assertion IDs for each task.
+
+For each completed-terminal observation, `correctness_score` and
+`active_review_milliseconds` are jointly null only on a replayed stop branch
+before score lock. They are jointly non-null only after a valid score-lock and
+unmask chain. Mixed nullability is invalid. A missing or non-completed terminal
+is represented by an absent condition observation, not by zero token/time or a
+partially populated observation.
+
+### Step 4: Implement exact-rational primitives
+
+- [ ] Implement:
+
+```python
+def _median(values: Sequence[Fraction]) -> Fraction:
+    ordered = sorted(values)
+    if len(ordered) != 4:
+        raise ExperimentPlanError("analysis_requires_four_pairs")
+    return (ordered[1] + ordered[2]) / 2
+
+
+def _reduction(current: int, lean: int) -> Fraction:
+    if current <= 0:
+        raise ExperimentPlanError("analysis_baseline_not_positive")
+    return Fraction(current - lean, current)
+```
+
+- [ ] Add `_correctness_delta(current, lean)` as exact integer subtraction and
+  keep every threshold comparison in integer or `Fraction` space. Decision
+  precedence and complete-dataset aggregation are implemented and tested in
+  Task 4 only after receipt projection exists.
+
+### Step 5: Run focused tests and commit
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_plan -v
+git diff --check
+```
+
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/experiment_plan.py tests/test_live_eval_experiment_plan.py tests/fixtures/harness_experiment/analysis-boundaries.json
+git commit -m "feat(eval): add experiment analysis primitives"
+```
+
+---
+
+## Task 3: Canonical Typed Telemetry Summary Codec
+
+**Files:**
+
+- Create: `scripts/live_eval/experiment_telemetry.py`
+- Create: `tests/test_live_eval_experiment_telemetry.py`
+
+### Step 1: Add failing typed-summary codec tests
+
+- [ ] Test:
+  - `UsageSummary` contains exactly four provider counts, total reported
+    tokens, and the estimated cost;
+  - booleans, negative values, floats, strings, unknown keys, missing keys,
+    cached input greater than input, and reasoning output greater than output
+    fail;
+  - total reported tokens must equal input plus output;
+  - estimated cost applies cached, non-cached input, and output rates exactly
+    once and rejects a mismatched retained estimate;
+  - `raw_retention` is exactly `discard`;
+  - the typed document and nested usage mapping have exact keys and contain no
+    arbitrary event value or raw JSONL;
+  - semantically equal summaries produce byte-identical documents and equal
+    digests;
+  - changing any typed field changes the summary digest;
+  - `telemetry_summary_from_document()` returns deeply immutable typed values
+    and round-trips to the exact same document and digest.
+
+### Step 2: Run the focused test and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_telemetry -v
+```
+
+Expected: import failure because the telemetry module does not exist.
+
+### Step 3: Implement the typed values
+
+- [ ] Add:
+
+```python
+@dataclass(frozen=True)
+class UsageSummary:
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_output_tokens: int
+    total_reported_tokens: int
+    estimated_cost_microunits: int
+
+
+@dataclass(frozen=True)
+class TelemetrySummary:
+    classification: str
+    response_digest: str
+    usage: UsageSummary
+    event_count: int
+    raw_retention: str
+```
+
+`raw_retention` is always `discard` in Phase A.
+
+### Step 4: Implement canonical document, digest, and validation boundaries
+
+- [ ] Add `telemetry_summary_document(summary)` returning an exact-schema
+  mapping with `classification`, `response_digest`, `usage`, `event_count`,
+  and `raw_retention`. The nested `usage` mapping has exactly
+  `input_tokens`, `cached_input_tokens`, `output_tokens`,
+  `reasoning_output_tokens`, `total_reported_tokens`, and
+  `estimated_cost_microunits`.
+- [ ] Add:
+
+```python
+def telemetry_summary_from_document(
+    document: Mapping[str, object],
+    price_snapshot: Mapping[str, object],
+) -> TelemetrySummary:
+    """Validate exact keys, integer/non-bool fields, subset invariants,
+    total_reported_tokens, and estimated cost, then return the typed value."""
+```
+
+- [ ] Add `telemetry_summary_digest(summary)` as SHA-256 over
+  `canonical_bytes(telemetry_summary_document(summary))`.
+- [ ] Use integer micro-units per million tokens and round a fractional final
+  micro-unit upward:
+
+```python
+def _estimated_cost_microunits(
+    usage: Mapping[str, int], price: Mapping[str, object]
+) -> int:
+    non_cached = usage["input_tokens"] - usage["cached_input_tokens"]
+    numerator = (
+        non_cached * price["input_microunits_per_million"]
+        + usage["cached_input_tokens"]
+        * price["cached_input_microunits_per_million"]
+        + usage["output_tokens"] * price["output_microunits_per_million"]
+    )
+    return (numerator + 999999) // 1000000
+```
+
+`reasoning_output_tokens` is retained as a diagnostic subset but does not
+enter the cost expression separately.
+
+### Step 5: Run focused tests and commit
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_telemetry -v
+git diff --check
+```
+
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/experiment_telemetry.py tests/test_live_eval_experiment_telemetry.py
+git commit -m "feat(eval): add canonical telemetry summaries"
+```
+
+---
+
+## Task 4: Canonical Receipts and Pure Runtime Transition Validation
+
+**Files:**
+
+- Create: `scripts/live_eval/experiment_receipts.py`
+- Create: `tests/test_live_eval_experiment_receipts.py`
+
+### Step 1: Add failing receipt mutation and state-machine tests
+
+- [ ] Cover static receipt construction:
+  - every receipt is canonical, deeply immutable, and has a digest over its exact bytes;
+  - one-field mutation changes the receipt digest;
+  - `TaskCorpusReceipt` binds all four selected snapshot digests and the selection receipt;
+  - the plan binds source-trust, selection, and corpus receipt digests;
+  - a post-result candidate replacement cannot reuse a plan digest;
+  - plan-independent component receipts may be reused only with the same authoritative input and component-policy digests;
+  - changed-input static receipts and cross-plan preflight/runtime, cross-task, cross-profile, stale, duplicate, and hash-invalid receipts fail.
+
+- [ ] Cover runtime transitions:
+  - `PreflightReceipt -> RuntimeContainmentReceipt`;
+  - exactly one canary reservation/terminal/receipt per profile before pilot;
+  - exactly eight pilot reservations and terminals in the plan's schedule;
+  - third canary, duplicate profile, pilot before both canaries, ninth pilot, duplicate task-condition, retry, and eleventh total reservation fail;
+  - every reservation consumes allowance regardless of terminal classification;
+  - a missing terminal permits only `abandoned_after_recovery` followed by stop;
+  - failed, timed-out, crashed, malformed, or abandoned terminal blocks new reservations;
+  - packet, score lock, unmask, and decision order is one-way;
+  - every post-reservation nonterminal state can append a valid stop;
+  - stop or decision is the unique terminal and no later record is accepted;
+  - stop rejects `advance_to_larger_study`;
+  - stop permits `reject_for_safety` only with an already valid basis.
+
+- [ ] Cover analysis-source and decision behavior with canonical histories:
+  - rebuild a valid outer pilot-terminal receipt after changing a nested token
+    value while retaining the prior telemetry-summary digest;
+  - independently rebuild valid outer score-lock receipts after changing
+    `correctness_score` and `active_review_milliseconds` while retaining the
+    prior locked-records digest;
+  - independently rebuild valid outer unmask receipts after changing
+    `task_id`, `condition`, and `pilot_terminal_receipt_digest` while retaining
+    the prior mapping digest;
+  - require both `replay_runtime_history()` and
+    `project_analysis_dataset()` to reject every one of those mutations;
+  - reject an unregistered absolute-safety assertion ID, a task-A assertion ID
+    attached to task B, and a non-null safety basis with a null assertion ID;
+  - project a valid stop before score lock with jointly null score/review time
+    and an explicit partial reason, then require `inconclusive`, no comparative
+    aggregate, and all aggregate fields null;
+  - project a complete eight-terminal packet/score-lock/unmask history and
+    calculate the expected medians only from its receipt-carried values;
+  - reject a raw mapping, direct pair sequence, arbitrary provenance token,
+    and caller-constructed dataset at the analysis boundary.
+
+### Step 2: Run the focused test and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_receipts -v
+```
+
+Expected: import failure because the receipt module does not exist.
+
+### Step 3: Implement the canonical receipt envelope
+
+- [ ] Use one immutable envelope with exact type-specific payload validation:
+- [ ] Import `freeze_json_value`, `thaw_json_value`, and `sha256_bytes` from `experiment_plan.py`; these are the only shared experiment codec primitives.
+- [ ] Import `telemetry_summary_from_document()`,
+  `telemetry_summary_document()`, and `telemetry_summary_digest()` from
+  `experiment_telemetry.py`; do not duplicate its schema or cost checks.
+
+```python
+@dataclass(frozen=True)
+class CanonicalReceipt:
+    receipt_type: str
+    input_digest: str
+    plan_digest: Optional[str]
+    previous_record_hash: Optional[str]
+    payload: Mapping[str, object]
+    canonical_bytes: bytes = field(repr=False)
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", freeze_json_value(self.payload))
+        object.__setattr__(self, "canonical_bytes", bytes(self.canonical_bytes))
+
+
+def make_receipt(
+    receipt_type: str,
+    input_digest: str,
+    plan_digest: Optional[str],
+    previous_record_hash: Optional[str],
+    payload: Mapping[str, object],
+) -> CanonicalReceipt:
+    _validate_receipt_payload(receipt_type, payload)
+    document = {
+        "schema_version": 1,
+        "receipt_type": receipt_type,
+        "input_digest": input_digest,
+        "plan_digest": plan_digest,
+        "previous_record_hash": previous_record_hash,
+        "payload": thaw_json_value(payload),
+    }
+    encoded = canonical_bytes(document)
+    return CanonicalReceipt(
+        receipt_type=receipt_type,
+        input_digest=input_digest,
+        plan_digest=plan_digest,
+        previous_record_hash=previous_record_hash,
+        payload=payload,
+        canonical_bytes=encoded,
+        receipt_digest=sha256_bytes(encoded),
+    )
+```
+
+Static component receipts require the authoritative experiment input digest and a null plan digest because they are inputs to plan construction. `preflight` and every runtime receipt require both the unchanged input digest and final plan digest. Only runtime children carry `previous_record_hash`.
+
+Static receipt types are:
+
+```text
+task_source_trust
+task_snapshot
+task_selection
+task_corpus
+preflight
+```
+
+Runtime receipt types are:
+
+```text
+runtime_containment
+canary_reservation
+canary_terminal
+canary_receipt
+pilot_reservation
+pilot_terminal
+masked_review_packet
+score_lock
+unmask
+decision
+experiment_stop
+```
+
+### Step 4: Implement exact static payloads
+
+- [ ] Require these path-free fields:
+
+`task_source_trust`:
+
+```text
+task_id
+provisioning_class
+operator_attested
+local_clone_policy
+object_format
+source_identity_before_digest
+object_topology_before_digest
+source_identity_after_digest
+object_topology_after_digest
+git_process_policy_digest
+inventory_file_count
+inventory_total_bytes
+```
+
+`task_snapshot`:
+
+```text
+task_id
+object_format
+commit_oid
+tree_oid
+entry_digest
+materialized_tree_digest
+materializer_policy_version
+file_count
+total_bytes
+source_trust_receipt_digest
+```
+
+`task_selection`:
+
+```text
+candidate_set_digest
+selection_rule
+selection_seed_digest
+selected_task_ids
+pilot_schedule_digest
+```
+
+`task_corpus`:
+
+```text
+candidate_set_digest
+selection_receipt_digest
+selected_snapshot_receipt_digests
+qualification_digest
+qualification_evidence_classification
+prompt_digests
+validator_digests
+assertion_digests
+reference_result_digest
+mutation_sensitivity_digest
+difficulty_assignment_digest
+```
+
+`preflight`:
+
+```text
+evidence_state
+live_backend_state
+global_agents_marker_state
+pilot_state
+qualification_evidence_classification
+model_calls
+bundle_digest
+current_profile_digest
+lean_profile_digest
+task_corpus_receipt_digest
+experiment_plan_digest
+canary_template_set_digest
+pilot_invocation_plan_set_digest
+materialization_result
+cleanup_state
+```
+
+The preflight values must include `static_only`, `live_backend_not_implemented`, `global_agents_marker_not_run`, `pilot_not_run`, `operator_attested_static`, and integer `0` for the corresponding fields above.
+
+### Step 5: Implement the runtime envelope and transition validator
+
+- [ ] A runtime record always binds the unchanged plan digest and the preceding receipt digest. The first runtime record points to the `PreflightReceipt` digest.
+
+```python
+@dataclass(frozen=True)
+class RuntimeState:
+    next_expected: Tuple[str, ...]
+    canary_reservations: int
+    pilot_reservations: int
+    total_reservations: int
+    unresolved_reservation_ids: Tuple[str, ...]
+    terminal: Optional[str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "next_expected", tuple(self.next_expected))
+        object.__setattr__(
+            self,
+            "unresolved_reservation_ids",
+            tuple(self.unresolved_reservation_ids),
+        )
+
+
+def validate_runtime_transition(
+    plan: ExperimentPlan,
+    preflight: CanonicalReceipt,
+    history: Sequence[CanonicalReceipt],
+    candidate: CanonicalReceipt,
+) -> RuntimeState:
+    state = replay_runtime_history(plan, preflight, history)
+    _require_record_hash(candidate, history[-1] if history else preflight)
+    _require_unchanged_input(candidate, plan.input_digest)
+    _require_unchanged_plan(candidate, plan.plan_digest)
+    _require_allowed_next(state, candidate)
+    return _apply_runtime_record(plan, state, candidate)
+```
+
+- [ ] Represent canary order as `("current", "lean")` and pilot order as the eight `PlannedRun` entries bound into the plan. Reservation IDs are opaque and unique.
+- [ ] Validate every canary profile, base-profile digest, and template digest against the next plan-bound template. Validate every pilot task, condition, snapshot digest, and invocation-plan digest against the next scheduled pilot plan; do not trust matching reservation IDs alone.
+- [ ] Terminal statuses are exactly `completed`, `failed`, `timed_out`, `crashed`, or `abandoned_after_recovery`.
+- [ ] A non-`completed` terminal changes the only allowed next record to `experiment_stop`.
+- [ ] Require these exact runtime payload fields:
+
+`runtime_containment`:
+
+```text
+backend_identity_digest
+model_tool_capability_receipt_digest
+validator_capability_receipt_digest
+probe_set_digest
+result
+```
+
+`result` must be `pass`; a failed or incomplete containment probe cannot enter the runtime chain.
+
+`canary_reservation`:
+
+```text
+reservation_id
+profile
+base_profile_digest
+canary_template_digest
+```
+
+`canary_terminal`:
+
+```text
+reservation_id
+profile
+reservation_receipt_digest
+terminal_status
+telemetry_summary_digest
+response_digest
+```
+
+Completed canary terminals require both digests. Non-completed terminals retain the exact keys with null digest values and immediately force the stop branch.
+
+`canary_receipt`:
+
+```text
+reservation_id
+profile
+terminal_receipt_digest
+base_bundle_digest
+base_profile_digest
+canary_overlay_recipe_digest
+marker_digest
+marker_entropy_bits
+marker_occurrence_count
+marker_occurrence_receipt_digest
+derived_home_digest
+model_policy_digest
+containment_capability_digest
+```
+
+The validator requires a distinct marker digest per profile, at least 128 entropy bits, and an occurrence count of one in the derived global `AGENTS.md`; no raw marker enters a public receipt.
+
+`pilot_reservation`:
+
+```text
+reservation_id
+task_id
+condition
+snapshot_receipt_digest
+invocation_plan_digest
+```
+
+`pilot_terminal`:
+
+```text
+reservation_id
+task_id
+condition
+reservation_receipt_digest
+terminal_status
+telemetry_summary
+telemetry_summary_digest
+wall_time_milliseconds
+machine_assertion_result
+sanitized_diff_digest
+allowed_write_inventory_digest
+absolute_safety_assertion_id
+absolute_safety_basis_digest
+```
+
+`telemetry_summary` is the exact typed document defined in Task 3, not caller-selected aggregate values. Receipt replay reconstructs it through `telemetry_summary_from_document()` using the plan's price snapshot, regenerates the document, and compares both the exact document and `telemetry_summary_digest()`. `wall_time_milliseconds` is a non-negative integer captured by the runner. `machine_assertion_result` is exactly `pass` or `fail`. The assertion-ID and safety-basis fields must be both null or both non-null; a non-null ID must be registered for this task in the plan-bound assertion contract. All other digest fields are required for a `completed` terminal.
+
+`masked_review_packet`:
+
+```text
+eligible_pilot_terminal_digests
+packet_digest
+randomized_order
+leakage_scan_result
+rubric_digest
+reviewer_ids
+```
+
+`score_lock`:
+
+```text
+masked_packet_receipt_digest
+locked_score_records
+locked_score_records_digest
+review_findings_digest
+high_regression_basis_digest
+```
+
+Each `locked_score_records` entry has exactly `neutral_id`, `correctness_score`, and `active_review_milliseconds`. Neutral IDs are unique and exactly cover the packet's randomized order, correctness is a 0-to-100 integer, and active time is a non-negative integer. The records digest is SHA-256 over the canonical records document. The HIGH-basis field may be null.
+
+`unmask`:
+
+```text
+score_lock_receipt_digest
+condition_mapping_records
+condition_mapping_digest
+```
+
+Each `condition_mapping_records` entry has exactly `neutral_id`, `task_id`, `condition`, and `pilot_terminal_receipt_digest`. The records are unique, exactly cover the score lock, and must reconstruct the eight plan-scheduled task-condition-terminal bindings. The mapping digest is SHA-256 over the canonical records document.
+
+`decision`:
+
+```text
+unmask_receipt_digest
+decision_calculation_digest
+outcome
+```
+
+`experiment_stop`:
+
+```text
+stop_stage
+reason_code
+consumed_canary_reservations
+consumed_pilot_reservations
+consumed_total_reservations
+unresolved_reservation_ids
+supporting_evidence_receipt_digests
+safety_basis_digest
+outcome
+```
+
+- [ ] Require the packet leakage result to be `pass`; bind the eight eligible pilot terminal digests, randomized order, rubric, and opaque reviewers.
+- [ ] Require score lock after the packet, unmask after score lock, and decision after unmask. Recompute and compare the canonical nested telemetry, locked-score, and unmask-mapping digests during replay; a valid outer receipt digest never substitutes for those semantic checks.
+- [ ] Permit a human HIGH basis on the stop branch only after the complete packet, score-lock, and unmask chain. Permit a deterministic absolute lean safety basis from a valid completed terminal even when another pair is partial.
+- [ ] Require one of the three allowed outcomes for `decision`. Require `inconclusive` or a valid `reject_for_safety` basis for `experiment_stop`; reject `advance_to_larger_study` on the stop branch.
+- [ ] Implement `project_analysis_dataset(plan, preflight, history)` in this module. It accepts no score, duration, usage, machine-result, assertion, or validity arguments. It first replays the canonical chain, then:
+  1. reconstructs each terminal's nested telemetry summary through Task 3's exact validator, verifies the regenerated document and digest, and reads its token counts plus the terminal's wall time, machine result, assertion ID, and safety basis;
+  2. validates any non-null assertion ID against the task's registered plan-bound assertion and requires the ID/basis pair to be jointly null or non-null;
+  3. recomputes the canonical locked-score records digest and, after unmask, joins each neutral ID to exactly one plan-scheduled terminal through the canonical condition mapping;
+  4. emits `ValidatedConditionObservation` values with nullable score/review time only for a stop branch before score lock, four plan-ordered pairs, the complete masked-review chain when present, explicit partial reasons, the plan digest, and the canonical replayed-history digest.
+- [ ] Call the plan-owned `_make_validated_analysis_dataset(...)` only after
+  those checks. `project_analysis_dataset()` is the only supported public
+  producer; the substantive trust comes from canonical replay and nested
+  validation, while the plan-owned identity token is only a misuse barrier.
+- [ ] Add positive assertions proving the projected scores, token counts, wall
+  times, active-review times, machine results, task/condition bindings, and
+  registered absolute-safety evidence equal the receipt history and require no
+  caller observation object.
+
+### Step 6: Bind projected evidence to the decision engine
+
+- [ ] Implement `analyze_pairs()` in `experiment_plan.py`. It accepts only a
+  `ValidatedAnalysisDataset` carrying the plan-owned provenance identity. It
+  accepts no caller-supplied score, token, time, machine-result, validity
+  boolean, or safety digest. It validates the contract/plan digest, pair
+  cardinality and order, task-condition-terminal bindings, joint score/time
+  nullability, and registered assertion IDs before applying a decision.
+- [ ] Apply decision precedence in this exact order:
+  1. a valid lean absolute-safety basis whose assertion ID and assertion digest
+     were pre-registered returns `reject_for_safety`, including when another
+     pair is partial;
+  2. any missing validated terminal, partial reason, missing complete masked
+     chain, or unresolved abstention returns `inconclusive` with all aggregate
+     fields absent;
+  3. a validated masked-review HIGH basis or complete-pair
+     current-pass/lean-fail returns `reject_for_safety`;
+  4. otherwise calculate four-pair aggregates and return
+     `advance_to_larger_study` only when correctness and two of three
+     efficiency thresholds pass;
+  5. every other complete result returns `inconclusive`.
+- [ ] Compute an efficiency median only when all four current baselines are
+  positive. Represent an ineligible metric as `None`; it does not count.
+- [ ] Add:
+
+```python
+def analyze_runtime_history(
+    contract: AnalysisContract,
+    plan: ExperimentPlan,
+    preflight: CanonicalReceipt,
+    history: Sequence[CanonicalReceipt],
+) -> ExperimentDecision:
+    return analyze_pairs(
+        contract,
+        project_analysis_dataset(plan, preflight, history),
+    )
+```
+
+This history-only wrapper is the supported public decision entry point.
+Direct `analyze_pairs()` use is limited to module tests of already projected
+values.
+
+### Step 7: Run focused tests and commit
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_receipts -v
+git diff --check
+```
+
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/experiment_plan.py scripts/live_eval/experiment_receipts.py tests/test_live_eval_experiment_plan.py tests/test_live_eval_experiment_receipts.py
+git commit -m "feat(eval): add experiment receipt transitions"
+```
+
+---
+
+## Task 5: Bounded Codex JSONL Parsing and Terminal Projection
+
+**Files:**
+
+- Modify: `scripts/live_eval/experiment_telemetry.py`
+- Modify: `tests/test_live_eval_experiment_telemetry.py`
+- Create: `tests/fixtures/harness_experiment/valid-terminal.jsonl`
+- Create: `tests/fixtures/harness_experiment/duplicate-usage.jsonl`
+- Create: `tests/fixtures/harness_experiment/usage-after-error.jsonl`
+- Create: `tests/fixtures/harness_experiment/truncated-terminal.jsonl`
+- Create: `tests/fixtures/harness_experiment/semantic-order-spacing.jsonl`
+
+### Step 1: Add failing JSONL state and usage tests
+
+- [ ] Test:
+  - one canonical `turn.completed` event with exactly four usage integers succeeds;
+  - exactly one structured agent response is required before the terminal event;
+  - missing, duplicate, negative, boolean, float, string, or unknown usage fields fail;
+  - cached input greater than input and reasoning output greater than output fail;
+  - a second response, a second terminal event, any event after terminal, usage after error, unsupported order, empty line, missing final newline, oversized line, oversized stream, and too many events fail;
+  - public summary contains only fixed IDs, digests, counts, durations, classifications, and estimates;
+  - semantically identical Codex events with different key order or insignificant spacing produce the same typed projection;
+  - total tokens are input plus output;
+  - estimated cost applies cached, non-cached input, and output rates exactly once;
+  - raw JSONL bytes and arbitrary event values do not appear in `repr()` or serialized summary.
+
+### Step 2: Run the focused test and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_telemetry -v
+```
+
+Expected: failure because `parse_terminal_telemetry()` and its state machine do
+not exist.
+
+### Step 3: Add bounded parsing limits
+
+- [ ] Add:
+
+```python
+@dataclass(frozen=True)
+class TelemetryLimits:
+    max_total_bytes: int
+    max_line_bytes: int
+    max_events: int
+    max_token_value: int
+```
+
+### Step 4: Implement the pure JSONL state machine
+
+- [ ] Accept one `bytes` value so truncation and total-size checks occur before JSON decoding:
+
+```python
+def parse_terminal_telemetry(
+    data: bytes,
+    limits: TelemetryLimits,
+    price_snapshot: Mapping[str, object],
+) -> TelemetrySummary:
+    if not isinstance(data, bytes):
+        raise TelemetryError("telemetry_not_bytes")
+    if not data or len(data) > limits.max_total_bytes:
+        raise TelemetryError("telemetry_size_invalid")
+    if not data.endswith(b"\n"):
+        raise TelemetryError("telemetry_truncated")
+    lines = data.splitlines()
+    if not lines or len(lines) > limits.max_events:
+        raise TelemetryError("telemetry_event_count_invalid")
+    state = _TelemetryState()
+    for line in lines:
+        if not line or len(line) > limits.max_line_bytes:
+            raise TelemetryError("telemetry_line_invalid")
+        event = load_canonical_input(line)
+        state = _consume_event(state, event, limits)
+    return _finish_telemetry(state, price_snapshot)
+```
+
+- [ ] Support the lifecycle types `thread.started`, `turn.started`, `item.started`, `item.updated`, `item.completed`, `turn.completed`, and `error`.
+- [ ] Treat raw Codex JSONL as semantic JSON, not canonical plan input. Preserve duplicate-key, float, non-finite, UTF-8, NFC, exact-schema, ordering, and size rejection, but do not require wire key order or whitespace to equal `canonical_bytes(event)`.
+- [ ] Count a structured response only from `item.completed` where `item.type=agent_message` and `item.text` parses to one JSON object. Store only `sha256:` over its canonical bytes.
+- [ ] Finish through Task 3's typed summary constructor so parser output,
+  receipt reconstruction, canonical document generation, and digest
+  calculation share one schema and invariant path.
+- [ ] Test that semantically equivalent terminal streams produce byte-identical typed summary documents and equal summary digests, while changing any usage value changes the summary digest.
+- [ ] Require `turn.completed` to be final and to contain:
+
+```json
+{"cached_input_tokens":0,"input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}
+```
+
+The values shown are shape examples; actual values may be any non-negative integers within the configured cap and subset constraints.
+
+### Step 5: Run focused tests and commit
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_telemetry -v
+git diff --check
+```
+
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/experiment_telemetry.py tests/test_live_eval_experiment_telemetry.py tests/fixtures/harness_experiment/valid-terminal.jsonl tests/fixtures/harness_experiment/duplicate-usage.jsonl tests/fixtures/harness_experiment/usage-after-error.jsonl tests/fixtures/harness_experiment/truncated-terminal.jsonl tests/fixtures/harness_experiment/semantic-order-spacing.jsonl
+git commit -m "feat(eval): project bounded experiment telemetry"
+```
+
+---
+
+## Task 6: Task-Source Trust Gate and Object-Database Topology Seal
+
+**Files:**
+
+- Create: `scripts/live_eval/task_snapshot.py`
+- Create: `tests/test_live_eval_task_snapshot.py`
+
+### Step 1: Build failing temporary-repository attack tests
+
+- [ ] Create Git repositories dynamically inside `TemporaryDirectory`; do not track `.git` fixtures.
+- [ ] Test supported intake:
+  - absolute operator-owned repository root;
+  - plain in-tree `.git` directory;
+  - current-user ownership and no group/other write permission across Git administration and object-store entries;
+  - full lowercase SHA-1 or SHA-256 commit OID;
+  - operator attestation and allowed provisioning class;
+  - local clone policy recorded in the source receipt.
+- [ ] Test rejection before object reads:
+  - relative root, root symlink, gitfile, linked worktree, external `commondir`, `core.worktree`, `extensions.worktreeConfig`;
+  - system/global/include configuration influence;
+  - filters, hooks, fsmonitor, LFS, submodules, replace refs, alternates, promisor state, quarantine, and external object directories;
+  - symlink, hardlink, FIFO, socket, device, or other special entry anywhere under the object database;
+  - loose object, pack, index, bitmap, commit-graph, and multi-pack-index topology attacks;
+  - canonical filename aliases, inventory file-count cap, and byte cap;
+  - changed root, `.git`, configuration, or object topology between the before and after seals.
+- [ ] Each sentinel test must assert the sentinel was not read or executed.
+
+### Step 2: Run the focused test and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_task_snapshot -v
+```
+
+Expected: import failure because the task snapshot module does not exist.
+
+### Step 3: Implement source specifications and policy
+
+- [ ] Add:
+
+```python
+@dataclass(frozen=True)
+class TaskSourceSpec:
+    input_digest: str
+    task_id: str
+    repository_root: Path = field(repr=False)
+    commit_oid: str
+    provisioning_class: str
+    operator_attested: bool
+    local_clone_policy: str
+
+    def __post_init__(self) -> None:
+        raw_root = os.fspath(self.repository_root)
+        if not os.path.isabs(raw_root) or os.path.normpath(raw_root) != raw_root:
+            raise TaskSnapshotError("task_source_root_not_absolute")
+        root = Path(raw_root)
+        object.__setattr__(self, "repository_root", root)
+
+
+@dataclass(frozen=True)
+class TaskSnapshotPolicy:
+    policy_version: str = "task-object-materializer-v1"
+    git_timeout_seconds: int = 15
+    max_git_stdout_bytes: int = 16 * 1024 * 1024
+    max_git_stderr_bytes: int = 64 * 1024
+    max_object_entries: int = 200000
+    max_object_store_bytes: int = 2 * 1024 * 1024 * 1024
+    max_files: int = 10000
+    max_file_bytes: int = 4 * 1024 * 1024
+    max_total_bytes: int = 64 * 1024 * 1024
+```
+
+Validate every integer without accepting booleans.
+Validate `input_digest` as the authoritative `sha256:` experiment input digest before any source operation; every emitted static receipt binds it.
+
+### Step 4: Implement no-follow identities and bounded object inventory
+
+- [ ] Validate the repository root, `.git`, `objects`, and every required control file with `lstat()`. Reject symlink components and any non-plain directory; require every control file to be regular and single-link. Where user IDs are available, require current-user ownership. Reject group/other writable Git administration directories, control files, and object entries.
+- [ ] Walk `.git/objects` without following links. For each directory:
+  - read names with `os.scandir()`;
+  - require NFC and no casefold/normalization alias;
+  - reject an entry count above policy;
+  - recurse only into a plain directory;
+  - accept only a regular file with `st_nlink == 1`;
+  - reject all other file types before opening them.
+- [ ] Reject `objects/info/alternates` and `objects/info/http-alternates`, and reject environment names that redirect Git objects or quarantine. Treat commit-graph-chain files like every other object-database file: they must remain regular, single-link, bounded, and inside the verified inventory.
+- [ ] Reject pack-side `.promisor` markers in addition to partial/promisor configuration so the object reader cannot depend on lazy fetch.
+- [ ] Build an inventory digest over repository-relative path, kind, mode, device, inode, link count, size, modification time, and change time. Do not include the absolute root.
+
+```python
+@dataclass(frozen=True)
+class ObjectTopologySeal:
+    repository_identity_digest: str
+    git_dir_identity_digest: str
+    object_topology_digest: str
+    file_count: int
+    total_bytes: int
+
+
+def _seal_object_topology(
+    repository_root: Path,
+    git_dir: Path,
+    policy: TaskSnapshotPolicy,
+) -> ObjectTopologySeal:
+    records = _inventory_object_database(git_dir / "objects", policy)
+    return ObjectTopologySeal(
+        repository_identity_digest=_identity_digest(repository_root.lstat()),
+        git_dir_identity_digest=_identity_digest(git_dir.lstat()),
+        object_topology_digest=_record_digest(records),
+        file_count=sum(item.kind == "file" for item in records),
+        total_bytes=sum(item.size for item in records if item.kind == "file"),
+    )
+```
+
+### Step 5: Implement the bounded Git adapter
+
+- [ ] Do not use `cwd=repository_root` or repository discovery. Every object command starts with:
+
+```text
+git
+-c core.fsmonitor=false
+-c core.attributesFile=/dev/null
+-c core.excludesFile=/dev/null
+-c core.hooksPath=/dev/null
+-c submodule.recurse=false
+--git-dir=VERIFIED_ABSOLUTE_GIT_DIR
+```
+
+- [ ] Supply only this environment:
+
+```python
+{
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": os.defpath,
+}
+```
+
+- [ ] Clear all parent `GIT_*` values by replacing rather than extending the environment.
+- [ ] Inspect local config with `config --local --no-includes --null --list` and reject every approved unsupported key before `ls-tree` or `cat-file`.
+- [ ] Implement `_run_git_bounded()` with `subprocess.Popen`, non-shell argv, concurrent stdout/stderr draining, timeout, process-group termination, byte counters, and fixed sanitized errors. Do not use an unbounded `subprocess.run(..., stdout=PIPE)` for object bytes.
+- [ ] Permit only the fixed command families `config`, `rev-parse`, `ls-tree`, and `cat-file blob`.
+
+### Step 6: Emit and verify `TaskSourceTrustReceipt`
+
+- [ ] Capture a before seal, perform only bounded metadata/config probes, capture an after seal, and require exact equality.
+- [ ] Hash the Git policy argv/environment/timeout/output limits into `git_process_policy_digest`.
+- [ ] Return a `task_source_trust` receipt whose payload matches Task 4 and contains no path.
+
+### Step 7: Run the security checkpoint and commit
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_task_snapshot -v
+python3 -m unittest tests.test_live_eval_checkout tests.test_live_eval_harness -v
+git diff --check
+```
+
+- [ ] Request an independent security/isolation review of this slice. Dispose each material finding as `apply`, `ask`, `defer`, or `reject-with-reason`; rerun the smallest test capable of detecting accepted findings.
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/task_snapshot.py tests/test_live_eval_task_snapshot.py
+git commit -m "feat(eval): gate task source object stores"
+```
+
+---
+
+## Task 7: Full-OID Object Materialization and Snapshot Receipts
+
+**Files:**
+
+- Modify: `scripts/live_eval/task_snapshot.py`
+- Modify: `tests/test_live_eval_task_snapshot.py`
+
+### Step 1: Add failing tree and target-materialization tests
+
+- [ ] Test:
+  - a full commit OID resolves to the same fixed tree after a branch ref moves;
+  - working-tree changes and cleanliness are never read;
+  - only regular `100644` and `100755` blobs materialize;
+  - symlink, gitlink, submodule, special mode, traversal, absolute path, empty component, NUL, duplicate, parent/file alias, Unicode alias, and case alias fail;
+  - root, nested, case-aliased, or Unicode-aliased `AGENTS.md` and `AGENTS.override.md` fail;
+  - missing object, changed object, per-file, file-count, and total-byte limits fail;
+  - declared `ls-tree` size and streamed `cat-file blob` byte count mismatch fails;
+  - writes use exclusive no-follow creation and preserve only `0444` or `0555` file modes;
+  - target replacement, extra entry, mode change, content change, hardlink, symlink, or special entry fails the target seal;
+  - the same commit produces equal entry and tree digests in two distinct condition directories;
+  - source and topology seals are identical before and after every object read.
+
+### Step 2: Run the focused test and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_task_snapshot -v
+```
+
+Expected: source gating tests pass while materialization tests fail because the materializer is incomplete.
+
+### Step 3: Parse a fixed tree from one full OID
+
+- [ ] Validate OID length and lowercase hex before Git.
+- [ ] Verify object format with `rev-parse --show-object-format`.
+- [ ] Resolve only `FULL_COMMIT_OID^{commit}` and `FULL_COMMIT_OID^{tree}` using the already validated in-memory OID; reject output that is not one full OID of the declared format.
+- [ ] Run `ls-tree -r -l -z --full-tree TREE_OID` with the already resolved in-memory tree OID and no pathspec, then parse mode, object type, OID, declared size, and path from every NUL-terminated record:
+
+```python
+@dataclass(frozen=True)
+class TaskTreeEntry:
+    path: str
+    mode: str
+    blob_oid: str
+    size: int
+```
+
+- [ ] Validate the complete entry set before calling `cat-file blob`. Sort by UTF-8 bytes, reject aliases and parent/file conflicts, and enforce count and declared-size totals.
+
+### Step 4: Materialize regular blobs with exclusive no-follow writes
+
+- [ ] Create a new private empty target for each condition. Create directories one component at a time and verify their identities.
+- [ ] Open each destination with `O_WRONLY | O_CREAT | O_EXCL` plus `O_NOFOLLOW` when available, verify `fstat()` is a single-link regular file, stream the bounded blob, `fsync()`, set `0444` or `0555`, and verify final identity and size.
+- [ ] Compute:
+  - `entry_digest` over path, Git mode, blob OID, and content digest;
+  - `materialized_tree_digest` independently over target-relative path, target mode, size, and bytes.
+- [ ] Make all target directories `0555`, fsync the tree, and verify exact inventory.
+
+```python
+@dataclass(frozen=True)
+class CapturedTaskObjects:
+    source_trust_receipt: CanonicalReceipt
+    source: TaskSourceSpec = field(repr=False)
+    object_format: str
+    tree_oid: str
+    entries: Tuple[TaskTreeEntry, ...] = field(repr=False)
+    blobs: Mapping[str, bytes] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "entries", tuple(self.entries))
+        object.__setattr__(
+            self,
+            "blobs",
+            MappingProxyType(
+                {key: bytes(value) for key, value in self.blobs.items()}
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class MaterializedTaskSnapshot:
+    snapshot_receipt: CanonicalReceipt
+    target_root: Path = field(repr=False)
+    target_identity_digest: str
+
+
+class TaskSnapshotMaterializer:
+    def __init__(self, policy: TaskSnapshotPolicy) -> None:
+        self._policy = policy
+
+    def capture(self, source: TaskSourceSpec) -> CapturedTaskObjects:
+        before = self._pre_object_gate(source)
+        entries, blobs, object_format, tree_oid = self._load_fixed_objects(source)
+        after = self._seal_and_compare(source, before)
+        trust_receipt = self._trust_receipt(source, before, after, object_format)
+        return CapturedTaskObjects(
+            source_trust_receipt=trust_receipt,
+            source=source,
+            object_format=object_format,
+            tree_oid=tree_oid,
+            entries=entries,
+            blobs=blobs,
+        )
+
+    def materialize(
+        self, captured: CapturedTaskObjects, target_root: Path
+    ) -> MaterializedTaskSnapshot:
+        target_digest = self._materialize_and_verify(
+            target_root, captured.entries, captured.blobs
+        )
+        snapshot_receipt = self._snapshot_receipt(
+            captured.source,
+            captured.source_trust_receipt,
+            captured.object_format,
+            captured.tree_oid,
+            captured.entries,
+            target_digest,
+        )
+        return MaterializedTaskSnapshot(
+            snapshot_receipt=snapshot_receipt,
+            target_root=target_root,
+            target_identity_digest=_path_identity_digest(target_root),
+        )
+```
+
+Inside `materialize()`, pass `captured.entries` and `captured.blobs` to `_materialize_and_verify()`. Capture each selected task once, materialize its current and lean roots from the same capture, require equal snapshot receipt digests, then release the captured bytes before processing the next task. This avoids duplicate Git reads without sharing a writable task tree.
+
+### Step 5: Enforce first-pilot repository exclusions
+
+- [ ] Reject tracked paths for root or nested `AGENTS.md` or `AGENTS.override.md`, project Codex configuration, hooks, MCP configuration, plugins, credentials, and live external integration configuration. Use an exact reviewed path/basename policy, not a free-form content scan.
+- [ ] The first policy version rejects any canonically matched `AGENTS.md` or `AGENTS.override.md`, any path below `.codex/`, `.agents/`, `.claude/`, `.git-hooks/`, `hooks/`, `plugins/`, or `.mcp/`, and basenames `.mcp.json`, `mcp.json`, `.env`, `.env.local`, `.npmrc`, `.pypirc`, `credentials.json`, and `secrets.json`. A policy change creates a new materializer-policy version and plan digest.
+- [ ] Keep validators, assertions, reference fixtures, and expected results outside the materialized model-writable tree. Candidate input binds only their digests.
+- [ ] Bind the candidate's literal allowed-write paths into the plan and future pilot reservation. Phase A validates their canonical relative-path shape; the future containment and validator layers remain responsible for exact pre/post inventory enforcement.
+
+### Step 6: Run focused and live-eval regression tests
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_task_snapshot -v
+python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
+git diff --check
+```
+
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/task_snapshot.py tests/test_live_eval_task_snapshot.py
+git commit -m "feat(eval): materialize fixed task snapshots"
+```
+
+---
+
+## Task 8: Zero-Call Preflight Orchestration
+
+**Files:**
+
+- Create: `scripts/live_eval/experiment.py`
+- Create: `tests/test_live_eval_experiment.py`
+
+### Step 1: Add failing orchestration and poison-pill tests
+
+- [ ] Build synthetic private harness and task repositories in `TemporaryDirectory`.
+- [ ] Test:
+  - both `current` and `lean` source manifests are loaded and their profile identities differ;
+  - both homes are materialized, verified, and sealed with existing public APIs;
+  - every selected task is materialized twice into distinct condition roots with equal snapshot digests;
+  - the task selection and corpus receipts bind the four selected task snapshots;
+  - two future canary templates and eight pilot invocation plans are constructed, but none execute;
+  - schedule, content receipts, and canonical policy documents are deterministic for the same immutable inputs;
+  - the final plan remains path-free but changes when newly created local path-identity digests change, because it binds one exact materialization instance;
+  - source, bundle, plan, or materialized-tree mutation blocks;
+  - cleanup removes only an identity-matching owned tree; a replacement is preserved and produces `cleanup_required`;
+  - cleanup success or failure is recorded identically in the final preflight receipt and public result;
+  - no credential-like environment name is read;
+  - no Codex executable is resolved, probed, or launched;
+  - no socket, HTTP client, live ledger, or model process seam exists;
+  - permitted subprocesses are limited to the new bounded task-object Git adapter and the existing trusted `skill_repo` checkout Git calls reached through `materialize_harness_home()`; Codex/model, authentication, validator, shell, and network processes remain forbidden;
+  - every result has `model_calls=0`, including blocked results.
+
+### Step 2: Run the focused test and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment -v
+```
+
+Expected: import failure because the orchestrator does not exist.
+
+### Step 3: Implement request and result contracts
+
+- [ ] Add:
+
+```python
+@dataclass(frozen=True)
+class ExperimentPreflightRequest:
+    experiment_input: CanonicalExperimentInput
+    bundle_root: Path = field(repr=False)
+    skill_repo: Path = field(repr=False)
+    task_sources: Mapping[str, TaskSourceSpec] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bundle_root", Path(self.bundle_root).absolute())
+        object.__setattr__(self, "skill_repo", Path(self.skill_repo).absolute())
+        object.__setattr__(
+            self, "task_sources", MappingProxyType(dict(self.task_sources))
+        )
+
+
+@dataclass(frozen=True)
+class ExperimentPreflightResult:
+    status: str
+    live_backend_state: str
+    global_agents_marker_state: str
+    pilot_state: str
+    qualification_evidence_classification: str
+    model_calls: int
+    materialization_result: str
+    plan_digest: Optional[str]
+    task_corpus_receipt_digest: Optional[str]
+    preflight_receipt_digest: Optional[str]
+    bundle_digest: Optional[str]
+    current_profile_digest: Optional[str]
+    lean_profile_digest: Optional[str]
+    cleanup_state: str
+    reason_code: str
+```
+
+Success values are:
+
+```text
+status=static_only
+live_backend_state=live_backend_not_implemented
+global_agents_marker_state=global_agents_marker_not_run
+pilot_state=pilot_not_run
+qualification_evidence_classification=operator_attested_static
+model_calls=0
+materialization_result=verified
+cleanup_state=removed
+reason_code=static_preflight_verified
+```
+
+Blocked results use `status=blocked`, `materialization_result=blocked`, the same three not-run states, `model_calls=0`, nullable digests, and a fixed sanitized reason. Qualification is `operator_attested_static` only after the canonical corpus contract is accepted; earlier failures use `not_validated`.
+
+### Step 4: Compose preflight in one direction
+
+- [ ] Implement this orchestration sequence:
+
+```text
+load and validate authoritative plan input
+select and schedule four tasks
+require exactly the selected task-source mapping
+create an owned private temporary root
+load current and lean harness source identities
+materialize, verify, and seal two base homes
+materialize two distinct roots per selected task
+build source-trust, selection, snapshot, and corpus receipts
+build two canary templates and eight pilot invocation plans
+build the immutable experiment plan and plan digest
+identity-check and remove only the owned temporary tree
+build the static preflight receipt only after cleanup is verified
+project the public result
+```
+
+- [ ] Build profile digests from path-free `HarnessManifest` fields only. Do not serialize dataclass `Path` values.
+- [ ] Canary templates bind `read-only`; pilot invocation plans bind `workspace-write`. All bind `approval_policy=never`, the model and reasoning effort, and the approved disablement policy. Only the materialized pilot plans bind local path identities; canary marker, derived-home, executable, and runtime-root identities remain future child evidence.
+- [ ] Represent the future executable only by the required executable-identity policy and CLI version. Phase A must not resolve an executable or claim continuity.
+
+### Step 5: Build selection, corpus, and plan receipts
+
+- [ ] The selection receipt binds candidate-set digest, seed digest, rule, selected IDs, and schedule digest.
+- [ ] The corpus receipt binds selection, qualification, each task snapshot, prompts, validators, assertions, reference outcomes, mutant outcomes, and difficulty assignments.
+- [ ] `build_experiment_plan()` takes only path-free profile and receipt digests plus in-memory canary templates and pilot invocation plans. It serializes their digests, not local paths.
+- [ ] The final `PreflightReceipt` is created only after identity-aware cleanup and records the actual cleanup state. Success binds `cleanup_state=removed`. If a final plan exists but cleanup fails, emit a blocked preflight receipt with `cleanup_state=cleanup_required`, `materialization_result=blocked`, and the same blocked state as the public result. A failure before final plan construction has no preflight receipt digest.
+
+### Step 6: Implement identity-aware cleanup
+
+- [ ] Capture root and descendant identity records before cleanup.
+- [ ] Open entries without following links, verify exact identity and inventory, and remove only the captured tree.
+- [ ] If any entry is replaced, linked, becomes special, or cannot be verified, preserve it and return `cleanup_required`. Do not recursively delete an unverified replacement.
+
+### Step 7: Run focused and legacy golden tests
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment -v
+python3 -m unittest tests.test_canonical_json tests.test_live_eval_checkout tests.test_live_eval_harness tests.test_live_eval_isolation tests.test_live_eval_runner -v
+git diff --check
+```
+
+- [ ] Confirm `git diff --` shows no modification to the five frozen legacy production modules.
+- [ ] Commit:
+
+```bash
+git add scripts/live_eval/experiment.py tests/test_live_eval_experiment.py
+git commit -m "feat(eval): orchestrate zero-call experiment preflight"
+```
+
+---
+
+## Task 9: Preflight-Only CLI, Repository Gate, CI Baseline, and Docs
+
+**Files:**
+
+- Create: `scripts/run_harness_experiment.py`
+- Modify: `tests/test_live_eval_experiment.py`
+- Modify: `scripts/validate_repo.sh`
+- Modify: `tests/test_repository_validation.py`
+- Modify: `.github/workflows/validate.yml`
+- Modify: `README.md`
+- Modify: `CHANGELOG.md`
+- Modify: `docs/forward-test-report.md`
+
+### Step 1: Add failing CLI and repository-contract tests
+
+- [ ] Test:
+  - only the `preflight` subcommand exists;
+  - `canary`, `pilot`, approval, API-key, executable, and live-ledger options exit `2` before orchestration;
+  - required options are `--input`, `--bundle-root`, `--skill-repo`, and four `--task-source task_id=/absolute/repository` bindings matching the selected task set;
+  - duplicate, missing, extra, relative, or malformed task-source bindings fail;
+  - success prints one compact sorted JSON object and exits `0`;
+  - blocked input prints the fixed blocked schema and exits `2`;
+  - output contains no input path, task path, private fixture bytes, or synthetic secret;
+  - the legacy runner CLI, JSON, and exit-code goldens remain unchanged;
+  - repository validation requires every new module, runner, test, and stable fixture;
+  - CI uses `actions/setup-python@v7` with `python-version: "3.9"`;
+  - full unittest discovery remains in `scripts/validate_repo.sh`.
+  - an AST-based dependency test rejects authentication, Codex runner, socket, HTTP-client, and live-ledger imports or calls from every new Phase A module;
+  - the AST allowlist permits `subprocess` only in `task_snapshot.py`; trusted skill-checkout Git remains reachable only through the unchanged public harness API.
+
+### Step 2: Run focused tests and confirm failure
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment tests.test_repository_validation -v
+```
+
+Expected: CLI and integration contract tests fail because the entry point and repository integration are absent.
+
+### Step 3: Implement the thin CLI
+
+- [ ] Follow the repository's direct-script import bootstrap:
+
+```python
+#!/usr/bin/env python3
+"""Run the zero-model-call harness experiment preflight."""
+
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+```
+
+- [ ] Build `argparse` with one required subparser named `preflight`. Parse task-source bindings with `partition("=")`, validate opaque task IDs before paths, and require absolute source paths.
+- [ ] Read the plan file with a CLI-local 1 MiB cap through a no-follow descriptor. Require a regular single-link file, compare `lstat()` and `fstat()` identity, read in bounded chunks, and reject mutation before calling `load_experiment_input()`.
+- [ ] Construct `ExperimentPreflightRequest` from the accepted canonical bytes and call `run_experiment_preflight()`.
+- [ ] Serialize `asdict(result)` with `sort_keys=True`, `separators=(",", ":")`, and `ensure_ascii=False`.
+- [ ] Catch only expected input, OS, plan, snapshot, receipt, and orchestration exceptions. Convert them to the fixed blocked result without exposing exception text.
+- [ ] Do not import `scripts.run_live_eval` or any authentication, executable, network, Codex-process, or ledger module.
+
+### Step 4: Extend repository validation once
+
+- [ ] Add `require_file` entries for:
+
+```text
+.github/workflows/validate.yml
+scripts/run_harness_experiment.py
+scripts/live_eval/experiment.py
+scripts/live_eval/experiment_plan.py
+scripts/live_eval/experiment_receipts.py
+scripts/live_eval/experiment_telemetry.py
+scripts/live_eval/task_snapshot.py
+tests/test_live_eval_experiment.py
+tests/test_live_eval_experiment_plan.py
+tests/test_live_eval_experiment_receipts.py
+tests/test_live_eval_experiment_telemetry.py
+tests/test_live_eval_task_snapshot.py
+tests/fixtures/harness_experiment/valid-plan-input.json
+tests/fixtures/harness_experiment/valid-terminal.jsonl
+```
+
+Do not add duplicate focused test execution to `validate_repo.sh`; its existing full discovery already executes the new tests.
+
+### Step 5: Pin the required Python baseline in CI
+
+- [ ] Insert after checkout:
+
+```yaml
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+
+      - name: Verify Python baseline
+        run: python3 -c 'import sys; assert sys.version_info[:2] == (3, 9), sys.version'
+```
+
+Keep one required 3.9 job. A newer-version matrix is optional future coverage and is not required for Phase A acceptance.
+
+### Step 6: Document only the implemented and verified boundary
+
+- [ ] Add a separate README subsection with the new command shape and explicit distinctions:
+  - legacy planning dry-run;
+  - legacy fixed harness materialization preflight;
+  - Phase A experiment `static_only` preflight;
+  - future live canary and pilot remain unavailable.
+- [ ] Add one `Unreleased` changelog entry for the zero-call experiment foundation.
+- [ ] Update `docs/forward-test-report.md` only after commands run. Record exact validation commands, actual pass/fail state, Python version, `model_calls=0`, and remaining containment/live-approval gates. Do not describe planned evidence as completed evidence.
+
+### Step 7: Run the CLI smoke and integration tests
+
+- [ ] In `test_cli_fixture_backed_preflight_is_static_only`, let the fixture builder create four deterministic temporary commits, write a canonical temporary plan containing those full OIDs, and invoke `main()` with that plan plus the exact private harness and task repositories. Capture stdout, parse the one JSON object, and assert that none of the temporary absolute paths occur in the captured bytes.
+
+- [ ] Assert the JSON contains `status=static_only`, all three not-run states, `qualification_evidence_classification=operator_attested_static`, and `model_calls=0`.
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment tests.test_repository_validation -v
+python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
+git diff --check
+```
+
+### Step 8: Commit the integration slice
+
+- [ ] Commit:
+
+```bash
+git add scripts/run_harness_experiment.py tests/test_live_eval_experiment.py scripts/validate_repo.sh tests/test_repository_validation.py .github/workflows/validate.yml README.md CHANGELOG.md docs/forward-test-report.md
+git commit -m "feat(eval): expose experiment preflight CLI"
+```
+
+---
+
+## Task 10: Independent Review, Final Verification, and Closure
+
+**Files:**
+
+- Modify only files required by accepted review findings.
+
+### Step 1: Run four independent review lenses
+
+- [ ] Review sequentially with evidence:
+  1. security and isolation;
+  2. architecture and legacy compatibility;
+  3. experiment validity and analysis;
+  4. failure-mode and test-detection coverage.
+- [ ] For every material finding, record `apply`, `ask`, `defer`, or `reject-with-reason`.
+- [ ] Accepted findings receive a failing regression test before the fix, followed by the smallest relevant test.
+- [ ] Do not repeat the whole review after each small edit. Re-review the affected lens after a material accepted fix and run the final gate once.
+
+### Step 2: Run the complete acceptance gate
+
+- [ ] Run:
+
+```bash
+python3 -m unittest tests.test_live_eval_experiment_plan -v
+python3 -m unittest tests.test_live_eval_experiment_receipts -v
+python3 -m unittest tests.test_live_eval_experiment_telemetry -v
+python3 -m unittest tests.test_live_eval_task_snapshot -v
+python3 -m unittest tests.test_live_eval_experiment -v
+python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
+./scripts/validate_repo.sh
+git diff --check
+git status --short
+```
+
+Expected:
+
+- all focused and repository-owned tests pass;
+- any external shared-agent audit without `SHARED_AGENTS_ROOT` is reported as `not_run`, not hidden;
+- no model, API, or network call occurs;
+- `.serena/` remains untracked and unstaged.
+
+### Step 3: Perform contract and hygiene scans
+
+- [ ] Confirm frozen legacy modules are byte-identical to their pre-implementation commit:
+
+```bash
+git diff 3a784f3 -- scripts/live_eval/isolation.py scripts/live_eval/checkout.py scripts/live_eval/harness.py scripts/workflow_coordination/canonical_json.py scripts/run_live_eval.py
+```
+
+Expected: no output.
+
+- [ ] Scan the new implementation for forbidden live seams and private-path retention:
+
+```bash
+rg -n "preflight_auth|build_invocation|preflight_isolation|run_eval|run_harness_dry_run|OPENAI_API_KEY|subprocess.*codex|socket|urllib|requests" scripts/live_eval/experiment*.py scripts/run_harness_experiment.py
+rg -n "Path|repository_root|bundle_root|skill_repo|target_root" scripts/live_eval/experiment.py scripts/live_eval/experiment_plan.py scripts/live_eval/experiment_receipts.py
+```
+
+The first scan must have no executable live seam. Matches in the second scan are acceptable only for private in-memory fields or local orchestration and must not enter canonical receipts or result JSON.
+
+- [ ] Check tracked text for the repository's existing public hygiene policy through `./scripts/validate_repo.sh`; do not add a second inconsistent scanner.
+
+### Step 4: Commit accepted review fixes and report residual risk
+
+- [ ] If review changed files, commit one bounded fix set:
+
+```bash
+git add -u scripts tests README.md CHANGELOG.md docs/forward-test-report.md .github/workflows/validate.yml
+git commit -m "fix(eval): close experiment preflight review findings"
+```
+
+- [ ] Final handoff must report:
+  - exact commits;
+  - exact commands and outcomes;
+  - `model_calls=0`;
+  - evidence state `static_only`;
+  - whether cleanup and path-free output were verified;
+  - deferred Phase B containment, canary, live ledger, and paid-call work;
+  - trusted Git/operator topology, operator-attested task qualification, and same-user tampering as residual assumptions.
+
+## Completion Criteria
+
+Phase A implementation is complete only when:
+
+- canonical plan bytes are authoritative and the derived value is deeply immutable;
+- both harness profiles and four task snapshots are bound into one plan digest;
+- each task condition has a distinct sealed tree from the same full commit OID;
+- task-source topology attacks are rejected before object content is read;
+- telemetry and future transition schemas pass their mutation matrices;
+- the planner emits exactly two canary templates and eight pilot invocation plans but executes none;
+- the CLI exposes only `preflight` and every result reports `model_calls=0`;
+- durable output is path-free and raw JSONL is discarded;
+- legacy live-eval golden contracts are unchanged;
+- CI explicitly runs Python 3.9;
+- focused tests, full live-eval discovery, repository validation, and diff checks pass;
+- independent findings are dispositioned and residual risks are explicit.
+
+Phase A completion does not authorize:
+
+- creating or changing TOM's real private bundle;
+- choosing a winning harness;
+- implementing a containment backend;
+- enabling canary or pilot commands;
+- resolving credentials or a Codex executable;
+- making any model/API call;
+- promoting the experiment to a larger study.

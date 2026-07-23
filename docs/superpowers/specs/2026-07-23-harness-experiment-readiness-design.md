@@ -1,6 +1,6 @@
 # Harness Experiment Readiness Design
 
-**Status:** Draft revised after adversarial review; awaiting written-spec final review
+**Status:** Approved for Phase A implementation planning
 **Date:** 2026-07-23
 **Scope:** Zero-model-call foundation for a future `current` versus `lean`
 Codex harness experiment
@@ -196,7 +196,10 @@ legacy canonical JSON helper.
 
 ### 3. Canonical immutable inputs
 
-All external JSON inputs use exact schemas and canonical UTF-8 bytes.
+All external plan, manifest, and receipt JSON inputs use exact schemas and
+canonical UTF-8 bytes. Raw Codex JSONL events are parsed as bounded semantic
+JSON because wire key order and insignificant whitespace are not contractual;
+only their typed allowlist projection is canonically serialized and hashed.
 Parsing rejects:
 
 - duplicate or unknown keys
@@ -660,6 +663,15 @@ records. `UnmaskReceipt` is valid only as a child of that score lock, and
 `DecisionReceipt` binds the unmasked mapping and decision calculation. Packet
 replacement, order mutation, rubric mutation, premature unmasking, or
 post-lock score changes invalidate the chain.
+
+Comparative analysis consumes only a dataset projected by replaying that
+receipt chain. Pilot terminals carry a canonical typed telemetry summary,
+wall time, machine result, and any registered absolute-safety assertion
+identity. Score lock and unmask receipts carry their canonical typed records
+as well as digests over those records. Replay recomputes the nested digests
+and joins neutral IDs to plan-scheduled terminals; scores, durations, token
+counts, machine results, mappings, and safety evidence are never accepted as
+parallel caller-supplied analysis inputs.
 
 ### 4. Decision rules
 
