@@ -47,8 +47,13 @@ Before source access, require:
 
 - `os.getuid`, `st_uid`, `st_dev`, `st_ino`, `st_mtime_ns`, and
   `st_ctime_ns`;
-- `os.killpg`, `os.getpgid`, `start_new_session`, `SIGTERM`, and `SIGKILL`;
-- `os.scandir`, `dir_fd`, `O_NOFOLLOW`, and `O_CLOEXEC`.
+- `os.killpg`, `os.getpgid`, `SIGTERM`, and `SIGKILL`;
+- `O_DIRECTORY`, `O_NOFOLLOW`, and `O_CLOEXEC`;
+- `os.open` and `os.stat` membership in `os.supports_dir_fd`, and
+  `os.scandir` membership in `os.supports_fd`;
+- descriptor-based `os.scandir(fd)` and a `subprocess.Popen` signature that
+  supports the POSIX
+  `subprocess.Popen(..., start_new_session=True)` contract.
 
 Absence of any required facility is `task_source_platform_unsupported`.
 
@@ -63,11 +68,19 @@ Absence of any required facility is `task_source_platform_unsupported`.
 
 Do not repair input with `absolute()` or `resolve()`. Starting at the
 filesystem anchor, `lstat()` every component through the repository root and
-reject every symbolic link. On macOS, tests created below `/var` pass the
-physical `/private/var/...` result explicitly.
+reject every symbolic link. Every ancestor is a plain directory, has
+`st_uid` equal to zero or `os.getuid()`, and normally has
+`st_mode & 0o022 == 0`. The sole writable-ancestor exception is a root-owned
+sticky directory whose immediate child on the accepted path is
+current-user-owned and has `st_mode & 0o022 == 0`; this permits a private
+`TemporaryDirectory` below `/tmp` without trusting another user's entry.
+Capture the ordered, name-free ancestor identity records in each filesystem
+seal. On macOS, tests created below `/var` pass the physical
+`/private/var/...` result explicitly.
 
 The repository root, its in-tree `.git` directory, `.git/objects`, every
-walked object directory, and every accepted control file must:
+walked object directory, every walked object file, every traversed
+administration directory, and every accepted control file must:
 
 - have `st_uid == os.getuid()`;
 - have `st_mode & 0o022 == 0`;
@@ -76,6 +89,15 @@ walked object directory, and every accepted control file must:
 Directories must be plain directories. Files must be regular files with
 `st_nlink == 1`. A `.git` gitfile, linked worktree, external Git directory,
 or external object directory is unsupported.
+
+After validating the anchor lexically, all descent is descriptor relative.
+Open a child directory from its already-open parent with
+`os.open(name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+dir_fd=parent_fd)`, compare `fstat()` with the no-follow metadata observation,
+and pass the verified child descriptor to `os.scandir()`. Apply the same
+parent-descriptor rule to control-file opens. Recheck each directory identity
+after scanning and close every descriptor on every path. A check-then-use
+sequence that later reopens a child by assembled pathname is forbidden.
 
 ## 3. Exact public surface
 
@@ -156,8 +178,18 @@ Exact scalar rules are:
 - every policy integer has exact type `int`, is positive, and is no greater
   than its displayed default hard ceiling;
 - `max_git_stderr_bytes <= max_git_stdout_bytes`,
-  `max_file_bytes <= max_total_bytes`, and all path limits are internally
-  consistent.
+  `max_config_bytes <= max_git_stdout_bytes`,
+  `max_component_bytes <= max_relative_path_bytes`, and
+  `max_file_bytes <= max_total_bytes`. There are no other cross-field
+  inequalities.
+
+`TaskSourceSpec.__post_init__()` takes a one-time `raw_root =
+os.fspath(repository_root)`, validates that exact string, and stores a newly
+constructed `Path(raw_root)`. It never retains the caller's `PathLike`
+instance. Constructors, `prepare_task_source()`, and Task 7 revalidate exact
+dataclass types, exact `vars()` field sets, exact nested dataclass types, and
+every scalar so `object.__new__` or mutable caller state cannot bypass the
+contract.
 
 Task 7 must reject a forged or mutated prepared value by revalidating the
 exact type, fields, nested values, policy, and fresh source seals.
@@ -203,9 +235,24 @@ bounded read it through `max_packed_refs_bytes`, reject malformed bytes or a
 replace ref, and bind its exact digest and identity. Absence is bound as the
 literal state `absent`.
 
-An ordinary `.git/hooks` directory containing only regular, single-link,
-non-writable `*.sample` files is allowed but never opened or executed. Any
-non-sample hook is rejected. The process policy disables hooks independently.
+Packed refs may be empty or header-only. Non-empty bytes contain no NUL or CR
+and end in LF. The first line may
+be one header `# pack-refs with: ` followed by one or more unique tokens selected from
+`peeled`, `fully-peeled`, and `sorted`. A ref record is exactly
+`<full-lowercase-oid> SP <refname>`. A peeled record is exactly
+`^<full-lowercase-oid>` and may occur only once immediately after a ref
+record. Ref names start with `refs/`, contain 1 through 1024 ASCII bytes, have
+no empty, `.` or `..` component, control, space, backslash, consecutive dot,
+`@{`, or `//`, and do not end in `/`, `.`, or `.lock`. Duplicate refs,
+additional comments, and every `refs/replace/` name fail.
+
+An ordinary `.git/hooks` directory containing only regular, single-link
+`*.sample` files with `st_mode & 0o022 == 0` is allowed but never opened or
+executed. Owner-write, including the normal `0755` sample mode, is allowed.
+Any non-sample hook is rejected. Traverse `.git/refs`, `.git/hooks`,
+`.git/worktrees`, and `.git/modules` with the same descriptor-relative
+directory and identity rules; do not follow an intermediate link. The process
+policy disables hooks independently.
 
 ## 5. Exact local-config policy
 
@@ -264,9 +311,215 @@ Every unknown key fails. Explicitly forbidden families include:
 `--no-includes` must ensure that an include target is not opened before the
 include key itself is rejected.
 
-## 6. Object-database grammar and seal
+## 6. Exact canonical evidence documents
 
-Walk `.git/objects` iteratively with `os.scandir()` and never follow links.
+For every document below, `D(value)` means `sha256:` plus lowercase SHA-256
+over `canonical_bytes(value)`. Exact dictionaries reject missing or
+additional keys. Exact integers reject booleans.
+
+An identity record has exactly:
+
+```json
+{"ctime_ns":0,"dev":0,"gid":0,"ino":0,"kind":"directory","mode":493,"mtime_ns":0,"nlink":1,"size":0,"uid":0}
+```
+
+The displayed numbers are shape examples. `kind` is `directory` or `file`;
+`mode` is the exact integer `stat.S_IMODE(st_mode)`; the other values are the
+corresponding nonnegative exact `stat` integers.
+
+### 6.1 Filesystem and control seal `F`
+
+`F = D(filesystem_document)` where the document has exactly:
+
+```json
+{
+  "ancestor_identities": [],
+  "config": {
+    "identity": {},
+    "raw_digest": "sha256:<64 lowercase hex>"
+  },
+  "control_policy_state": {
+    "commondir": "absent",
+    "config_worktree": "absent",
+    "hooks": "absent",
+    "modules": "absent",
+    "object_alternates": "absent",
+    "promisor_markers": "absent",
+    "replace_refs": "absent",
+    "worktrees": "absent"
+  },
+  "document_type": "task-source-filesystem-seal-v1",
+  "expected_object_format": "sha1",
+  "git_dir_identity": {},
+  "objects_identity": {},
+  "packed_refs": {"state": "absent"},
+  "repository_identity": {},
+  "schema_version": 1
+}
+```
+
+The identity placeholders are exact identity records.
+`ancestor_identities` is the anchor-through-parent sequence in traversal
+order and contains no names. `expected_object_format` is `sha1` or `sha256`.
+When packed refs are present, its exact alternative is:
+
+```json
+{"identity":{},"raw_digest":"sha256:<64 lowercase hex>","state":"present"}
+```
+
+The fixed control-state strings state the verified outcome, not caller input.
+`hooks` is exactly `absent` or `sample_only`; `modules` and `worktrees` are
+exactly `absent` or `empty`.
+
+### 6.2 Local configuration seal `C`
+
+After parsing the bounded Git output, create:
+
+```json
+{
+  "document_type": "task-local-config-seal-v1",
+  "raw_config_digest": "sha256:<64 lowercase hex>",
+  "records": [
+    {"key":"core.bare","value":"false"}
+  ],
+  "schema_version": 1
+}
+```
+
+Every record has exactly `key` and `value`. Records are sorted by key UTF-8
+bytes then value UTF-8 bytes. `C = D(config_document)`. The document may exist
+transiently in memory to calculate `C`; raw bytes, records, and values are
+released and only `C` is stored.
+
+### 6.3 Object topology seal `O`
+
+Topology paths are relative to `.git/objects`, not the repository root. The
+root record path is the exact string `.`. Each record has exactly:
+
+```json
+{"ctime_ns":0,"dev":0,"gid":0,"ino":0,"kind":"file","mode":292,"mtime_ns":0,"nlink":1,"path":"pack/pack-<oid>.idx","size":0,"uid":0}
+```
+
+Records are sorted by `path.encode("utf-8")`. The exact outer document is:
+
+```json
+{
+  "document_type": "task-object-topology-v1",
+  "entry_count": 1,
+  "file_count": 0,
+  "object_format": "sha1",
+  "records": [
+    {"ctime_ns":0,"dev":0,"gid":0,"ino":0,"kind":"directory","mode":493,"mtime_ns":0,"nlink":1,"path":".","size":0,"uid":0}
+  ],
+  "schema_version": 1,
+  "total_bytes": 0
+}
+```
+
+The numbers and empty records are shape examples and must agree with the
+actual records. `O = D(topology_document)`, and
+`ObjectTopologySeal.object_topology_digest == O`.
+
+### 6.4 Source authority identity and receipt mapping
+
+The exact source authority document is:
+
+```json
+{
+  "document_type": "task-source-identity-v1",
+  "filesystem_identity_digest": "sha256:<F>",
+  "local_config_digest": "sha256:<C>",
+  "schema_version": 1
+}
+```
+
+`S = D(source_authority_document)`. A prepared source stores `S`, `C`, and
+the typed topology seal containing `O`. Task 7 maps them into the existing
+Task 4 receipt without adding fields:
+
+```text
+source_identity_before_digest = S0 = D(F0, C0 document)
+source_identity_after_digest  = S1 = D(F1, C1 document)
+object_topology_before_digest = O0
+object_topology_after_digest  = O1
+git_process_policy_digest     = P
+inventory_file_count          = topology.file_count
+inventory_total_bytes         = topology.total_bytes
+object_format                 = prepared.object_format
+```
+
+The notation `D(F, C document)` means the exact
+`task-source-identity-v1` document above, not concatenated strings.
+The receipt's task ID, provisioning class, attestation, and local-clone
+policy are copied from the revalidated `TaskSourceSpec`; its input digest
+comes from the authoritative Task 1 input.
+
+### 6.5 Git process policy document `P`
+
+`P = D(process_policy_document)`. It has exactly:
+
+```json
+{
+  "argv_prefix": ["git","-c","core.fsmonitor=false","-c","core.attributesFile=<null-device>","-c","core.excludesFile=<null-device>","-c","core.hooksPath=<null-device>","-c","submodule.recurse=false","--git-dir=<verified-git-dir>"],
+  "close_fds": true,
+  "cwd": "/",
+  "document_type": "task-git-process-policy-v1",
+  "environment": {
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "<null-device>",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "<os.defpath>"
+  },
+  "limits": {
+    "git_termination_grace_milliseconds": 250,
+    "git_timeout_seconds": 15,
+    "max_git_stderr_bytes": 65536,
+    "max_git_stdout_bytes": 16777216
+  },
+  "operation_templates": [],
+  "schema_version": 1,
+  "shell": false,
+  "start_new_session": true,
+  "stdin": "DEVNULL",
+  "termination": ["concurrent-bounded-drain","monotonic-deadline","TERM","bounded-grace","KILL","reap","close-pipes","verify-group-absent"]
+}
+```
+
+`environment` has exactly the keys in Section 8, using `<null-device>` for
+`os.devnull` and `<os.defpath>` for `PATH`. `limits` has exactly
+`git_timeout_seconds`, `git_termination_grace_milliseconds`,
+`max_git_stdout_bytes`, and `max_git_stderr_bytes` with the current validated
+policy integers. `operation_templates` is exactly:
+
+```json
+[
+  ["config","--file=<verified-config>","--no-includes","--null","--list"],
+  ["rev-parse","--show-object-format=storage"],
+  ["rev-parse","--verify","--end-of-options","<validated-full-oid>^{commit}"],
+  ["rev-parse","--verify","--end-of-options","<validated-full-oid>^{tree}"],
+  ["ls-tree","-r","-l","-z","--full-tree","<validated-tree-oid>"],
+  ["cat-file","blob","<validated-full-oid>"]
+]
+```
+
+No actual path or OID enters this document.
+
+## 7. Object-database grammar and seal
+
+Walk `.git/objects` iteratively with the descriptor-relative open and
+`os.scandir(fd)` procedure in Section 2 and never follow links. Every child
+directory is opened from its verified parent fd and `fstat()`-matched before
+descent; no assembled child path is reopened. Every walked directory and
+file has current uid, the repository device, and `st_mode & 0o022 == 0`.
+Every file is additionally regular with `st_nlink == 1`. Enforce these rules
+before the first Git subprocess.
+
 The root record `.` has depth zero and is included in
 `max_object_entries`. The cap counts every directory and file record.
 `file_count` counts files only, and `total_bytes` sums file sizes only. All
@@ -311,7 +564,7 @@ Use repository-relative paths only, sort records by path UTF-8 bytes, and
 digest the canonical document. The absolute root and object contents do not
 enter this document.
 
-## 7. Bounded Git process policy
+## 8. Bounded Git process policy
 
 The global executable ban has one Phase A exception: the literal executable
 name `git` inside `task_snapshot.py`'s fixed adapter. It may not resolve,
@@ -373,32 +626,59 @@ period, send `SIGKILL` when needed, reap the process, and close every pipe.
 Nonzero exit is `task_git_failed`. Spawn, output, timeout, and operation
 failures use their fixed codes and discard raw stderr.
 
+No operation returns until the leader is waited, both pipes reach EOF or are
+closed, and the recorded process group is confirmed absent. Timeout,
+output-limit, drain failure, nonzero exit, or a residual group after nominal
+leader completion always runs TERM/grace/KILL, waits the leader, closes both
+pipes, and verifies group absence. A zero leader status is successful only
+when no group member remains. A residual group after nominal success and
+every internal drain or cleanup failure are `task_git_failed`. If cleanup
+cannot be confirmed, do not preserve an earlier success, timeout, or
+output-limit classification.
+
 `git_process_policy_digest` hashes a canonical
 `task-git-process-policy-v1` document containing the exact prefix, operation
 templates, environment, cwd policy, timeout, grace, caps, termination rules,
 and placeholders `<verified-git-dir>`, `<verified-config>`, and
 `<validated-full-oid>`. It never hashes or retains an actual path.
 
-## 8. Preparation and sole receipt issuance
+## 9. Preparation and sole receipt issuance
 
 `prepare_task_source()` performs, in order:
 
 ```text
 validate source and policy without source access
-capture filesystem/config/object seals F0/C0/O0
-run bounded config and object-format metadata operations
-capture filesystem/config/object seals F1/C1/O1
+capture raw filesystem/control seal F0 and object seal O0
+run bounded config and derive semantic config seal C0
+run bounded object-format metadata operation
+run bounded config again and derive C1
+capture raw filesystem/control seal F1 and object seal O1
 require F0 == F1, C0 == C1, and O0 == O1
-return PreparedTaskSource
+derive S = D(task-source-identity-v1(F0, C0))
+return PreparedTaskSource storing S, C0, O0, format, and P
 ```
 
 It performs no `rev-parse --verify`, `ls-tree`, or `cat-file`, and imports no
 receipt constructor.
 
-Task 7 capture is a separate transaction. It revalidates the prepared value,
-captures fresh F0/C0/O0, performs all fixed-OID object reads, captures
-F1/C1/O1 once after the final object command, and requires all three pairs to
-match. It does not rescan the object database around each blob.
+Task 7 capture is a separate transaction. Before its first Git spawn, require:
+
+- `type(prepared) is PreparedTaskSource` and exact recursive field
+  revalidation succeeds;
+- `prepared.git_dir == prepared.source.repository_root / ".git"`;
+- the materializer's exact validated policy equals `prepared.policy`;
+- a recomputed `P` equals `prepared.git_process_policy_digest`;
+- a fresh raw filesystem/control seal F0 plus fresh config operation C0
+  derives exactly `prepared.source_identity_digest`;
+- `C0 == prepared.local_config_digest`;
+- fresh `O0` equals every field of `prepared.object_topology`;
+- the commit-OID-length format equals `prepared.object_format`.
+
+It then performs all fixed-OID object reads, runs the bounded config operation
+again to derive C1, and captures F1 and O1 once after the final object
+command. Require F1 == F0, C1 == C0, O1 == O0, and the recomputed final source
+identity to equal the prepared source identity. It does not rescan the object
+database around each blob.
 
 Only after those equalities hold does Task 7 issue exactly one
 `task_source_trust` receipt using the existing Task 4 payload. The source
@@ -406,7 +686,7 @@ identity fields bind the full filesystem/config/control seal, the topology
 fields bind the object seal, and the process-policy field binds the path-free
 policy document. Every failure path issues no source-trust receipt.
 
-## 9. Required TDD and security checkpoint
+## 10. Required TDD and security checkpoint
 
 Use table-driven tests for:
 

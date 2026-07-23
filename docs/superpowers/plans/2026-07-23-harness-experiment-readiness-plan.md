@@ -1685,7 +1685,7 @@ That contract takes precedence over illustrative snippets below.
 - [ ] Test rejection before object reads:
   - relative root, root symlink, gitfile, linked worktree, external `commondir`, `core.worktree`, `extensions.worktreeConfig`;
   - system/global/include configuration influence;
-  - filters, hooks, fsmonitor, LFS, submodules, replace refs, alternates, promisor state, quarantine, and external object directories;
+  - filters, non-sample hooks, fsmonitor, LFS, submodules, replace refs, alternates, promisor state, quarantine, and external object directories;
   - symlink, hardlink, FIFO, socket, device, or other special entry anywhere under the object database;
   - loose object, pack, index, bitmap, commit-graph, and multi-pack-index topology attacks;
   - canonical filename aliases, inventory file-count cap, and byte cap;
@@ -1731,6 +1731,9 @@ Expected: import failure because the task snapshot module does not exist.
   ownership, modes, aliases, depth, component/path, entry, and byte limits.
 - [ ] Canonicalize the exact path/kind/mode/device/inode/uid/gid/link/size/
   nanosecond-time records in UTF-8 path order without an absolute path.
+- [ ] Build the five exact versioned canonical evidence documents in the
+  binding and map `task-source-identity-v1(F,C)` plus
+  `task-object-topology-v1` into the unchanged Task 4 receipt fields.
 
 ### Step 5: Implement the bounded Git adapter
 
@@ -1745,9 +1748,10 @@ Expected: import failure because the task snapshot module does not exist.
 
 ### Step 6: Return a prepared source without a receipt
 
-- [ ] Capture filesystem/config/object seals, run only bounded config and
-  object-format metadata probes, recapture all three seals, and require exact
-  equality.
+- [ ] Capture raw filesystem/control and object seals, run bounded config,
+  object-format, and second config probes, then recapture raw filesystem and
+  object seals. Require exact F/C/O pair equality and derive the prepared
+  source identity from the versioned canonical documents.
 - [ ] Return one deeply immutable `PreparedTaskSource`. Do not call commit or
   blob object operations and do not import or construct a receipt.
 - [ ] Reserve the sole authoritative `task_source_trust` receipt for Task 7,
@@ -1909,8 +1913,10 @@ class TaskSnapshotMaterializer:
 ```
 
 Inside `capture()`, issue the sole source-trust receipt only after fresh
-filesystem/config/object seals match across the complete fixed-object read
-transaction. No failure path emits it. Inside `materialize()`, pass
+filesystem/config/object seals first match the exact prepared source and then
+match across the complete fixed-object read transaction. Require the
+materializer policy and recomputed process-policy digest to equal the
+prepared values. No failure path emits a receipt. Inside `materialize()`, pass
 `captured.entries` and `captured.blobs` to `_materialize_and_verify()`.
 Capture each selected task once, materialize its current and lean roots from
 the same capture, require equal snapshot receipt digests, then release the
