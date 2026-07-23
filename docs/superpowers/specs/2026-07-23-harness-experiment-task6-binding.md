@@ -237,14 +237,17 @@ literal state `absent`.
 
 Packed refs may be empty or header-only. Non-empty bytes contain no NUL or CR
 and end in LF. The first line may
-be one header `# pack-refs with: ` followed by one or more unique tokens selected from
-`peeled`, `fully-peeled`, and `sorted`. A ref record is exactly
+be one header `# pack-refs with: ` followed by one or more unique tokens
+selected from `peeled`, `fully-peeled`, and `sorted`, each followed by one
+SP, including exactly one trailing SP before LF. A ref record is exactly
 `<full-lowercase-oid> SP <refname>`. A peeled record is exactly
 `^<full-lowercase-oid>` and may occur only once immediately after a ref
 record. Ref names start with `refs/`, contain 1 through 1024 ASCII bytes, have
-no empty, `.` or `..` component, control, space, backslash, consecutive dot,
-`@{`, or `//`, and do not end in `/`, `.`, or `.lock`. Duplicate refs,
-additional comments, and every `refs/replace/` name fail.
+no empty, `.` or `..` component, no component beginning `.`, and no component
+ending `.lock`. They contain no control, space, `~`, `^`, `:`, `?`, `*`, `[`,
+backslash, `..`, `@{`, or `//`, are not the single name `@`, and do not end
+in `/` or `.`. Duplicate refs, additional comments, and every
+`refs/replace/` name fail.
 
 An ordinary `.git/hooks` directory containing only regular, single-link
 `*.sample` files with `st_mode & 0o022 == 0` is allowed but never opened or
@@ -253,6 +256,13 @@ Any non-sample hook is rejected. Traverse `.git/refs`, `.git/hooks`,
 `.git/worktrees`, and `.git/modules` with the same descriptor-relative
 directory and identity rules; do not follow an intermediate link. The process
 policy disables hooks independently.
+
+Administration checks are bounded. Open verified `.git/refs` and perform one
+direct no-follow lookup of its `replace` child; do not walk the ref tree.
+Enumerate at most `max_object_entries + 1` hook entries, with exactly
+`max_object_entries` accepted and one over rejected. For `worktrees` and
+`modules`, request only the first directory entry and reject immediately when
+one exists; an empty directory is accepted without a full traversal.
 
 ## 5. Exact local-config policy
 
@@ -661,15 +671,17 @@ return PreparedTaskSource storing S, C0, O0, format, and P
 It performs no `rev-parse --verify`, `ls-tree`, or `cat-file`, and imports no
 receipt constructor.
 
-Task 7 capture is a separate transaction. Before its first Git spawn, require:
+Task 7 capture is a separate transaction. Before its first fixed-object Git
+operation, perform in order:
 
 - `type(prepared) is PreparedTaskSource` and exact recursive field
   revalidation succeeds;
 - `prepared.git_dir == prepared.source.repository_root / ".git"`;
 - the materializer's exact validated policy equals `prepared.policy`;
 - a recomputed `P` equals `prepared.git_process_policy_digest`;
-- a fresh raw filesystem/control seal F0 plus fresh config operation C0
-  derives exactly `prepared.source_identity_digest`;
+- capture fresh F0 and O0 without spawning Git;
+- run the bounded config operation to derive C0;
+- require F0 plus C0 to derive exactly `prepared.source_identity_digest`;
 - `C0 == prepared.local_config_digest`;
 - fresh `O0` equals every field of `prepared.object_topology`;
 - the commit-OID-length format equals `prepared.object_format`.
