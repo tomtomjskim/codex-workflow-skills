@@ -168,7 +168,21 @@ validator_policy
 executable_identity_policy
 ```
 
-The required values are `read-only`, `workspace-write`, `never`, nine exact booleans matching the approved design, and non-empty policy identifiers for the final three fields. The serializer binds policy and path-identity digests, never local path strings.
+The required scalar values are `canary_sandbox=read-only`,
+`pilot_sandbox=workspace-write`, and `approval_policy=never`. The nine exact
+booleans are:
+
+```json
+{"hooks_disabled":true,"ignore_rules":true,"ignore_user_config":true,"mcp_disabled":true,"plugins_disabled":true,"provider_transport_allowed":true,"skills_disabled":true,"tool_network_disabled":true,"web_search_disabled":true}
+```
+
+Every value is an actual JSON boolean; integer `0` or `1` is invalid.
+`provider_transport_allowed=true` reserves only a future approved model
+transport. It does not authorize a Phase A connection and does not weaken
+tool or validator network denial. `ignore_rules=true` refers only to
+execpolicy `.rules`, never `AGENTS.md`. The final three policy identifiers
+must be non-empty. The serializer binds policy and path-identity digests,
+never local path strings.
 
 ---
 
@@ -388,6 +402,33 @@ class ExperimentPlan:
         )
 ```
 
+- [ ] Expose this exact path-free builder:
+
+```python
+def build_experiment_plan(
+    experiment_input: CanonicalExperimentInput,
+    *,
+    bundle_digest: str,
+    current_profile_digest: str,
+    lean_profile_digest: str,
+    task_source_trust_receipt_digests: Sequence[str],
+    task_selection_receipt_digest: str,
+    task_corpus_receipt_digest: str,
+    canary_templates: Sequence[CanaryInvocationTemplate],
+    pilot_invocation_plans: Sequence[PilotInvocationPlan],
+) -> ExperimentPlan:
+```
+
+The builder accepts no `Path`, caller-built `plan_document`, caller-supplied
+policy/template/plan digest, separate pilot schedule, or call-allocation
+digest. It recomputes the schedule from the authoritative frozen input,
+requires the source-trust digest sequence to be UTF-8-byte sorted and unique,
+and validates the child plans against that schedule. Canary ordinals/profiles
+are exactly `(1, current)` and `(2, lean)`. Pilot plan ordinals are 3 through
+10, embedded run ordinals are 1 through 8, and every pilot plan ordinal equals
+its run ordinal plus two. The builder computes every child canonical digest
+and the call-allocation digest itself.
+
 `plan_document` contains the exact approved contracts plus:
 
 ```text
@@ -410,7 +451,82 @@ The argv template includes `--ignore-user-config` and `--ignore-rules`. The latt
 
 Canary templates use ordinals 1 and 2 for `current` and `lean`. They bind a base profile and the approved overlay, root-capability, argv, and containment policies, but not a marker, derived-home identity, executable identity, or runtime task root. Those values exist only in future runtime child receipts after Phase B approval. Pilot plans use ordinals 3 through 10 and carry the corresponding scheduled task, condition, sealed local root identities, and capability-root sets.
 
-The module owns fixed V1 canonical documents for the canary append-only overlay recipe, canary response schema, pilot response schema, argv templates, and root-capability policy. Their digests enter the template or pilot plan. A policy-document change changes the plan digest.
+The module owns the following exact V1 canonical policy documents. It hashes
+each with `sha256_bytes(canonical_bytes(document))`; only the resulting digest
+enters a template or pilot plan. A policy-document change changes the plan
+digest.
+
+`canary_overlay_recipe`:
+
+```json
+{"assembly_order":["base_bytes","prefix_utf8","runtime_marker","suffix_utf8"],"base_encoding":"utf-8","base_file_kind":"regular","document_type":"canary_overlay_recipe","marker":{"encoded_length":32,"encoding":"lowercase_hex","entropy_bits":128},"operation":"append_exact_utf8","prefix_utf8":"\n\nReturn this exact opaque canary marker in the required response field: ","preserve_base_bytes":true,"require_marker_absent_before_append":true,"required_derived_marker_occurrences":1,"schema_version":1,"suffix_utf8":"\n","target_relative_path":"AGENTS.md"}
+```
+
+`canary_response_schema`:
+
+```json
+{"$id":"urn:codex-workflow-skills:harness-experiment:canary-response:v1","additionalProperties":false,"properties":{"marker":{"maxLength":32,"minLength":32,"pattern":"^[0-9a-f]{32}$","type":"string"}},"required":["marker"],"type":"object"}
+```
+
+`pilot_response_schema`:
+
+```json
+{"$id":"urn:codex-workflow-skills:harness-experiment:pilot-response:v1","additionalProperties":false,"properties":{"status":{"enum":["completed","blocked"],"type":"string"},"summary":{"maxLength":2048,"minLength":1,"type":"string"}},"required":["status","summary"],"type":"object"}
+```
+
+The argv documents use typed atoms rather than magic string placeholders.
+`runtime_executable_binding=future_child_receipt` means the document binds no
+executable path or identity in Phase A. Slots are declarative only; Task 1
+does not implement a renderer.
+
+`canary_argv_template`:
+
+```json
+{"argv_tail":[{"literal":"-a"},{"literal":"never"},{"literal":"exec"},{"literal":"--json"},{"literal":"--strict-config"},{"literal":"--ephemeral"},{"literal":"--ignore-user-config"},{"literal":"--ignore-rules"},{"literal":"--sandbox"},{"literal":"read-only"},{"literal":"--model"},{"encoding":"one_argv_token","slot":"model_id"},{"literal":"--config"},{"encoding":"canonical_json_string_as_toml_basic_string","prefix":"model_reasoning_effort=","slot":"reasoning_effort"},{"literal":"--output-schema"},{"encoding":"one_argv_token","slot":"output_schema_path"},{"literal":"-"}],"document_type":"canary_argv_template","ignore_rules_semantics":"execpolicy_dot_rules_only","runtime_executable_binding":"future_child_receipt","schema_version":1,"stdin_utf8":"Return the exact opaque canary marker specified by the applicable global AGENTS.md instructions as JSON matching the output schema."}
+```
+
+`pilot_argv_template`:
+
+```json
+{"argv_tail":[{"literal":"-a"},{"literal":"never"},{"literal":"exec"},{"literal":"--json"},{"literal":"--strict-config"},{"literal":"--ephemeral"},{"literal":"--ignore-user-config"},{"literal":"--ignore-rules"},{"literal":"--sandbox"},{"literal":"workspace-write"},{"literal":"--model"},{"encoding":"one_argv_token","slot":"model_id"},{"literal":"--config"},{"encoding":"canonical_json_string_as_toml_basic_string","prefix":"model_reasoning_effort=","slot":"reasoning_effort"},{"literal":"--output-schema"},{"encoding":"one_argv_token","slot":"output_schema_path"},{"literal":"-"}],"document_type":"pilot_argv_template","ignore_rules_semantics":"execpolicy_dot_rules_only","runtime_executable_binding":"future_child_receipt","schema_version":1,"stdin_binding":"plan_candidate_prompt_digest"}
+```
+
+These argv tails match the locally verified pinned `codex-cli 0.145.0`
+grammar: the root approval option precedes `exec`, while strict config,
+ephemeral mode, user/rules isolation, sandbox, model, config, output schema,
+and stdin selection are `exec` options. Runtime compatibility remains a
+future capability-probe requirement; Phase A stores only this declarative
+hash contract.
+
+For the `reasoning_effort` atom, the exact argv token is
+`"model_reasoning_effort=" + canonical_bytes(reasoning_effort).decode("utf-8")`.
+Canonical JSON string encoding is also valid TOML basic-string encoding for
+the already validated NFC, non-surrogate value, so quoting and escaping cannot
+vary under one template digest. The pilot stdin binding resolves only to the
+candidate `prompt_digest` already bound into the plan; Task 1 stores no raw
+pilot prompt.
+
+`environment_policy`:
+
+```json
+{"document_type":"experiment_environment_policy","hooks_disabled":true,"mcp_disabled":true,"parent_environment_inherited":false,"plugins_disabled":true,"provider_transport_allowed":true,"schema_version":1,"skills_disabled":true,"tool_credentials_allowed":false,"tool_network_disabled":true,"transport_credential_binding":"future_runtime_only","validator_network_disabled":true,"web_search_disabled":true}
+```
+
+`root_capability_policy`:
+
+```json
+{"canary_runtime_identities":"future_child_receipt_only","document_type":"root_capability_policy","implicit_roots_allowed":false,"required_sets":["tool_read_root_identity_digests","tool_write_root_identity_digests","validator_read_root_identity_digests","validator_write_root_identity_digests"],"root_identity_format":"sha256_prefixed_digest","schema_version":1,"sets_are_utf8_sorted_unique":true,"tool_and_validator_write_sets_disjoint":true,"tool_write_must_be_readable":true,"unlisted_host_roots_allowed":false,"validator_only_roots_visible_to_tool":false,"validator_write_must_be_readable":true}
+```
+
+The call-allocation digest is derived, not caller supplied. Its canonical
+document is:
+
+```json
+{"canary_calls":2,"concurrency":1,"document_type":"call_allocation","pilot_calls":8,"retry_calls":0,"schema_version":1,"total_calls":10}
+```
+
+The builder rejects input-budget values that cannot produce this exact first
+pilot allocation.
 
 ### Step 5: Implement deterministic pair scheduling
 
