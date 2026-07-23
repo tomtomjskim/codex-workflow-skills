@@ -13,7 +13,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 import unicodedata
 
 from scripts.workflow_coordination.canonical_json import canonical_bytes
@@ -96,6 +97,18 @@ class TaskSnapshotPolicy:
 
 
 @dataclass(frozen=True)
+class TaskTreeEntry:
+    path: str
+    git_mode: str
+    blob_oid: str
+    size: int
+    content_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_task_tree_entry(self)
+
+
+@dataclass(frozen=True)
 class ObjectTopologySeal:
     object_topology_digest: str
     entry_count: int
@@ -134,6 +147,28 @@ class _FilesystemSeal:
     raw_config_digest: str
     git_dir: Path = field(repr=False)
     config_path: Path = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _TaskTreeRecord:
+    path: str
+    git_mode: str
+    blob_oid: str
+    size: int
+
+
+@dataclass(frozen=True)
+class _ParsedTaskTree:
+    object_format: str
+    records: Tuple[_TaskTreeRecord, ...]
+    directories: Tuple[str, ...]
+    blob_sizes: Tuple[Tuple[str, int], ...]
+    file_count: int
+    directory_count: int
+    tree_entry_count: int
+    total_bytes: int
+    unique_blob_count: int
+    unique_blob_bytes: int
 
 
 def _fail(code: str) -> None:
@@ -198,6 +233,525 @@ def _validate_policy(policy: TaskSnapshotPolicy) -> None:
         or policy.max_file_bytes > policy.max_total_bytes
     ):
         _fail("task_snapshot_policy_invalid")
+
+
+_PUBLIC_TASK_TREE_PATH_POLICY = TaskSnapshotPolicy()
+
+
+def _validate_task_tree_entry(entry: TaskTreeEntry) -> None:
+    if (
+        not _exact_fields(entry, TaskTreeEntry)
+        or type(entry.path) is not str
+        or not entry.path
+        or type(entry.git_mode) is not str
+        or entry.git_mode not in ("100644", "100755")
+        or type(entry.blob_oid) is not str
+        or _OID_PATTERN.fullmatch(entry.blob_oid) is None
+        or type(entry.size) is not int
+        or entry.size < 0
+        or type(entry.content_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(entry.content_digest) is None
+    ):
+        _fail("task_tree_invalid")
+    components = _task_path_components(
+        entry.path,
+        _PUBLIC_TASK_TREE_PATH_POLICY,
+    )
+    _validate_task_path_exclusions(components)
+
+
+def _task_path_components(
+    path: str,
+    policy: TaskSnapshotPolicy,
+) -> Tuple[str, ...]:
+    if type(path) is not str:
+        _fail("task_tree_invalid")
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeError:
+        _fail("task_tree_invalid")
+    if len(encoded) > policy.max_relative_path_bytes:
+        _fail("task_tree_limit")
+    if (
+        not path
+        or path.startswith("/")
+        or path.endswith("/")
+        or "\\" in path
+        or unicodedata.normalize("NFC", path) != path
+        or any(
+            unicodedata.category(character) in ("Cc", "Cf", "Cs")
+            for character in path
+        )
+    ):
+        _fail("task_tree_invalid")
+    components = tuple(path.split("/"))
+    if any(
+        not component
+        or component in (".", "..")
+        or component.endswith(".")
+        or component.endswith(" ")
+        for component in components
+    ):
+        _fail("task_tree_invalid")
+    if (
+        len(components) > policy.max_tree_depth
+        or any(
+            len(component.encode("utf-8")) > policy.max_component_bytes
+            for component in components
+        )
+    ):
+        _fail("task_tree_limit")
+    return components
+
+
+def _task_name_key(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def _validate_raw_task_path_limits(
+    raw_path: bytes,
+    policy: TaskSnapshotPolicy,
+) -> None:
+    if len(raw_path) > policy.max_relative_path_bytes:
+        _fail("task_tree_limit")
+    raw_components = raw_path.split(b"/")
+    if (
+        len(raw_components) > policy.max_tree_depth
+        or any(
+            len(component) > policy.max_component_bytes
+            for component in raw_components
+        )
+    ):
+        _fail("task_tree_limit")
+
+
+def _parse_task_blob_size(
+    raw_size: bytes,
+    policy: TaskSnapshotPolicy,
+) -> int:
+    try:
+        decoded_size = raw_size.decode("ascii")
+    except UnicodeDecodeError:
+        _fail("task_tree_invalid")
+    if re.fullmatch(r"(?:0|[1-9][0-9]*)", decoded_size) is None:
+        _fail("task_tree_invalid")
+    maximum_size = str(policy.max_file_bytes)
+    if (
+        len(decoded_size) > len(maximum_size)
+        or (
+            len(decoded_size) == len(maximum_size)
+            and decoded_size > maximum_size
+        )
+    ):
+        _fail("task_blob_limit")
+    return int(decoded_size)
+
+
+def _validate_task_path_exclusions(components: Tuple[str, ...]) -> None:
+    keys = tuple(_task_name_key(component) for component in components)
+    final_key = keys[-1]
+    if ".git" in keys:
+        _fail("task_tree_invalid")
+    if final_key in {
+        "agents.md",
+        "agents.override.md",
+        ".mcp.json",
+        "mcp.json",
+        ".env",
+        ".env.local",
+        ".npmrc",
+        ".pypirc",
+        "credentials.json",
+        "secrets.json",
+    }:
+        _fail("task_tree_invalid")
+    if any(
+        key in {".codex", ".agents", ".claude", ".mcp"}
+        for key in keys[:-1]
+    ):
+        _fail("task_tree_invalid")
+    if (
+        len(keys) > 1
+        and keys[0] in {".git-hooks", "hooks", "plugins"}
+    ):
+        _fail("task_tree_invalid")
+
+
+def _validate_parsed_task_tree(
+    parsed: _ParsedTaskTree,
+    policy: Optional[TaskSnapshotPolicy] = None,
+) -> None:
+    if (
+        type(parsed) is not _ParsedTaskTree
+        or set(vars(parsed))
+        != {item.name for item in fields(_ParsedTaskTree)}
+        or parsed.object_format not in ("sha1", "sha256")
+        or type(parsed.records) is not tuple
+        or type(parsed.directories) is not tuple
+        or type(parsed.blob_sizes) is not tuple
+    ):
+        _fail("task_tree_invalid")
+    oid_length = 40 if parsed.object_format == "sha1" else 64
+    expected_directories = {"."}
+    expected_blob_sizes = {}
+    total_bytes = 0
+    previous_path = None
+    for record in parsed.records:
+        if (
+            type(record) is not _TaskTreeRecord
+            or set(vars(record))
+            != {item.name for item in fields(_TaskTreeRecord)}
+            or type(record.path) is not str
+            or not record.path
+            or type(record.git_mode) is not str
+            or record.git_mode not in ("100644", "100755")
+            or type(record.blob_oid) is not str
+            or len(record.blob_oid) != oid_length
+            or _OID_PATTERN.fullmatch(record.blob_oid) is None
+            or type(record.size) is not int
+            or record.size < 0
+        ):
+            _fail("task_tree_invalid")
+        if (
+            previous_path is not None
+            and previous_path.encode("utf-8")
+            >= record.path.encode("utf-8")
+        ):
+            _fail("task_tree_invalid")
+        previous_path = record.path
+        components = record.path.split("/")
+        for index in range(1, len(components)):
+            expected_directories.add("/".join(components[:index]))
+        existing_size = expected_blob_sizes.get(record.blob_oid)
+        if existing_size is not None and existing_size != record.size:
+            _fail("task_tree_invalid")
+        expected_blob_sizes[record.blob_oid] = record.size
+        total_bytes += record.size
+    expected_blob_items = tuple(
+        sorted(
+            expected_blob_sizes.items(),
+            key=lambda item: item[0].encode("ascii"),
+        )
+    )
+    expected_directory_items = tuple(
+        sorted(expected_directories, key=lambda item: item.encode("utf-8"))
+    )
+    if (
+        parsed.directories != expected_directory_items
+        or parsed.blob_sizes != expected_blob_items
+        or type(parsed.file_count) is not int
+        or parsed.file_count != len(parsed.records)
+        or type(parsed.directory_count) is not int
+        or parsed.directory_count != len(expected_directories)
+        or type(parsed.tree_entry_count) is not int
+        or parsed.tree_entry_count
+        != parsed.file_count + parsed.directory_count
+        or type(parsed.total_bytes) is not int
+        or parsed.total_bytes != total_bytes
+        or type(parsed.unique_blob_count) is not int
+        or parsed.unique_blob_count != len(expected_blob_items)
+        or type(parsed.unique_blob_bytes) is not int
+        or parsed.unique_blob_bytes
+        != sum(size for _, size in expected_blob_items)
+    ):
+        _fail("task_tree_invalid")
+    if policy is not None:
+        _validate_policy(policy)
+        if (
+            parsed.file_count > policy.max_files
+            or parsed.tree_entry_count > policy.max_tree_entries
+        ):
+            _fail("task_tree_limit")
+        if (
+            any(size > policy.max_file_bytes for _, size in parsed.blob_sizes)
+            or parsed.total_bytes > policy.max_total_bytes
+            or parsed.unique_blob_count > policy.max_unique_blobs
+            or parsed.unique_blob_bytes > policy.max_total_bytes
+        ):
+            _fail("task_blob_limit")
+
+
+def _parse_task_tree(
+    output: bytes,
+    object_format: str,
+    policy: TaskSnapshotPolicy,
+) -> _ParsedTaskTree:
+    _validate_policy(policy)
+    if (
+        type(output) is not bytes
+        or type(object_format) is not str
+        or object_format not in ("sha1", "sha256")
+    ):
+        _fail("task_tree_invalid")
+    if output == b"":
+        parsed = _ParsedTaskTree(
+            object_format=object_format,
+            records=(),
+            directories=(".",),
+            blob_sizes=(),
+            file_count=0,
+            directory_count=1,
+            tree_entry_count=1,
+            total_bytes=0,
+            unique_blob_count=0,
+            unique_blob_bytes=0,
+        )
+        _validate_parsed_task_tree(parsed, policy)
+        return parsed
+    if not output.endswith(b"\0"):
+        _fail("task_tree_invalid")
+    raw_records = output[:-1].split(b"\0", policy.max_files)
+    if (
+        len(raw_records) == policy.max_files + 1
+        and b"\0" in raw_records[-1]
+    ):
+        raw_records[-1] = raw_records[-1].split(b"\0", 1)[0]
+    if not raw_records or any(record == b"" for record in raw_records):
+        _fail("task_tree_invalid")
+
+    oid_length = 40 if object_format == "sha1" else 64
+    records = []
+    directories = {"."}
+    files = set()
+    sibling_aliases = {}
+    blob_sizes = {}
+    total_bytes = 0
+    unique_blob_bytes = 0
+    for raw_record in raw_records:
+        fields_bytes = raw_record.split(b"\t", 4)
+        if len(fields_bytes) != 5 or any(
+            field == b"" for field in fields_bytes[:4]
+        ):
+            _fail("task_tree_invalid")
+        raw_path = fields_bytes[4]
+        _validate_raw_task_path_limits(raw_path, policy)
+        try:
+            git_mode, object_type, blob_oid = (
+                field.decode("ascii") for field in fields_bytes[:3]
+            )
+            path = raw_path.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            _fail("task_tree_invalid")
+        if (
+            git_mode not in ("100644", "100755")
+            or object_type != "blob"
+            or len(blob_oid) != oid_length
+            or _OID_PATTERN.fullmatch(blob_oid) is None
+        ):
+            _fail("task_tree_invalid")
+        size = _parse_task_blob_size(fields_bytes[3], policy)
+        components = _task_path_components(path, policy)
+        _validate_task_path_exclusions(components)
+
+        parent_components = []
+        for index, component in enumerate(components):
+            parent = "/".join(parent_components) or "."
+            alias_maps = sibling_aliases.setdefault(
+                parent, ({}, {}, {})
+            )
+            keys = (
+                component,
+                unicodedata.normalize("NFC", component),
+                _task_name_key(component),
+            )
+            for alias_map, key in zip(alias_maps, keys):
+                previous = alias_map.get(key)
+                if previous is not None and previous != component:
+                    _fail("task_tree_invalid")
+                alias_map[key] = component
+            parent_components.append(component)
+            current = "/".join(parent_components)
+            is_final = index == len(components) - 1
+            if is_final:
+                if current in files or current in directories:
+                    _fail("task_tree_invalid")
+                files.add(current)
+                if len(files) > policy.max_files:
+                    _fail("task_tree_limit")
+            else:
+                if current in files:
+                    _fail("task_tree_invalid")
+                directories.add(current)
+            if len(files) + len(directories) > policy.max_tree_entries:
+                _fail("task_tree_limit")
+
+        previous_size = blob_sizes.get(blob_oid)
+        if previous_size is not None and previous_size != size:
+            _fail("task_tree_invalid")
+        if previous_size is None:
+            blob_sizes[blob_oid] = size
+            unique_blob_bytes += size
+            if len(blob_sizes) > policy.max_unique_blobs:
+                _fail("task_blob_limit")
+            if unique_blob_bytes > policy.max_total_bytes:
+                _fail("task_blob_limit")
+        total_bytes += size
+        if total_bytes > policy.max_total_bytes:
+            _fail("task_blob_limit")
+        records.append(
+            _TaskTreeRecord(
+                path=path,
+                git_mode=git_mode,
+                blob_oid=blob_oid,
+                size=size,
+            )
+        )
+
+    sorted_records = tuple(
+        sorted(records, key=lambda item: item.path.encode("utf-8"))
+    )
+    sorted_directories = tuple(
+        sorted(directories, key=lambda item: item.encode("utf-8"))
+    )
+    sorted_blob_sizes = tuple(
+        sorted(
+            blob_sizes.items(),
+            key=lambda item: item[0].encode("ascii"),
+        )
+    )
+    parsed = _ParsedTaskTree(
+        object_format=object_format,
+        records=sorted_records,
+        directories=sorted_directories,
+        blob_sizes=sorted_blob_sizes,
+        file_count=len(sorted_records),
+        directory_count=len(sorted_directories),
+        tree_entry_count=len(sorted_records) + len(sorted_directories),
+        total_bytes=total_bytes,
+        unique_blob_count=len(sorted_blob_sizes),
+        unique_blob_bytes=unique_blob_bytes,
+    )
+    _validate_parsed_task_tree(parsed, policy)
+    return parsed
+
+
+def _load_task_blobs(
+    git_dir: Path,
+    config_path: Path,
+    parsed: _ParsedTaskTree,
+    policy: TaskSnapshotPolicy,
+    *,
+    capture_deadline: Optional[float] = None,
+) -> Tuple[Tuple[TaskTreeEntry, ...], Mapping[str, bytes]]:
+    _validate_parsed_task_tree(parsed, policy)
+    contents = {}
+    content_digests = {}
+    algorithm = hashlib.sha1 if parsed.object_format == "sha1" else hashlib.sha256
+    for blob_oid, declared_size in parsed.blob_sizes:
+        content = _run_git(
+            git_dir,
+            config_path,
+            policy,
+            "cat-blob",
+            blob_oid,
+            capture_deadline=capture_deadline,
+            stdout_limit=declared_size,
+        )
+        if type(content) is not bytes or len(content) != declared_size:
+            _fail("task_blob_invalid")
+        framed = (
+            b"blob "
+            + str(len(content)).encode("ascii")
+            + b"\0"
+            + content
+        )
+        if algorithm(framed).hexdigest() != blob_oid:
+            _fail("task_blob_invalid")
+        contents[blob_oid] = bytes(content)
+        content_digests[blob_oid] = (
+            "sha256:" + hashlib.sha256(content).hexdigest()
+        )
+    entries = tuple(
+        TaskTreeEntry(
+            path=record.path,
+            git_mode=record.git_mode,
+            blob_oid=record.blob_oid,
+            size=record.size,
+            content_digest=content_digests[record.blob_oid],
+        )
+        for record in parsed.records
+    )
+    return entries, MappingProxyType(dict(contents))
+
+
+def _task_entry_document(
+    commit_oid: str,
+    tree_oid: str,
+    parsed: _ParsedTaskTree,
+    entries: Tuple[TaskTreeEntry, ...],
+) -> Dict[str, object]:
+    _validate_parsed_task_tree(parsed)
+    oid_length = 40 if parsed.object_format == "sha1" else 64
+    if (
+        type(commit_oid) is not str
+        or len(commit_oid) != oid_length
+        or _OID_PATTERN.fullmatch(commit_oid) is None
+        or type(tree_oid) is not str
+        or len(tree_oid) != oid_length
+        or _OID_PATTERN.fullmatch(tree_oid) is None
+        or type(entries) is not tuple
+        or len(entries) != len(parsed.records)
+    ):
+        _fail("task_tree_invalid")
+    digest_by_oid = {}
+    entry_documents = []
+    total_bytes = 0
+    for record, entry in zip(parsed.records, entries):
+        _validate_task_tree_entry(entry)
+        if (
+            entry.path != record.path
+            or entry.git_mode != record.git_mode
+            or entry.blob_oid != record.blob_oid
+            or entry.size != record.size
+        ):
+            _fail("task_tree_invalid")
+        previous_digest = digest_by_oid.get(entry.blob_oid)
+        if (
+            previous_digest is not None
+            and previous_digest != entry.content_digest
+        ):
+            _fail("task_blob_invalid")
+        digest_by_oid[entry.blob_oid] = entry.content_digest
+        total_bytes += entry.size
+        entry_documents.append(
+            {
+                "blob_oid": entry.blob_oid,
+                "content_digest": entry.content_digest,
+                "git_mode": entry.git_mode,
+                "path": entry.path,
+                "size": entry.size,
+            }
+        )
+    if (
+        total_bytes != parsed.total_bytes
+        or len(digest_by_oid) != parsed.unique_blob_count
+    ):
+        _fail("task_blob_invalid")
+    return {
+        "commit_oid": commit_oid,
+        "directory_count": parsed.directory_count,
+        "document_type": "task-tree-entries-v1",
+        "entries": entry_documents,
+        "file_count": parsed.file_count,
+        "logical_total_bytes": parsed.total_bytes,
+        "object_format": parsed.object_format,
+        "schema_version": 1,
+        "tree_entry_count": parsed.tree_entry_count,
+        "tree_oid": tree_oid,
+        "unique_blob_bytes": parsed.unique_blob_bytes,
+        "unique_blob_count": parsed.unique_blob_count,
+    }
+
+
+def _task_entry_digest(
+    commit_oid: str,
+    tree_oid: str,
+    parsed: _ParsedTaskTree,
+    entries: Tuple[TaskTreeEntry, ...],
+) -> str:
+    return _digest(
+        _task_entry_document(commit_oid, tree_oid, parsed, entries)
+    )
 
 
 def _require_supported_platform() -> None:

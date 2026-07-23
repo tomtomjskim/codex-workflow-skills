@@ -3,8 +3,10 @@ from pathlib import Path
 import subprocess
 import tempfile
 import errno
+import hashlib
 import io
 import socket
+from types import MappingProxyType
 import unittest
 from dataclasses import fields, replace
 from unittest.mock import patch
@@ -13,6 +15,7 @@ import scripts.live_eval.task_snapshot as task_snapshot_module
 from scripts.live_eval.task_snapshot import (
     ObjectTopologySeal,
     PreparedTaskSource,
+    TaskTreeEntry,
     TaskSnapshotError,
     TaskSnapshotPolicy,
     TaskSourceSpec,
@@ -24,9 +27,13 @@ from scripts.live_eval.task_snapshot import (
     _parse_config_output,
     _parse_packed_refs,
     _process_policy_digest,
+    _load_task_blobs,
+    _parse_task_tree,
     _require_supported_platform,
     _run_git,
     _source_identity_digest,
+    _task_entry_digest,
+    _task_entry_document,
     _open_child_directory,
     _validate_physical_root,
     prepare_task_source,
@@ -1893,6 +1900,563 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
             )
         self.assertIn(task_snapshot_module.signal.SIGTERM, signals)
         self.assertFalse(group_alive["value"])
+
+
+class TaskSnapshotTreeEvidenceTests(RepositoryFixture, unittest.TestCase):
+    @staticmethod
+    def blob_oid(content, object_format):
+        framed = (
+            b"blob "
+            + str(len(content)).encode("ascii")
+            + b"\0"
+            + content
+        )
+        algorithm = hashlib.sha1 if object_format == "sha1" else hashlib.sha256
+        return algorithm(framed).hexdigest()
+
+    @staticmethod
+    def tree_record(path, oid, size, mode="100644"):
+        return (
+            mode.encode("ascii")
+            + b"\tblob\t"
+            + oid.encode("ascii")
+            + b"\t"
+            + str(size).encode("ascii")
+            + b"\t"
+            + path.encode("utf-8")
+            + b"\0"
+        )
+
+    def test_empty_and_sha_variants_build_sorted_immutable_evidence(self):
+        policy = TaskSnapshotPolicy()
+        empty = _parse_task_tree(b"", "sha1", policy)
+        self.assertEqual(empty.file_count, 0)
+        self.assertEqual(empty.directory_count, 1)
+        self.assertEqual(empty.tree_entry_count, 1)
+        self.assertEqual(empty.total_bytes, 0)
+        self.assertEqual(empty.unique_blob_count, 0)
+        self.assertEqual(empty.unique_blob_bytes, 0)
+
+        for object_format in ("sha1", "sha256"):
+            with self.subTest(object_format=object_format):
+                first = b"same"
+                second = b"other"
+                first_oid = self.blob_oid(first, object_format)
+                second_oid = self.blob_oid(second, object_format)
+                output = b"".join(
+                    (
+                        self.tree_record(
+                            "z.sh", first_oid, len(first), "100755"
+                        ),
+                        self.tree_record(
+                            "a.txt", second_oid, len(second)
+                        ),
+                        self.tree_record(
+                            "nested/repeat.txt", first_oid, len(first)
+                        ),
+                    )
+                )
+                parsed = _parse_task_tree(output, object_format, policy)
+                calls = []
+                contents = {first_oid: first, second_oid: second}
+
+                def run_git(
+                    git_dir,
+                    config_path,
+                    selected_policy,
+                    operation,
+                    value=None,
+                    *,
+                    capture_deadline=None,
+                    stdout_limit=None
+                ):
+                    calls.append((operation, value, stdout_limit))
+                    return contents[value]
+
+                with patch(
+                    "scripts.live_eval.task_snapshot._run_git",
+                    side_effect=run_git,
+                ):
+                    entries, blobs = _load_task_blobs(
+                        Path("/repo/.git"),
+                        Path("/repo/.git/config"),
+                        parsed,
+                        policy,
+                        capture_deadline=10.0,
+                    )
+
+                self.assertEqual(
+                    [entry.path for entry in entries],
+                    ["a.txt", "nested/repeat.txt", "z.sh"],
+                )
+                self.assertEqual(entries[-1].git_mode, "100755")
+                self.assertEqual(type(blobs), MappingProxyType)
+                self.assertEqual(
+                    list(blobs),
+                    sorted((first_oid, second_oid), key=lambda item: item.encode("ascii")),
+                )
+                self.assertEqual(
+                    calls,
+                    [
+                        ("cat-blob", oid, len(contents[oid]))
+                        for oid in sorted(
+                            contents, key=lambda item: item.encode("ascii")
+                        )
+                    ],
+                )
+                self.assertEqual(parsed.file_count, 3)
+                self.assertEqual(parsed.directory_count, 2)
+                self.assertEqual(parsed.total_bytes, 13)
+                self.assertEqual(parsed.unique_blob_count, 2)
+                self.assertEqual(parsed.unique_blob_bytes, 9)
+
+    def test_tree_framing_and_scalar_grammar_rejects_malformed_records(self):
+        oid = "a" * 40
+        valid = self.tree_record("file.py", oid, 1)
+        attacks = (
+            valid[:-1],
+            valid + b"\0",
+            b"100644\tblob\t" + oid.encode("ascii") + b"\t1\0",
+            b"100600\tblob\t" + oid.encode("ascii") + b"\t1\tfile.py\0",
+            b"100644\ttree\t" + oid.encode("ascii") + b"\t1\tfile.py\0",
+            b"100644\tblob\t" + ("A" * 40).encode("ascii") + b"\t1\tfile.py\0",
+            b"100644\tblob\t" + oid.encode("ascii") + b"\t01\tfile.py\0",
+            b"100644\tblob\t" + oid.encode("ascii") + b"\t-1\tfile.py\0",
+            b"100644\tbl\xc3\xb6b\t" + oid.encode("ascii") + b"\t1\tfile.py\0",
+        )
+        for payload in attacks:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_tree_invalid$"
+            ):
+                _parse_task_tree(payload, "sha1", TaskSnapshotPolicy())
+
+    def test_huge_canonical_size_fails_closed_before_integer_conversion(self):
+        payload = (
+            b"100644\tblob\t"
+            + b"a" * 40
+            + b"\t"
+            + b"9" * 5000
+            + b"\tfile.py\0"
+        )
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_blob_limit$"
+        ) as raised:
+            _parse_task_tree(payload, "sha1", TaskSnapshotPolicy())
+        self.assertIsNone(raised.exception.__context__)
+        self.assertIsNone(raised.exception.__cause__)
+
+    def test_raw_path_caps_precede_decode_and_unicode_work(self):
+        oid = b"a" * 40
+        prefix = b"100644\tblob\t" + oid + b"\t0\t"
+        policy = TaskSnapshotPolicy()
+        over_cap_paths = (
+            b"a" * (policy.max_relative_path_bytes + 1),
+            b"a" * (policy.max_component_bytes + 1),
+            b"/".join(b"a" for _ in range(policy.max_tree_depth + 1)),
+        )
+        for raw_path in over_cap_paths:
+            with self.subTest(length=len(raw_path)), patch(
+                "scripts.live_eval.task_snapshot.unicodedata.normalize",
+                side_effect=AssertionError("normalization must not run"),
+            ), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_tree_limit$"
+            ):
+                _parse_task_tree(
+                    prefix + raw_path + b"\0",
+                    "sha1",
+                    policy,
+                )
+
+        invalid_utf8 = b"\xff" * (policy.max_relative_path_bytes + 1)
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_limit$"
+        ):
+            _parse_task_tree(prefix + invalid_utf8 + b"\0", "sha1", policy)
+
+    def test_record_flood_is_bounded_and_fails_with_tree_limit(self):
+        payload = b"".join(
+            self.tree_record(
+                "f{:04d}".format(index),
+                "{:040x}".format(index + 1),
+                0,
+            )
+            for index in range(1000)
+        )
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_limit$"
+        ):
+            _parse_task_tree(
+                payload,
+                "sha1",
+                TaskSnapshotPolicy(max_files=2),
+            )
+
+    def test_path_grammar_aliases_and_file_directory_conflicts_fail(self):
+        oid = "a" * 40
+        invalid_paths = (
+            "/absolute",
+            "trailing/",
+            "empty//part",
+            ".",
+            "..",
+            "a/./b",
+            "a/../b",
+            "back\\slash",
+            "trailing.",
+            "trailing ",
+            "tab\tname",
+            "zero\u200bwidth",
+            "e\u0301.py",
+        )
+        for path in invalid_paths:
+            with self.subTest(path=path), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_tree_invalid$"
+            ):
+                _parse_task_tree(
+                    self.tree_record(path, oid, 1),
+                    "sha1",
+                    TaskSnapshotPolicy(),
+                )
+
+        invalid_utf8 = (
+            b"100644\tblob\t"
+            + oid.encode("ascii")
+            + b"\t1\tbad-\xff\0"
+        )
+        collisions = (
+            self.tree_record("Straße.py", oid, 1)
+            + self.tree_record("STRASSE.py", "b" * 40, 1),
+            self.tree_record("same", oid, 1)
+            + self.tree_record("same", oid, 1),
+            self.tree_record("parent", oid, 1)
+            + self.tree_record("parent/child", "b" * 40, 1),
+            self.tree_record("parent/child", oid, 1)
+            + self.tree_record("parent", "b" * 40, 1),
+        )
+        for payload in (invalid_utf8,) + collisions:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_tree_invalid$"
+            ):
+                _parse_task_tree(payload, "sha1", TaskSnapshotPolicy())
+
+    def test_exclusion_scopes_reject_only_the_enumerated_boundaries(self):
+        oid = "a" * 40
+        denied = (
+            ".GiT/config",
+            "src/AGENTS.MD",
+            "src/agents.override.md",
+            "src/.CoDeX/config.toml",
+            "src/.agents/role.md",
+            "src/.claude/config",
+            "src/.mcp/config",
+            ".git-hooks/pre-commit",
+            "Hooks/pre-commit",
+            "PLUGINS/tool.py",
+            "src/.mcp.json",
+            "src/mcp.json",
+            "src/.env",
+            "src/.ENV.LOCAL",
+            "src/.npmrc",
+            "src/.pypirc",
+            "src/CREDENTIALS.JSON",
+            "src/secrets.json",
+            "src/.GIT",
+        )
+        for path in denied:
+            with self.subTest(path=path), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_tree_invalid$"
+            ):
+                _parse_task_tree(
+                    self.tree_record(path, oid, 1),
+                    "sha1",
+                    TaskSnapshotPolicy(),
+                )
+
+        allowed = b"".join(
+            (
+                self.tree_record(".agents", oid, 1),
+                self.tree_record(".claude", oid, 1),
+                self.tree_record(".codex", oid, 1),
+                self.tree_record(".env.production", oid, 1),
+                self.tree_record(".git-hooks", oid, 1),
+                self.tree_record(".mcp", oid, 1),
+                self.tree_record("hooks", oid, 1),
+                self.tree_record("plugins", oid, 1),
+                self.tree_record("src/.git-hooks/tool.py", oid, 1),
+                self.tree_record("src/hooks/tool.py", oid, 1),
+                self.tree_record("src/plugins/tool.py", oid, 1),
+            )
+        )
+        parsed = _parse_task_tree(allowed, "sha1", TaskSnapshotPolicy())
+        self.assertEqual(parsed.file_count, 11)
+
+    def test_public_tree_entry_rejects_unvalidated_path(self):
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_invalid$"
+        ):
+            TaskTreeEntry(
+                path="../escape",
+                git_mode="100644",
+                blob_oid="a" * 40,
+                size=1,
+                content_digest="sha256:" + "b" * 64,
+            )
+
+    def test_complete_tree_limits_are_decided_before_blob_loading(self):
+        accepted = b"".join(
+            self.tree_record(
+                "f{:03d}".format(index),
+                "{:040x}".format(index + 1),
+                0,
+            )
+            for index in range(256)
+        )
+        parsed = _parse_task_tree(
+            accepted,
+            "sha1",
+            TaskSnapshotPolicy(max_files=256),
+        )
+        self.assertEqual(parsed.unique_blob_count, 256)
+
+        attacks = (
+            (
+                accepted
+                + self.tree_record("overflow", "{:040x}".format(257), 0),
+                TaskSnapshotPolicy(max_files=257),
+                "task_blob_limit",
+            ),
+            (
+                self.tree_record("one", "a" * 40, 0)
+                + self.tree_record("two", "a" * 40, 0),
+                TaskSnapshotPolicy(max_files=1),
+                "task_tree_limit",
+            ),
+            (
+                self.tree_record("dir/file", "a" * 40, 0),
+                TaskSnapshotPolicy(max_tree_entries=2),
+                "task_tree_limit",
+            ),
+            (
+                self.tree_record("large", "a" * 40, 2),
+                TaskSnapshotPolicy(max_file_bytes=1),
+                "task_blob_limit",
+            ),
+        )
+        for payload, policy, expected in attacks:
+            with self.subTest(expected=expected), patch(
+                "scripts.live_eval.task_snapshot._run_git"
+            ) as run_git, self.assertRaisesRegex(
+                TaskSnapshotError, "^" + expected + "$"
+            ):
+                parsed = _parse_task_tree(payload, "sha1", policy)
+                _load_task_blobs(
+                    Path("/repo/.git"),
+                    Path("/repo/.git/config"),
+                    parsed,
+                    policy,
+                )
+            run_git.assert_not_called()
+
+    def test_path_and_logical_byte_limits_use_fixed_classifications(self):
+        cases = (
+            (
+                self.tree_record("ab", "a" * 40, 0),
+                TaskSnapshotPolicy(max_component_bytes=1),
+                "task_tree_limit",
+            ),
+            (
+                self.tree_record("ab/c", "a" * 40, 0),
+                TaskSnapshotPolicy(
+                    max_component_bytes=3,
+                    max_relative_path_bytes=3,
+                ),
+                "task_tree_limit",
+            ),
+            (
+                self.tree_record("a/b", "a" * 40, 0),
+                TaskSnapshotPolicy(max_tree_depth=1),
+                "task_tree_limit",
+            ),
+            (
+                self.tree_record("one", "a" * 40, 1)
+                + self.tree_record("two", "a" * 40, 1),
+                TaskSnapshotPolicy(
+                    max_file_bytes=1,
+                    max_total_bytes=1,
+                ),
+                "task_blob_limit",
+            ),
+        )
+        for payload, policy, expected in cases:
+            with self.subTest(expected=expected), self.assertRaisesRegex(
+                TaskSnapshotError, "^" + expected + "$"
+            ):
+                _parse_task_tree(payload, "sha1", policy)
+
+    def test_all_semantic_caps_are_inclusive(self):
+        oid = "a" * 40
+        accepted = (
+            (
+                self.tree_record("ab", oid, 0),
+                TaskSnapshotPolicy(max_component_bytes=2),
+            ),
+            (
+                self.tree_record("ab/c", oid, 0),
+                TaskSnapshotPolicy(
+                    max_component_bytes=3,
+                    max_relative_path_bytes=4,
+                ),
+            ),
+            (
+                self.tree_record("a/b", oid, 0),
+                TaskSnapshotPolicy(max_tree_depth=2),
+            ),
+            (
+                self.tree_record("dir/file", oid, 0),
+                TaskSnapshotPolicy(max_tree_entries=3),
+            ),
+            (
+                self.tree_record("one", oid, 1),
+                TaskSnapshotPolicy(
+                    max_file_bytes=1,
+                    max_total_bytes=1,
+                ),
+            ),
+            (
+                self.tree_record("one", oid, 1)
+                + self.tree_record("two", oid, 1),
+                TaskSnapshotPolicy(
+                    max_file_bytes=1,
+                    max_total_bytes=2,
+                ),
+            ),
+        )
+        for payload, policy in accepted:
+            with self.subTest(policy=policy):
+                self.assertGreaterEqual(
+                    _parse_task_tree(payload, "sha1", policy).file_count,
+                    1,
+                )
+
+    def test_duplicate_classification_precedes_file_cap(self):
+        record = self.tree_record("same", "a" * 40, 0)
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_invalid$"
+        ):
+            _parse_task_tree(
+                record + record,
+                "sha1",
+                TaskSnapshotPolicy(max_files=1),
+            )
+
+    def test_repeated_oid_size_mismatch_fails_before_loading(self):
+        payload = (
+            self.tree_record("one", "a" * 40, 1)
+            + self.tree_record("two", "a" * 40, 2)
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot._run_git"
+        ) as run_git, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_invalid$"
+        ):
+            parsed = _parse_task_tree(
+                payload, "sha1", TaskSnapshotPolicy()
+            )
+            _load_task_blobs(
+                Path("/repo/.git"),
+                Path("/repo/.git/config"),
+                parsed,
+                TaskSnapshotPolicy(),
+            )
+        run_git.assert_not_called()
+
+    def test_blob_loader_rejects_short_long_and_oid_mismatch(self):
+        content = b"good"
+        oid = self.blob_oid(content, "sha1")
+        parsed = _parse_task_tree(
+            self.tree_record("file", oid, len(content)),
+            "sha1",
+            TaskSnapshotPolicy(),
+        )
+        for returned in (b"bad", b"longer", b"evil"):
+            with self.subTest(returned=returned), patch(
+                "scripts.live_eval.task_snapshot._run_git",
+                return_value=returned,
+            ), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_blob_invalid$"
+            ):
+                _load_task_blobs(
+                    Path("/repo/.git"),
+                    Path("/repo/.git/config"),
+                    parsed,
+                    TaskSnapshotPolicy(),
+                )
+
+    def test_entry_document_separates_logical_and_unique_aggregates(self):
+        content = b"x"
+        oid = self.blob_oid(content, "sha1")
+        parsed = _parse_task_tree(
+            self.tree_record("b", oid, 1)
+            + self.tree_record("a", oid, 1, "100755"),
+            "sha1",
+            TaskSnapshotPolicy(),
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot._run_git",
+            return_value=content,
+        ):
+            entries, blobs = _load_task_blobs(
+                Path("/repo/.git"),
+                Path("/repo/.git/config"),
+                parsed,
+                TaskSnapshotPolicy(),
+            )
+        commit_oid = "b" * 40
+        tree_oid = "c" * 40
+        document = _task_entry_document(
+            commit_oid, tree_oid, parsed, entries
+        )
+        content_digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        self.assertEqual(
+            document,
+            {
+                "commit_oid": commit_oid,
+                "directory_count": 1,
+                "document_type": "task-tree-entries-v1",
+                "entries": [
+                    {
+                        "blob_oid": oid,
+                        "content_digest": content_digest,
+                        "git_mode": "100755",
+                        "path": "a",
+                        "size": 1,
+                    },
+                    {
+                        "blob_oid": oid,
+                        "content_digest": content_digest,
+                        "git_mode": "100644",
+                        "path": "b",
+                        "size": 1,
+                    },
+                ],
+                "file_count": 2,
+                "logical_total_bytes": 2,
+                "object_format": "sha1",
+                "schema_version": 1,
+                "tree_entry_count": 3,
+                "tree_oid": tree_oid,
+                "unique_blob_bytes": 1,
+                "unique_blob_count": 1,
+            },
+        )
+        self.assertEqual(
+            _task_entry_digest(commit_oid, tree_oid, parsed, entries),
+            "sha256:" + hashlib.sha256(
+                task_snapshot_module.canonical_bytes(document)
+            ).hexdigest(),
+        )
+        self.assertEqual(type(entries[0]), TaskTreeEntry)
+        self.assertEqual(type(blobs), MappingProxyType)
 
 
 class TaskSnapshotPreparationTests(RepositoryFixture, unittest.TestCase):
