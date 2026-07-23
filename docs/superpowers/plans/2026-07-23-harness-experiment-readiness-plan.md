@@ -346,6 +346,7 @@ class CanaryInvocationTemplate:
 class PilotInvocationPlan:
     ordinal: int
     run: PlannedRun
+    snapshot_receipt_digest: str
     model_id: str
     reasoning_effort: str
     sandbox: str
@@ -1032,6 +1033,18 @@ git commit -m "feat(eval): add canonical telemetry summaries"
 ---
 
 ## Task 4: Canonical Receipts and Pure Runtime Transition Validation
+
+### Binding clarification
+
+The normative ambiguity-resolution contract for this task is:
+
+`docs/superpowers/specs/2026-07-23-harness-experiment-task4-binding.md`
+
+Read and apply it in full. It closes the plan-bound snapshot seam, envelope
+and error rules, runtime recovery/stop conflict, nested digest documents,
+analysis-source identity, projection joins, and deterministic decision output.
+For Task 4, that document takes precedence where this task's prose is
+underspecified. It does not expand Phase A into live execution.
 
 **Files:**
 
