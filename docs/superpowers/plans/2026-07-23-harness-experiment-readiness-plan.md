@@ -4,7 +4,7 @@
 
 **Goal:** Implement the approved zero-model-call Phase A foundation for a future `current` versus `lean` harness experiment, with immutable plan identities, hardened task snapshots, synthetic telemetry and receipt validation, and a preflight-only CLI.
 
-**Architecture:** Add a new experiment module family and CLI beside the legacy live-eval runner. Canonical plan bytes are authoritative, task repositories are read only through a separately hardened full-OID Git-object adapter, and every retained output is a path-free typed projection. Phase A materializes and verifies both harness profiles and distinct condition task trees, constructs two future canary templates and eight pilot invocation plans, validates future runtime transitions with synthetic records, emits a `static_only` preflight receipt, and contains no path that can authenticate or launch Codex.
+**Architecture:** Add a new experiment module family and CLI beside the legacy live-eval runner. Canonical plan bytes are authoritative, task repositories are read only through a separately hardened full-OID Git-object adapter, and retained outputs exclude absolute and host-local paths while the plan intentionally retains repository-relative allowed-write authority. Phase A materializes and verifies both harness profiles and distinct condition task trees, constructs two future canary templates and eight pilot invocation plans, validates future runtime transitions with synthetic records, emits a `static_only` preflight receipt, and contains no path that can authenticate or launch Codex.
 
 **Tech Stack:** Python 3.9 standard library, existing canonical JSON and fixed harness public APIs, `unittest`, local temporary Git repositories, GitHub Actions.
 
@@ -28,7 +28,11 @@
 - Do not import private helpers from the legacy modules. The task loader requires its own absolute-`--git-dir`, bounded subprocess, topology-seal, and no-worktree implementation.
 - Use `@dataclass(frozen=True)`, tuples, `frozenset`, and `MappingProxyType` for immutable public values. Avoid Python features introduced after 3.9.
 - Canonical input digests are SHA-256 over the exact accepted input bytes. A parsed-and-reserialized value is not a substitute for the authoritative bytes.
-- All durable JSON contains opaque identifiers, fixed classifications, counts, and `sha256:` digests only. It contains no local paths, private policy text, prompts, raw model output, or raw reasoning.
+- Durable JSON contains no absolute or host-local paths, private policy text,
+  prompts, raw model output, or raw reasoning. The canonical input and
+  experiment plan intentionally retain validated repository-relative
+  `allowed_write_paths`; other durable fields use opaque identifiers, fixed
+  classifications, counts, and `sha256:` digests.
 - No production dependency, model/API call, credential lookup, Codex/model/auth/validator executable resolution, network access, or live ledger write is permitted. The literal `git` executable used only by `task_snapshot.py`'s fixed, bounded adapter is the sole executable exception.
 - Focused tests run after each small implementation slice. Full live-eval discovery runs at the task-snapshot security checkpoint and final integration; `./scripts/validate_repo.sh` runs only at branch-completion checkpoints.
 - The untracked `.serena/` directory is user state and must not be staged or modified.
@@ -181,8 +185,8 @@ Every value is an actual JSON boolean; integer `0` or `1` is invalid.
 transport. It does not authorize a Phase A connection and does not weaken
 tool or validator network denial. `ignore_rules=true` refers only to
 execpolicy `.rules`, never `AGENTS.md`. The final three policy identifiers
-must be non-empty. The serializer binds policy and path-identity digests,
-never local path strings.
+must be non-empty. The serializer binds reproducible content and policy
+digests, never local path strings or transient filesystem identities.
 
 ---
 
@@ -207,7 +211,9 @@ never local path strings.
   - exactly two low and two medium candidates are required;
   - qualification fails for a reference failure, a passing negative control, or formatting-only mutants.
   - canary templates contain no marker, derived-home, executable, credential, or runtime-root identity;
-  - pilot plans contain the four explicit capability-root digest sets and reject an unknown or `danger-full-access` sandbox.
+  - pilot plans bind the root-capability policy digest, defer actual
+    capability-root sets to Phase B runtime evidence, and reject an unknown or
+    `danger-full-access` sandbox.
 
 Use this test shape:
 
@@ -347,34 +353,21 @@ class PilotInvocationPlan:
     ordinal: int
     run: PlannedRun
     snapshot_receipt_digest: str
+    allowed_write_policy_digest: str
+    base_profile_digest: str
+    root_capability_policy_digest: str
     model_id: str
     reasoning_effort: str
     sandbox: str
     approval_policy: str
     provider_transport_allowed: bool
     tool_network_disabled: bool
-    codex_home_identity_digest: str
-    task_root_identity_digest: str
-    temp_root_identity_digest: str
-    tool_read_root_identity_digests: Tuple[str, ...]
-    tool_write_root_identity_digests: Tuple[str, ...]
-    validator_read_root_identity_digests: Tuple[str, ...]
-    validator_write_root_identity_digests: Tuple[str, ...]
     child_process_policy: str
     validator_policy: str
     output_schema_digest: str
     environment_policy_digest: str
     argv_template_digest: str
     containment_policy_version: str
-
-    def __post_init__(self) -> None:
-        for name in (
-            "tool_read_root_identity_digests",
-            "tool_write_root_identity_digests",
-            "validator_read_root_identity_digests",
-            "validator_write_root_identity_digests",
-        ):
-            object.__setattr__(self, name, tuple(getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -403,7 +396,7 @@ class ExperimentPlan:
         )
 ```
 
-- [ ] Expose this exact path-free builder:
+- [ ] Expose this exact host-local-path-free builder:
 
 ```python
 def build_experiment_plan(
@@ -450,7 +443,15 @@ It does not contain runtime containment, canary, pilot, review, unmask, stop, or
 
 The argv template includes `--ignore-user-config` and `--ignore-rules`. The latter is documented and tested as ignoring execpolicy `.rules`; it must not be represented as disabling `AGENTS.md`.
 
-Canary templates use ordinals 1 and 2 for `current` and `lean`. They bind a base profile and the approved overlay, root-capability, argv, and containment policies, but not a marker, derived-home identity, executable identity, or runtime task root. Those values exist only in future runtime child receipts after Phase B approval. Pilot plans use ordinals 3 through 10 and carry the corresponding scheduled task, condition, sealed local root identities, and capability-root sets.
+Canary templates use ordinals 1 and 2 for `current` and `lean`. They bind a
+base profile and the approved overlay, root-capability, argv, and containment
+policies, but not a marker, derived-home identity, executable identity, or
+runtime task root. Those values exist only in future runtime child receipts
+after Phase B approval. Pilot plans use ordinals 3 through 10 and carry the
+corresponding scheduled task and condition plus stable snapshot,
+allowed-write, base-profile, root-capability, argv, environment, and
+containment policy digests. Actual derived-home/task/temp identities and
+capability-root sets are Phase B runtime containment/child evidence.
 
 The module owns the following exact V1 canonical policy documents. It hashes
 each with `sha256_bytes(canonical_bytes(document))`; only the resulting digest
@@ -1782,6 +1783,19 @@ git commit -m "feat(eval): gate task source object stores"
 
 ## Task 7: Full-OID Object Materialization and Snapshot Receipts
 
+### Binding clarification
+
+`docs/superpowers/specs/2026-07-23-harness-experiment-task7-binding.md`
+is normative for this task and its Task 8 handoff. It supersedes the older
+single-target materializer sketch below with a capture-once,
+`materialize_pair()`-once transaction; adds exact tree/trie/unique-blob and
+60-second capture limits, including a hard 256-unique-blob ceiling; amends the
+fixed Git templates; defines canonical entry, materialized-tree, and
+root-identity documents; and fixes receipt, simple single-task lifecycle,
+identity-based overlap, descriptor, conservative whole-unit rollback,
+exclusion-scope, and allowed-write-policy timing. Phase A verifies logical
+state but does not promise crash durability for its transient trees.
+
 **Files:**
 
 - Modify: `scripts/live_eval/task_snapshot.py`
@@ -1800,6 +1814,18 @@ git commit -m "feat(eval): gate task source object stores"
   - writes use exclusive no-follow creation and preserve only `0444` or `0555` file modes;
   - target replacement, extra entry, mode change, content change, hardlink, symlink, or special entry fails the target seal;
   - the same commit produces equal entry and tree digests in two distinct condition directories;
+  - an empty tree, repeated blobs, derived-directory count, tree depth,
+    unique-blob count, and capture-transaction timeout obey their exact
+    inclusive limits;
+  - pair failure first inspects the whole pair; any replacement or inspection
+    mismatch causes no cleanup mutation and preserves the whole pair, while a
+    later deletion error remains observable and overrides the original error;
+  - source-root and `.git` descendant targets reject before write by opened
+    `(dev, ino, kind)` identity regardless of mutable metadata changes,
+    including case-insensitive or Unicode-normalizing path aliases;
+  - simple capture/pair/close transitions require the exact captured object,
+    repeatable stateless verification detects mutation, and peak descriptors
+    stay within `max_tree_depth + 8`;
   - fresh filesystem, config, and topology seals are identical before the
     first and after the final object read; the object database is not rescanned
     around each blob.
@@ -1817,118 +1843,87 @@ Expected: source gating tests pass while materialization tests fail because the 
 ### Step 3: Parse a fixed tree from one full OID
 
 - [ ] Validate OID length and lowercase hex before Git.
-- [ ] Verify object format with `rev-parse --show-object-format`.
+- [ ] Verify object format with
+  `rev-parse --show-object-format=storage`.
 - [ ] Resolve only `FULL_COMMIT_OID^{commit}` and `FULL_COMMIT_OID^{tree}` using the already validated in-memory OID; reject output that is not one full OID of the declared format.
-- [ ] Run `ls-tree -r -l -z --full-tree TREE_OID` with the already resolved in-memory tree OID and no pathspec, then parse mode, object type, OID, declared size, and path from every NUL-terminated record:
+- [ ] Run the binding's exact formatted
+  `ls-tree -r -z --full-tree --format=... TREE_OID` operation with no
+  pathspec, then parse mode, object type, full OID, canonical declared size,
+  and strict UTF-8 path from every NUL-terminated record:
 
 ```python
 @dataclass(frozen=True)
 class TaskTreeEntry:
     path: str
-    mode: str
+    git_mode: str
     blob_oid: str
     size: int
+    content_digest: str
 ```
 
-- [ ] Validate the complete entry set before calling `cat-file blob`. Sort by UTF-8 bytes, reject aliases and parent/file conflicts, and enforce count and declared-size totals.
+- [ ] Validate the complete path trie, exclusions, derived-directory count,
+  aliases, conflicts, and all declared limits before calling
+  `cat-file blob`; fetch once per unique OID in canonical OID order and
+  recompute its Git object OID.
 
 ### Step 4: Materialize regular blobs with exclusive no-follow writes
 
-- [ ] Create a new private empty target for each condition. Create directories one component at a time and verify their identities.
-- [ ] Open each destination with `O_WRONLY | O_CREAT | O_EXCL` plus `O_NOFOLLOW` when available, verify `fstat()` is a single-link regular file, stream the bounded blob, `fsync()`, set `0444` or `0555`, and verify final identity and size.
+- [ ] Validate one exact private target parent and create both absent
+  condition roots in one ownership-tracked `materialize_pair()` transaction.
+  Create directories one component at a time and verify their identities.
+- [ ] Make overlap identity independent of mutable owner/mode metadata:
+  matching `(dev, ino, kind)` with the captured source root or `.git` rejects
+  before any target mutation.
+- [ ] Open each destination with `O_WRONLY | O_CREAT | O_EXCL` plus
+  `O_NOFOLLOW`, verify `fstat()` is a single-link regular file, write the
+  bounded blob, set `0444` or `0555`, close/reopen it through the verified
+  parent, and verify final identity, size, and content hash.
 - [ ] Compute:
-  - `entry_digest` over path, Git mode, blob OID, and content digest;
+  - `entry_digest` over the complete exact `task-tree-entries-v1` document,
+    including commit/tree/format, derived-directory and file counts, logical
+    and unique byte counts, and every path/mode/blob/content record;
   - `materialized_tree_digest` independently over target-relative path, target mode, size, and bytes.
-- [ ] Make all target directories `0555`, fsync the tree, and verify exact inventory.
+- [ ] Make all target directories `0555`, verify exact inventories by bounded
+  descriptor-relative re-read, and construct one condition-independent
+  snapshot receipt only after both roots pass. Do not add `fsync()` calls to
+  the new task-snapshot materializer or its cleanup; crash durability is
+  outside Phase A. This does not change the existing verified harness
+  checkout helper's internal durability calls.
 
-```python
-@dataclass(frozen=True)
-class CapturedTaskObjects:
-    source_trust_receipt: CanonicalReceipt
-    source: TaskSourceSpec = field(repr=False)
-    object_format: str
-    tree_oid: str
-    entries: Tuple[TaskTreeEntry, ...] = field(repr=False)
-    blobs: Mapping[str, bytes] = field(repr=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "entries", tuple(self.entries))
-        object.__setattr__(
-            self,
-            "blobs",
-            MappingProxyType(
-                {key: bytes(value) for key, value in self.blobs.items()}
-            ),
-        )
-
-
-@dataclass(frozen=True)
-class MaterializedTaskSnapshot:
-    snapshot_receipt: CanonicalReceipt
-    target_root: Path = field(repr=False)
-    target_identity_digest: str
-
-
-class TaskSnapshotMaterializer:
-    def __init__(self, policy: TaskSnapshotPolicy) -> None:
-        self._policy = policy
-
-    def capture(self, prepared: PreparedTaskSource) -> CapturedTaskObjects:
-        before = self._fresh_capture_gate(prepared)
-        entries, blobs, object_format, tree_oid = self._load_fixed_objects(
-            prepared
-        )
-        after = self._seal_and_compare(prepared, before)
-        trust_receipt = self._trust_receipt(
-            prepared, before, after, object_format
-        )
-        return CapturedTaskObjects(
-            source_trust_receipt=trust_receipt,
-            source=prepared.source,
-            object_format=object_format,
-            tree_oid=tree_oid,
-            entries=entries,
-            blobs=blobs,
-        )
-
-    def materialize(
-        self, captured: CapturedTaskObjects, target_root: Path
-    ) -> MaterializedTaskSnapshot:
-        target_digest = self._materialize_and_verify(
-            target_root, captured.entries, captured.blobs
-        )
-        snapshot_receipt = self._snapshot_receipt(
-            captured.source,
-            captured.source_trust_receipt,
-            captured.object_format,
-            captured.tree_oid,
-            captured.entries,
-            target_digest,
-        )
-        return MaterializedTaskSnapshot(
-            snapshot_receipt=snapshot_receipt,
-            target_root=target_root,
-            target_identity_digest=_path_identity_digest(target_root),
-        )
-```
+Implement the exact `TaskTreeEntry`, `CapturedTaskObjects`,
+`MaterializedTaskSnapshot`, and `TaskSnapshotMaterializer` public surface in
+Task 7 binding Section 2. There is no public single-target `materialize()`.
 
 Inside `capture()`, issue the sole source-trust receipt only after fresh
 filesystem/config/object seals first match the exact prepared source and then
 match across the complete fixed-object read transaction. Require the
 materializer policy and recomputed process-policy digest to equal the
-prepared values. No failure path emits a receipt. Inside `materialize()`, pass
-`captured.entries` and `captured.blobs` to `_materialize_and_verify()`.
-Capture each selected task once, materialize its current and lean roots from
-the same capture, require equal snapshot receipt digests, then release the
-captured bytes before processing the next task. This avoids duplicate Git
-reads without sharing a writable task tree.
+prepared values. A capture failure emits no source receipt. A later pair
+failure occurs after that receipt exists but emits no snapshot receipt.
+Capture each selected task once, materialize both roots from the same capture
+with `materialize_pair()`, require the same snapshot receipt object and
+distinct target identities, then call idempotent `close()` in `finally` and
+release captured/snapshot references before processing the next task. The pair
+operation already performs independent full verification of both roots, so
+Task 8 does not immediately duplicate `verify()` calls.
 
 ### Step 5: Enforce first-pilot repository exclusions
 
-- [ ] Reject tracked paths for root or nested `AGENTS.md` or `AGENTS.override.md`, project Codex configuration, hooks, MCP configuration, plugins, credentials, and live external integration configuration. Use an exact reviewed path/basename policy, not a free-form content scan.
-- [ ] The first policy version rejects any canonically matched `AGENTS.md` or `AGENTS.override.md`, any path below `.codex/`, `.agents/`, `.claude/`, `.git-hooks/`, `hooks/`, `plugins/`, or `.mcp/`, and basenames `.mcp.json`, `mcp.json`, `.env`, `.env.local`, `.npmrc`, `.pypirc`, `credentials.json`, and `secrets.json`. A policy change creates a new materializer-policy version and plan digest.
+- [ ] Reject only the binding's exact enumerated path/basename denylist. Do
+  not claim it detects every credential or live integration; unlisted secret
+  names/content remain an operator-attested corpus residual.
+- [ ] Apply the binding's exact depth scopes: agent basenames and hidden
+  `.codex`/`.agents`/`.claude`/`.mcp` directory components at any depth;
+  root-level `.git-hooks`/`hooks`/`plugins` directories; and the enumerated
+  sensitive basenames at any depth. A policy change creates a new
+  materializer-policy version and plan digest.
 - [ ] Keep validators, assertions, reference fixtures, and expected results outside the materialized model-writable tree. Candidate input binds only their digests.
-- [ ] Bind the candidate's literal allowed-write paths into the plan and future pilot reservation. Phase A validates their canonical relative-path shape; the future containment and validator layers remain responsible for exact pre/post inventory enforcement.
+- [ ] Defer candidate allowed-write validation to Task 8 after capture. Bind
+  only the digest of the exact transient `task-allowed-write-policy-v1`
+  document into each pilot invocation plan. Keep the authoritative
+  repository-relative paths in canonical input and the experiment plan, but
+  never put an absolute/host-local path or allowed-write path in a pilot
+  reservation receipt.
 
 ### Step 6: Run focused and live-eval regression tests
 
@@ -1951,8 +1946,23 @@ git commit -m "feat(eval): materialize fixed task snapshots"
 
 ## Task 8: Zero-Call Preflight Orchestration
 
+### Binding clarification
+
+Task 7 binding Section 11 is normative. Task 8 validates each candidate's
+leaf allowed-write paths against the captured tree, hashes the exact transient
+`task-allowed-write-policy-v1` document, and makes
+`PilotInvocationPlan` a reproducible content/policy plan by binding
+`allowed_write_policy_digest`, `base_profile_digest`, and
+`root_capability_policy_digest` while removing transient local-root identities
+and runtime capability sets. The authoritative repository-relative paths
+remain in the existing canonical input preserved and digest-bound by
+`ExperimentPlan`. Absolute and host-local paths remain forbidden.
+
 **Files:**
 
+- Modify: `scripts/live_eval/experiment_plan.py`
+- Modify: `tests/test_live_eval_experiment_plan.py`
+- Modify: `tests/test_live_eval_experiment_receipts.py`
 - Create: `scripts/live_eval/experiment.py`
 - Create: `tests/test_live_eval_experiment.py`
 
@@ -1962,14 +1972,40 @@ git commit -m "feat(eval): materialize fixed task snapshots"
 - [ ] Test:
   - both `current` and `lean` source manifests are loaded and their profile identities differ;
   - both homes are materialized, verified, and sealed with existing public APIs;
-  - every selected task is materialized twice into distinct condition roots with equal snapshot digests;
+  - every selected task is captured once and materialized with one pair
+    transaction into distinct condition roots sharing the same snapshot
+    receipt object but distinct root identities;
+  - existing-file and missing-leaf allowed-write policies are validated
+    against the captured trie, change the pilot-plan digest, retain their
+    authoritative repository-relative paths in input/plan, and leak no
+    absolute or host-local path;
+  - same-task conditions share one allowed-write-policy digest and a digest
+    cannot map to two task IDs;
   - the task selection and corpus receipts bind the four selected task snapshots;
   - two future canary templates and eight pilot invocation plans are constructed, but none execute;
   - schedule, content receipts, and canonical policy documents are deterministic for the same immutable inputs;
-  - the final plan remains path-free but changes when newly created local path-identity digests change, because it binds one exact materialization instance;
+  - the final plan remains host-local-path-free while intentionally retaining
+    repository-relative allowed-write authority, remains stable across equal
+    target rematerializations at different trusted local paths when the same
+    captured source/snapshot evidence is reused, and changes when snapshot
+    evidence or bound policy changes;
+  - actual baseline/derived-home/derived-task/temp identities and all four
+    capability-root sets are absent from Phase A plans and required in future
+    Phase B runtime containment/child evidence before reservation;
+  - before the first write, the trusted temporary parent is physically
+    ancestry-disjoint in both directions from bundle, skill, every selected
+    task source, and every selected `.git`, including case/Unicode aliases;
   - source, bundle, plan, or materialized-tree mutation blocks;
-  - cleanup removes only an identity-matching owned tree; a replacement is preserved and produces `cleanup_required`;
-  - cleanup success or failure is recorded identically in the final preflight receipt and public result;
+  - cleanup pre-inspects the whole owned tree; a replacement or inspection
+    failure causes no chmod/delete and produces `cleanup_required`;
+  - success produces the existing success-only preflight receipt, while
+    post-plan cleanup failure retains completed path-free result digests with
+    `preflight_receipt_digest=None`;
+  - ownership authority comes from creation/acquisition rather than a cleanup
+    scan; replacements are never chmodded and production never invokes
+    recursive `TemporaryDirectory` cleanup;
+  - sealed task roots remain immutable baselines and no future
+    `workspace-write` plan makes them directly writable;
   - no credential-like environment name is read;
   - no Codex executable is resolved, probed, or launched;
   - no socket, HTTP client, live ledger, or model process seam exists;
@@ -1996,11 +2032,13 @@ class ExperimentPreflightRequest:
     experiment_input: CanonicalExperimentInput
     bundle_root: Path = field(repr=False)
     skill_repo: Path = field(repr=False)
+    temp_parent: Path = field(repr=False)
     task_sources: Mapping[str, TaskSourceSpec] = field(repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "bundle_root", Path(self.bundle_root).absolute())
         object.__setattr__(self, "skill_repo", Path(self.skill_repo).absolute())
+        object.__setattr__(self, "temp_parent", Path(self.temp_parent).absolute())
         object.__setattr__(
             self, "task_sources", MappingProxyType(dict(self.task_sources))
         )
@@ -2025,6 +2063,11 @@ class ExperimentPreflightResult:
     reason_code: str
 ```
 
+The binding's exact validation supersedes the sketch's `.absolute()` calls:
+detach each path only after validating its original exact physical absolute
+spelling. `temp_parent` is a caller-owned empty current-UID `0700` directory.
+Task 8 preserves it and creates/removes only its exact owned `phase-a` child.
+
 Success values are:
 
 ```text
@@ -2039,7 +2082,17 @@ cleanup_state=removed
 reason_code=static_preflight_verified
 ```
 
-Blocked results use `status=blocked`, `materialization_result=blocked`, the same three not-run states, `model_calls=0`, nullable digests, and a fixed sanitized reason. Qualification is `operator_attested_static` only after the canonical corpus contract is accepted; earlier failures use `not_validated`.
+Blocked results before final-plan construction use `status=blocked`,
+`materialization_result=blocked`, the same three not-run states,
+`model_calls=0`, nullable digests, and a fixed sanitized reason.
+Qualification is `operator_attested_static` only after the canonical corpus
+contract is accepted; earlier failures use `not_validated`. The one
+post-plan cleanup alternative retains every final digest and uses
+`status=blocked`, `qualification_evidence_classification=operator_attested_static`,
+`materialization_result=blocked`, `cleanup_state=cleanup_required`, and
+`reason_code=task_snapshot_cleanup_required` exactly as specified by Task 7
+binding Section 11.2. It also requires `preflight_receipt_digest=None`; no
+blocked `PreflightReceipt` exists.
 
 ### Step 4: Compose preflight in one direction
 
@@ -2048,41 +2101,108 @@ Blocked results use `status=blocked`, `materialization_result=blocked`, the same
 ```text
 load and validate authoritative plan input
 select and schedule four tasks
-require exactly the selected task-source mapping
-create an owned private temporary root
+require exactly the selected task-source mapping and trusted empty temp parent
+physically validate bundle, skill, selected task roots, and each .git
+require temp-parent ancestry disjointness from every protected root
+create exact owned temp_parent/phase-a and its creation-time ledger
 load current and lean harness source identities
 materialize, verify, and seal two base homes
-materialize two distinct roots per selected task
-build source-trust, selection, snapshot, and corpus receipts
+for each selected task: create a fresh single-task materializer
+prepare/capture once and materialize one distinct current/lean pair
+use the pair's two independent full verifications and digest the allowed-write policy
+in finally close the materializer and drop capture/snapshot references
+collect one source-trust and one snapshot receipt per selected task
+build selection and corpus receipts
 build two canary templates and eight pilot invocation plans
 build the immutable experiment plan and plan digest
 identity-check and remove only the owned temporary tree
-build the static preflight receipt only after cleanup is verified
+build the success preflight receipt only after complete cleanup
 project the public result
 ```
 
 - [ ] Build profile digests from path-free `HarnessManifest` fields only. Do not serialize dataclass `Path` values.
-- [ ] Canary templates bind `read-only`; pilot invocation plans bind `workspace-write`. All bind `approval_policy=never`, the model and reasoning effort, and the approved disablement policy. Only the materialized pilot plans bind local path identities; canary marker, derived-home, executable, and runtime-root identities remain future child evidence.
+- [ ] Canary templates bind `read-only`; pilot invocation plans bind the
+  future `workspace-write` policy. Phase A task roots are immutable baselines,
+  not writable execution roots. A future child must create and bind a
+  separate derived root/overlay and derivation-policy digest without chmodding
+  the baseline for execution. Canary marker, derived-home, executable, and
+  runtime-root identities remain future child evidence.
 - [ ] Represent the future executable only by the required executable-identity policy and CLI version. Phase A must not resolve an executable or claim continuity.
 
 ### Step 5: Build selection, corpus, and plan receipts
 
 - [ ] The selection receipt binds candidate-set digest, seed digest, rule, selected IDs, and schedule digest.
 - [ ] The corpus receipt binds selection, qualification, each task snapshot, prompts, validators, assertions, reference outcomes, mutant outcomes, and difficulty assignments.
-- [ ] `build_experiment_plan()` takes only path-free profile and receipt digests plus in-memory canary templates and pilot invocation plans. It serializes their digests, not local paths.
-- [ ] The final `PreflightReceipt` is created only after identity-aware cleanup and records the actual cleanup state. Success binds `cleanup_state=removed`. If a final plan exists but cleanup fails, emit a blocked preflight receipt with `cleanup_state=cleanup_required`, `materialization_result=blocked`, and the same blocked state as the public result. A failure before final plan construction has no preflight receipt digest.
+- [ ] Extend `PilotInvocationPlan` and its exact child document with
+  `allowed_write_policy_digest`, `base_profile_digest`, and
+  `root_capability_policy_digest` immediately after
+  `snapshot_receipt_digest`. Remove the three transient local-root identity
+  fields and four runtime capability-set tuples. Require the pair for one task
+  to share its allowed-write digest, reject a digest mapped to a different
+  task, and require each condition's matching base-profile digest. The
+  existing pilot reservation binds these fields transitively through
+  `invocation_plan_digest`.
+- [ ] Keep repository-relative paths in the existing authoritative canonical
+  input preserved and digest-bound by `ExperimentPlan`; do not add a duplicate
+  top-level path projection. The three content/policy digests are the only new
+  durable fields, and absolute/host-local paths remain forbidden.
+- [ ] A future Phase B reservation must reload authoritative input bytes,
+  verify `input_digest`, rebuild the allowed-write policy against the freshly
+  verified baseline/derived namespace, compare its digest before use, and bind
+  actual root identities and capability sets in versioned runtime
+  containment/child evidence before reservation.
+- [ ] Keep existing preflight receipt validation and replay success-only:
+  exactly `verified/removed`. Fixture updates in
+  `tests/test_live_eval_experiment_receipts.py` cover the amended invocation
+  plan shape; production `experiment_receipts.py` does not change.
+- [ ] After identity-aware cleanup, emit a success `PreflightReceipt` only for
+  `verified/removed`. A cleanup-required public result retains completed
+  path-free digests but has `preflight_receipt_digest=None`. A failure before
+  final plan construction also has no preflight receipt digest.
 
 ### Step 6: Implement identity-aware cleanup
 
-- [ ] Capture root and descendant identity records before cleanup.
-- [ ] Open entries without following links, verify exact identity and inventory, and remove only the captured tree.
-- [ ] If any entry is replaced, linked, becomes special, or cannot be verified, preserve it and return `cleanup_required`. Do not recursively delete an unverified replacement.
+- [ ] Validate the explicit caller-owned `temp_parent` through physical
+  descriptor traversal, require exact mode `0700` and an empty inventory, and
+  retain its descriptor. Never infer `/tmp`, `TMPDIR`, or another ambient
+  parent.
+- [ ] Before creating `phase-a`, physically traverse `bundle_root`,
+  `skill_repo`, every selected task source root, and every exact `.git`.
+  Compare terminal `(dev, ino, kind)` identities against opened ancestor
+  chains (each including its terminal and every opened ancestor through the
+  filesystem anchor) in both directions and reject all overlap, including
+  case/Unicode aliases, before any write.
+- [ ] Record each root and descendant stable token (`dev`, `ino`, `uid`, `gid`,
+  `kind`) and expected component inventory when created or acquired; never
+  establish ownership from a cleanup-time scan or maintain latest-mutation
+  identity records.
+- [ ] Before mutation, inspect the whole owned `phase-a` tree
+  descriptor-relatively. If every inventory, token, kind, and single-link-file
+  check passes, `fchmod(0700)` directories top-down and delete entries
+  bottom-up with immediate token rechecks. The new Task 8 ownership-cleanup
+  layer adds no `fsync()` calls for its temporary files, directories, or
+  parents. Existing `materialize_harness_home()` checkout internals remain
+  unchanged and may retain their established `fsync()` calls; they do not
+  create crash-durable preflight evidence.
+- [ ] If any entry is replaced, linked, becomes special, or cannot be
+  inspected during the read-only pass, perform no chmod/delete, preserve the
+  whole owned tree, and return `cleanup_required`. An OS error or same-UID race
+  after mutation begins may leave partial residue and also returns
+  `cleanup_required`.
+- [ ] Production orchestration must not invoke `TemporaryDirectory` recursive
+  cleanup or another unverified recursive deleter. After removing the exact
+  owned `phase-a` leaf, preserve the empty caller-owned `temp_parent`.
+  A success receipt proves the observed logical cleanup state, not
+  crash-persistent absence; after a host crash the caller must identity-check
+  this parent before reuse.
 
 ### Step 7: Run focused and legacy golden tests
 
 - [ ] Run:
 
 ```bash
+python3 -m unittest tests.test_live_eval_experiment_plan -v
+python3 -m unittest tests.test_live_eval_experiment_receipts -v
 python3 -m unittest tests.test_live_eval_experiment -v
 python3 -m unittest tests.test_canonical_json tests.test_live_eval_checkout tests.test_live_eval_harness tests.test_live_eval_isolation tests.test_live_eval_runner -v
 git diff --check
@@ -2092,7 +2212,7 @@ git diff --check
 - [ ] Commit:
 
 ```bash
-git add scripts/live_eval/experiment.py tests/test_live_eval_experiment.py
+git add scripts/live_eval/experiment_plan.py scripts/live_eval/experiment.py tests/test_live_eval_experiment_plan.py tests/test_live_eval_experiment_receipts.py tests/test_live_eval_experiment.py
 git commit -m "feat(eval): orchestrate zero-call experiment preflight"
 ```
 
@@ -2116,7 +2236,10 @@ git commit -m "feat(eval): orchestrate zero-call experiment preflight"
 - [ ] Test:
   - only the `preflight` subcommand exists;
   - `canary`, `pilot`, approval, API-key, executable, and live-ledger options exit `2` before orchestration;
-  - required options are `--input`, `--bundle-root`, `--skill-repo`, and four `--task-source task_id=/absolute/repository` bindings matching the selected task set;
+  - required options are `--input`, `--bundle-root`, `--skill-repo`,
+    `--temp-parent`, and four
+    `--task-source task_id=/absolute/repository` bindings matching the
+    selected task set;
   - duplicate, missing, extra, relative, or malformed task-source bindings fail;
   - success prints one compact sorted JSON object and exits `0`;
   - blocked input prints the fixed blocked schema and exits `2`;
@@ -2153,7 +2276,11 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 ```
 
-- [ ] Build `argparse` with one required subparser named `preflight`. Parse task-source bindings with `partition("=")`, validate opaque task IDs before paths, and require absolute source paths.
+- [ ] Build `argparse` with one required subparser named `preflight`. Parse
+  task-source bindings with `partition("=")`, validate opaque task IDs before
+  paths, and require absolute source paths. Pass the exact required
+  `--temp-parent` value into `ExperimentPreflightRequest`; never fall back to
+  `TMPDIR`, `tempfile.gettempdir()`, or `/tmp`.
 - [ ] Read the plan file with a CLI-local 1 MiB cap through a no-follow descriptor. Require a regular single-link file, compare `lstat()` and `fstat()` identity, read in bounded chunks, and reject mutation before calling `load_experiment_input()`.
 - [ ] Construct `ExperimentPreflightRequest` from the accepted canonical bytes and call `run_experiment_preflight()`.
 - [ ] Serialize `asdict(result)` with `sort_keys=True`, `separators=(",", ":")`, and `ensure_ascii=False`.
@@ -2308,7 +2435,7 @@ git commit -m "fix(eval): close experiment preflight review findings"
   - exact commands and outcomes;
   - `model_calls=0`;
   - evidence state `static_only`;
-  - whether cleanup and path-free output were verified;
+  - whether cleanup and host-local-path-free output were verified;
   - deferred Phase B containment, canary, live ledger, and paid-call work;
   - trusted Git/operator topology, operator-attested task qualification, and same-user tampering as residual assumptions.
 
@@ -2323,7 +2450,8 @@ Phase A implementation is complete only when:
 - telemetry and future transition schemas pass their mutation matrices;
 - the planner emits exactly two canary templates and eight pilot invocation plans but executes none;
 - the CLI exposes only `preflight` and every result reports `model_calls=0`;
-- durable output is path-free and raw JSONL is discarded;
+- durable output excludes absolute/host-local paths, retains only the approved
+  repository-relative allowed-write authority, and discards raw JSONL;
 - legacy live-eval golden contracts are unchanged;
 - CI explicitly runs Python 3.9;
 - focused tests, full live-eval discovery, repository validation, and diff checks pass;
