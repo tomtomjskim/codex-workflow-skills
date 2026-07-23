@@ -1,20 +1,37 @@
 """Canonical typed telemetry summaries for the Phase A experiment."""
 
 from collections.abc import Mapping as ABCMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
+import json
 import re
-from typing import Mapping
+from typing import FrozenSet, Mapping, Optional, Tuple
 import unicodedata
 
 from scripts.workflow_coordination.canonical_json import canonical_bytes
 
 
 class TelemetryError(ValueError):
-    """Raised when a telemetry summary or price snapshot is invalid."""
+    """Raised when telemetry input, projection, or pricing is invalid."""
 
 
 _ERROR = "telemetry_summary_invalid"
+MAX_TOTAL_BYTES = 8_388_608
+MAX_LINE_BYTES = 1_048_576
+MAX_EVENTS = 4_096
+MAX_TOKEN_VALUE = 1_000_000_000
+MAX_JSON_DEPTH = 32
+MIN_JSON_INTEGER = -9_223_372_036_854_775_808
+MAX_JSON_INTEGER = 9_223_372_036_854_775_807
+PRICE_SNAPSHOT_READ_ORDER = (
+    "model_id",
+    "currency",
+    "input_microunits_per_million",
+    "cached_input_microunits_per_million",
+    "output_microunits_per_million",
+    "effective_at",
+    "source_label",
+)
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
 _SUMMARY_KEYS = frozenset(
@@ -61,6 +78,94 @@ _PRICE_RATE_FIELDS = (
     "output_microunits_per_million",
 )
 _PRICE_TEXT_FIELDS = ("model_id", "effective_at", "source_label")
+_LIMIT_FIELDS = frozenset(
+    {
+        "max_total_bytes",
+        "max_line_bytes",
+        "max_events",
+        "max_token_value",
+    }
+)
+_LIMIT_CEILINGS = {
+    "max_total_bytes": MAX_TOTAL_BYTES,
+    "max_line_bytes": MAX_LINE_BYTES,
+    "max_events": MAX_EVENTS,
+    "max_token_value": MAX_TOKEN_VALUE,
+}
+_WIRE_USAGE_KEYS = frozenset(
+    {
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    }
+)
+_EVENT_KEYS = {
+    "thread.started": frozenset({"type", "thread_id"}),
+    "turn.started": frozenset({"type"}),
+    "item.started": frozenset({"type", "item"}),
+    "item.updated": frozenset({"type", "item"}),
+    "item.completed": frozenset({"type", "item"}),
+    "turn.completed": frozenset({"type", "usage"}),
+    "turn.failed": frozenset({"type", "error"}),
+    "error": frozenset({"type", "message"}),
+}
+_ITEM_KEYS = {
+    "agent_message": frozenset({"id", "type", "text"}),
+    "reasoning": frozenset({"id", "type", "text"}),
+    "command_execution": frozenset(
+        {
+            "id",
+            "type",
+            "command",
+            "aggregated_output",
+            "exit_code",
+            "status",
+        }
+    ),
+    "file_change": frozenset({"id", "type", "changes", "status"}),
+    "todo_list": frozenset({"id", "type", "items"}),
+    "error": frozenset({"id", "type", "message"}),
+}
+_COMMAND_STATUSES = frozenset(
+    {"in_progress", "completed", "failed", "declined"}
+)
+_FILE_CHANGE_STATUSES = frozenset(
+    {"in_progress", "completed", "failed"}
+)
+_FILE_CHANGE_KINDS = frozenset({"add", "delete", "update"})
+_STARTABLE_ITEM_TYPES = frozenset(
+    {"command_execution", "file_change", "todo_list"}
+)
+_DIRECT_COMPLETION_ITEM_TYPES = frozenset(
+    {
+        "agent_message",
+        "reasoning",
+        "command_execution",
+        "file_change",
+        "error",
+    }
+)
+_SIGNED_INTEGER_LIMIT_TEXT = {
+    False: str(MAX_JSON_INTEGER),
+    True: str(-MIN_JSON_INTEGER),
+}
+
+
+class _StreamInvalid(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class TelemetryLimits:
+    max_total_bytes: int
+    max_line_bytes: int
+    max_events: int
+    max_token_value: int
+
+    def __post_init__(self) -> None:
+        _validate_telemetry_limits(self)
 
 
 @dataclass(frozen=True)
@@ -82,8 +187,456 @@ class TelemetrySummary:
     raw_retention: str
 
 
+@dataclass(frozen=True)
+class _TelemetryState:
+    phase: str = "START"
+    active_items: Tuple[Tuple[str, str], ...] = ()
+    seen_item_ids: FrozenSet[str] = frozenset()
+    response_digest: Optional[str] = None
+    terminal_usage: Optional[Tuple[int, int, int, int, int]] = None
+
+
 def _raise_invalid() -> None:
     raise TelemetryError(_ERROR)
+
+
+def _raise_code(code: str) -> None:
+    raise TelemetryError(code)
+
+
+def _stream_invalid() -> None:
+    raise _StreamInvalid()
+
+
+def _validate_telemetry_limits(limits: object) -> TelemetryLimits:
+    try:
+        if type(limits) is not TelemetryLimits:
+            _raise_code("telemetry_limits_invalid")
+        values = vars(limits)
+        if set(values) != _LIMIT_FIELDS:
+            _raise_code("telemetry_limits_invalid")
+        for field_name, ceiling in _LIMIT_CEILINGS.items():
+            value = values[field_name]
+            if type(value) is not int or value < 1 or value > ceiling:
+                _raise_code("telemetry_limits_invalid")
+        if values["max_line_bytes"] > values["max_total_bytes"]:
+            _raise_code("telemetry_limits_invalid")
+        return limits
+    except TelemetryError:
+        raise
+    except Exception:
+        raise TelemetryError("telemetry_limits_invalid") from None
+
+
+def _is_nfc_text(value: object, *, nonempty: bool = False) -> bool:
+    if type(value) is not str or (nonempty and not value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return unicodedata.is_normalized("NFC", value)
+
+
+def _integer_literal_fits(text: str) -> bool:
+    if not text:
+        return False
+    negative = text.startswith("-")
+    digits = text[1:] if negative else text
+    if not digits or any(
+        character < "0" or character > "9" for character in digits
+    ):
+        return False
+    normalized = digits.lstrip("0") or "0"
+    limit = _SIGNED_INTEGER_LIMIT_TEXT[negative]
+    return len(normalized) < len(limit) or (
+        len(normalized) == len(limit) and normalized <= limit
+    )
+
+
+def _scan_bounded_json(data: bytes) -> None:
+    stack = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(data):
+        byte = data[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            index += 1
+            continue
+        if byte == 0x22:
+            in_string = True
+            index += 1
+            continue
+        if byte in (0x7B, 0x5B):
+            stack.append(byte)
+            if len(stack) > MAX_JSON_DEPTH:
+                _stream_invalid()
+            index += 1
+            continue
+        if byte in (0x7D, 0x5D):
+            expected = 0x7B if byte == 0x7D else 0x5B
+            if not stack or stack[-1] != expected:
+                _stream_invalid()
+            stack.pop()
+            index += 1
+            continue
+        if byte == 0x2D or 0x30 <= byte <= 0x39:
+            start = index
+            if byte == 0x2D:
+                index += 1
+                if index >= len(data) or not 0x30 <= data[index] <= 0x39:
+                    continue
+            while index < len(data) and 0x30 <= data[index] <= 0x39:
+                index += 1
+            try:
+                literal = data[start:index].decode("ascii")
+            except UnicodeDecodeError:
+                _stream_invalid()
+            if not _integer_literal_fits(literal):
+                _stream_invalid()
+            continue
+        index += 1
+
+
+def _reject_json_value(_text: str) -> object:
+    _stream_invalid()
+
+
+def _parse_bounded_json_integer(text: str) -> int:
+    if not _integer_literal_fits(text):
+        _stream_invalid()
+    return int(text)
+
+
+def _object_without_duplicates(pairs: object) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            _stream_invalid()
+        result[key] = value
+    return result
+
+
+def _validate_semantic_json_value(value: object, depth: int = 0) -> None:
+    if type(value) is dict:
+        next_depth = depth + 1
+        if next_depth > MAX_JSON_DEPTH:
+            _stream_invalid()
+        for key, nested in value.items():
+            if not _is_nfc_text(key):
+                _stream_invalid()
+            _validate_semantic_json_value(nested, next_depth)
+        return
+    if type(value) is list:
+        next_depth = depth + 1
+        if next_depth > MAX_JSON_DEPTH:
+            _stream_invalid()
+        for nested in value:
+            _validate_semantic_json_value(nested, next_depth)
+        return
+    if type(value) is str:
+        if not _is_nfc_text(value):
+            _stream_invalid()
+        return
+    if type(value) is int:
+        if value < MIN_JSON_INTEGER or value > MAX_JSON_INTEGER:
+            _stream_invalid()
+        return
+    if type(value) in (bool, type(None)):
+        return
+    _stream_invalid()
+
+
+def _load_bounded_semantic_json(data: bytes) -> dict:
+    try:
+        if data.startswith(b"\xef\xbb\xbf"):
+            _stream_invalid()
+        _scan_bounded_json(data)
+        text = data.decode("utf-8")
+        value = json.loads(
+            text,
+            object_pairs_hook=_object_without_duplicates,
+            parse_int=_parse_bounded_json_integer,
+            parse_float=_reject_json_value,
+            parse_constant=_reject_json_value,
+        )
+        if type(value) is not dict:
+            _stream_invalid()
+        _validate_semantic_json_value(value)
+        return value
+    except _StreamInvalid:
+        raise
+    except Exception:
+        _stream_invalid()
+
+
+def _require_stream_keys(value: object, expected: frozenset) -> dict:
+    if type(value) is not dict or set(value) != expected:
+        _stream_invalid()
+    return value
+
+
+def _structured_response_digest(text: object) -> str:
+    if not _is_nfc_text(text):
+        _stream_invalid()
+    try:
+        response = _load_bounded_semantic_json(text.encode("utf-8"))
+        return "sha256:{}".format(
+            hashlib.sha256(canonical_bytes(response)).hexdigest()
+        )
+    except _StreamInvalid:
+        raise
+    except Exception:
+        _stream_invalid()
+
+
+def _validate_wire_usage(
+    usage: object, limits: TelemetryLimits
+) -> Tuple[int, int, int, int, int]:
+    checked = _require_stream_keys(usage, _WIRE_USAGE_KEYS)
+    values = []
+    for field_name in (
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ):
+        value = checked[field_name]
+        if (
+            type(value) is not int
+            or value < 0
+            or value > limits.max_token_value
+        ):
+            _stream_invalid()
+        values.append(value)
+    input_tokens, cached_input, cache_write, output_tokens, reasoning = values
+    if (
+        cached_input > input_tokens
+        or reasoning > output_tokens
+        or input_tokens + output_tokens > limits.max_token_value
+        or cache_write != 0
+    ):
+        _stream_invalid()
+    return (
+        input_tokens,
+        cached_input,
+        cache_write,
+        output_tokens,
+        reasoning,
+    )
+
+
+def _require_item_text(item: dict, field_name: str) -> None:
+    if not _is_nfc_text(item[field_name]):
+        _stream_invalid()
+
+
+def _validate_item(item: object) -> Tuple[str, str, dict]:
+    if (
+        type(item) is not dict
+        or type(item.get("id")) is not str
+        or type(item.get("type")) is not str
+    ):
+        _stream_invalid()
+    item_type = item["type"]
+    expected_keys = _ITEM_KEYS.get(item_type)
+    if expected_keys is None:
+        _stream_invalid()
+    checked = _require_stream_keys(item, expected_keys)
+    item_id = checked["id"]
+    if not _is_nfc_text(item_id, nonempty=True):
+        _stream_invalid()
+
+    if item_type in ("agent_message", "reasoning"):
+        _require_item_text(checked, "text")
+    elif item_type == "command_execution":
+        _require_item_text(checked, "command")
+        _require_item_text(checked, "aggregated_output")
+        exit_code = checked["exit_code"]
+        if exit_code is not None and (
+            type(exit_code) is not int
+            or exit_code < -2_147_483_648
+            or exit_code > 2_147_483_647
+        ):
+            _stream_invalid()
+        status = checked["status"]
+        if type(status) is not str or status not in _COMMAND_STATUSES:
+            _stream_invalid()
+    elif item_type == "file_change":
+        status = checked["status"]
+        if type(status) is not str or status not in _FILE_CHANGE_STATUSES:
+            _stream_invalid()
+        changes = checked["changes"]
+        if type(changes) is not list:
+            _stream_invalid()
+        for change in changes:
+            nested = _require_stream_keys(
+                change, frozenset({"path", "kind"})
+            )
+            if not _is_nfc_text(nested["path"]):
+                _stream_invalid()
+            if (
+                type(nested["kind"]) is not str
+                or nested["kind"] not in _FILE_CHANGE_KINDS
+            ):
+                _stream_invalid()
+    elif item_type == "todo_list":
+        items = checked["items"]
+        if type(items) is not list:
+            _stream_invalid()
+        for todo in items:
+            nested = _require_stream_keys(
+                todo, frozenset({"text", "completed"})
+            )
+            if (
+                not _is_nfc_text(nested["text"])
+                or type(nested["completed"]) is not bool
+            ):
+                _stream_invalid()
+    else:
+        _require_item_text(checked, "message")
+    return item_id, item_type, checked
+
+
+def _validate_event(
+    event: object, limits: TelemetryLimits
+) -> Tuple[
+    str,
+    Optional[Tuple[str, str, dict]],
+    Optional[Tuple[int, int, int, int, int]],
+]:
+    if type(event) is not dict or type(event.get("type")) is not str:
+        _stream_invalid()
+    event_type = event["type"]
+    expected_keys = _EVENT_KEYS.get(event_type)
+    if expected_keys is None:
+        _stream_invalid()
+    checked = _require_stream_keys(event, expected_keys)
+
+    item = None
+    usage = None
+    if event_type == "thread.started":
+        if not _is_nfc_text(checked["thread_id"], nonempty=True):
+            _stream_invalid()
+    elif event_type.startswith("item."):
+        item = _validate_item(checked["item"])
+    elif event_type == "turn.completed":
+        usage = _validate_wire_usage(checked["usage"], limits)
+    elif event_type == "turn.failed":
+        error = _require_stream_keys(
+            checked["error"], frozenset({"message"})
+        )
+        if not _is_nfc_text(error["message"]):
+            _stream_invalid()
+    elif event_type == "error":
+        if not _is_nfc_text(checked["message"]):
+            _stream_invalid()
+    return event_type, item, usage
+
+
+def _consume_item_event(
+    state: _TelemetryState,
+    event_type: str,
+    item: Tuple[str, str, dict],
+) -> _TelemetryState:
+    item_id, item_type, checked = item
+    active = dict(state.active_items)
+    seen = set(state.seen_item_ids)
+
+    if event_type == "item.started":
+        if (
+            item_type not in _STARTABLE_ITEM_TYPES
+            or item_id in seen
+        ):
+            _stream_invalid()
+        if item_type == "command_execution" and (
+            checked["status"] != "in_progress"
+            or checked["exit_code"] is not None
+        ):
+            _stream_invalid()
+        if (
+            item_type == "file_change"
+            and checked["status"] != "in_progress"
+        ):
+            _stream_invalid()
+        active[item_id] = item_type
+        seen.add(item_id)
+    elif event_type == "item.updated":
+        if (
+            item_type != "todo_list"
+            or active.get(item_id) != item_type
+        ):
+            _stream_invalid()
+    else:
+        active_type = active.get(item_id)
+        if active_type is not None:
+            if active_type != item_type:
+                _stream_invalid()
+            del active[item_id]
+        else:
+            if (
+                item_id in seen
+                or item_type not in _DIRECT_COMPLETION_ITEM_TYPES
+            ):
+                _stream_invalid()
+            seen.add(item_id)
+
+    response_digest = state.response_digest
+    if event_type == "item.completed" and item_type == "agent_message":
+        if response_digest is not None:
+            _stream_invalid()
+        response_digest = _structured_response_digest(checked["text"])
+    return replace(
+        state,
+        active_items=tuple(active.items()),
+        seen_item_ids=frozenset(seen),
+        response_digest=response_digest,
+    )
+
+
+def _consume_event(
+    state: _TelemetryState,
+    event: object,
+    limits: TelemetryLimits,
+) -> _TelemetryState:
+    event_type, item, usage = _validate_event(event, limits)
+    if state.phase == "START":
+        if event_type != "thread.started":
+            _stream_invalid()
+        return replace(state, phase="THREAD")
+    if state.phase == "THREAD":
+        if event_type != "turn.started":
+            _stream_invalid()
+        return replace(state, phase="TURN_ACTIVE")
+    if state.phase != "TURN_ACTIVE":
+        _stream_invalid()
+    if event_type.startswith("item."):
+        if item is None:
+            _stream_invalid()
+        return _consume_item_event(state, event_type, item)
+    if event_type in ("error", "turn.failed"):
+        _stream_invalid()
+    if event_type != "turn.completed":
+        _stream_invalid()
+    if (
+        state.active_items
+        or state.response_digest is None
+        or usage is None
+    ):
+        _stream_invalid()
+    return replace(
+        state,
+        phase="SUCCESS",
+        terminal_usage=usage,
+    )
 
 
 def _require_mapping(value: object, exact_keys: frozenset) -> dict:
@@ -163,6 +716,32 @@ def _validate_price_snapshot(price_snapshot: object) -> dict:
     return price
 
 
+def _snapshot_price_mapping(price_snapshot: object) -> dict:
+    try:
+        if not isinstance(price_snapshot, ABCMapping):
+            _raise_invalid()
+        iterator = iter(price_snapshot)
+        keys = []
+        seen = set()
+        for _index in range(len(_PRICE_KEYS) + 1):
+            try:
+                key = next(iterator)
+            except StopIteration:
+                break
+            if type(key) is not str or key in seen:
+                _raise_invalid()
+            seen.add(key)
+            keys.append(key)
+        if len(keys) != len(_PRICE_KEYS) or seen != _PRICE_KEYS:
+            _raise_invalid()
+        detached = {}
+        for key in PRICE_SNAPSHOT_READ_ORDER:
+            detached[key] = price_snapshot[key]
+        return detached
+    except Exception:
+        raise TelemetryError(_ERROR) from None
+
+
 def _validate_summary_document(document: object) -> dict:
     checked = _require_mapping(document, _SUMMARY_KEYS)
     _require_exact_text(checked["classification"], "completed")
@@ -210,6 +789,75 @@ def _estimated_cost_microunits(
         + usage["output_tokens"] * price["output_microunits_per_million"]
     )
     return (numerator + 999999) // 1000000
+
+
+def parse_terminal_telemetry(
+    data: bytes,
+    limits: TelemetryLimits,
+    price_snapshot: Mapping[str, object],
+) -> TelemetrySummary:
+    """Project one bounded successful Codex JSONL stream."""
+    if type(data) is not bytes:
+        raise TelemetryError("telemetry_not_bytes")
+    checked_limits = _validate_telemetry_limits(limits)
+    if not data or len(data) > checked_limits.max_total_bytes:
+        raise TelemetryError("telemetry_size_invalid")
+    if not data.endswith(b"\n"):
+        raise TelemetryError("telemetry_truncated")
+    if b"\r" in data:
+        raise TelemetryError("telemetry_line_invalid")
+    lines = data[:-1].split(b"\n")
+    if not lines or len(lines) > checked_limits.max_events:
+        raise TelemetryError("telemetry_event_count_invalid")
+    for line in lines:
+        if not line or len(line) > checked_limits.max_line_bytes:
+            raise TelemetryError("telemetry_line_invalid")
+
+    try:
+        state = _TelemetryState()
+        for line in lines:
+            event = _load_bounded_semantic_json(line)
+            state = _consume_event(state, event, checked_limits)
+        if (
+            state.phase != "SUCCESS"
+            or state.response_digest is None
+            or state.terminal_usage is None
+        ):
+            _stream_invalid()
+    except Exception:
+        raise TelemetryError("telemetry_stream_invalid") from None
+
+    try:
+        price = _validate_price_snapshot(
+            _snapshot_price_mapping(price_snapshot)
+        )
+        (
+            input_tokens,
+            cached_input_tokens,
+            _cache_write_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+        ) = state.terminal_usage
+        projected_usage = {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_output_tokens": reasoning_output_tokens,
+            "total_reported_tokens": input_tokens + output_tokens,
+        }
+        projected_usage["estimated_cost_microunits"] = (
+            _estimated_cost_microunits(projected_usage, price)
+        )
+        document = {
+            "classification": "completed",
+            "response_digest": state.response_digest,
+            "usage": projected_usage,
+            "event_count": len(lines),
+            "raw_retention": "discard",
+        }
+        return telemetry_summary_from_document(document, price)
+    except Exception:
+        raise TelemetryError(_ERROR) from None
 
 
 def telemetry_summary_from_document(
