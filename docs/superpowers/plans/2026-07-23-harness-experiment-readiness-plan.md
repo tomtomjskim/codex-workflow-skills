@@ -880,6 +880,37 @@ git commit -m "feat(eval): add experiment analysis primitives"
 
 ## Task 3: Canonical Typed Telemetry Summary Codec
 
+### Binding clarification
+
+- Task 3 summaries represent only a successfully completed terminal
+  projection. `classification` is exactly `completed`,
+  `response_digest` is a non-null lowercase
+  `sha256:<64 hexadecimal characters>` value, and `event_count` is an exact
+  non-boolean integer greater than or equal to one.
+- `price_snapshot` has exactly the seven Task 1 price-snapshot keys. Its three
+  rates are exact non-boolean non-negative integers; `model_id`,
+  `effective_at`, and `source_label` are non-empty NFC strings; and `currency`
+  is three uppercase ASCII letters. Task 3 does not repeat the Task 1
+  model/currency cross-object equality checks because those counterpart
+  values are not arguments to the codec.
+- Define `TelemetryError(ValueError)`. Any Task 3 typed-value, document,
+  price-snapshot, serialization, or digest validation failure raises exactly
+  `TelemetryError("telemetry_summary_invalid")`.
+- `telemetry_summary_document()` and `telemetry_summary_digest()` accept only
+  exact `TelemetrySummary` and nested exact `UsageSummary` instances. They
+  revalidate intrinsic scalar types, non-negativity, subset and total
+  invariants, the fixed classification, digest, positive event count, and
+  `raw_retention=discard` before serialization.
+- Price-bound estimated-cost equality is validated by
+  `telemetry_summary_from_document()`, the only Task 3 API that receives a
+  price snapshot. The serializer and digest API still require a non-negative
+  integer retained estimate but cannot independently recompute it without
+  changing their approved signatures. Task 5 must construct parser output
+  through `telemetry_summary_from_document()` rather than treating a directly
+  constructed dataclass as validated.
+- This task adds no JSONL parsing, event-order state machine, size limits, or
+  Task 5 transport error codes.
+
 **Files:**
 
 - Create: `scripts/live_eval/experiment_telemetry.py`
