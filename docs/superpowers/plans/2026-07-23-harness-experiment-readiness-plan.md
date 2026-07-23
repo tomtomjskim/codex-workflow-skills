@@ -1533,6 +1533,12 @@ git commit -m "feat(eval): add experiment receipt transitions"
 
 ## Task 5: Bounded Codex JSONL Parsing and Terminal Projection
 
+**Normative clarification:**
+`docs/superpowers/specs/2026-07-23-harness-experiment-task5-binding.md`.
+It supersedes this task wherever the original four-field usage sketch or
+underspecified event lifecycle conflicts with the pinned five-field,
+zero-cache-write source-shaped subset.
+
 **Files:**
 
 - Modify: `scripts/live_eval/experiment_telemetry.py`
@@ -1546,7 +1552,9 @@ git commit -m "feat(eval): add experiment receipt transitions"
 ### Step 1: Add failing JSONL state and usage tests
 
 - [ ] Test:
-  - one canonical `turn.completed` event with exactly four usage integers succeeds;
+  - one semantic `turn.completed` event with exactly five wire usage
+    integers succeeds when `cache_write_input_tokens=0`;
+  - a four-field wire event and non-zero cache-write usage fail closed;
   - exactly one structured agent response is required before the terminal event;
   - missing, duplicate, negative, boolean, float, string, or unknown usage fields fail;
   - cached input greater than input and reasoning output greater than output fail;
@@ -1591,38 +1599,48 @@ def parse_terminal_telemetry(
     limits: TelemetryLimits,
     price_snapshot: Mapping[str, object],
 ) -> TelemetrySummary:
-    if not isinstance(data, bytes):
+    if type(data) is not bytes:
         raise TelemetryError("telemetry_not_bytes")
-    if not data or len(data) > limits.max_total_bytes:
+    checked_limits = _validate_telemetry_limits(limits)
+    if not data or len(data) > checked_limits.max_total_bytes:
         raise TelemetryError("telemetry_size_invalid")
     if not data.endswith(b"\n"):
         raise TelemetryError("telemetry_truncated")
-    lines = data.splitlines()
-    if not lines or len(lines) > limits.max_events:
+    if b"\r" in data:
+        raise TelemetryError("telemetry_line_invalid")
+    lines = data[:-1].split(b"\n")
+    if not lines or len(lines) > checked_limits.max_events:
         raise TelemetryError("telemetry_event_count_invalid")
     state = _TelemetryState()
     for line in lines:
-        if not line or len(line) > limits.max_line_bytes:
+        if not line or len(line) > checked_limits.max_line_bytes:
             raise TelemetryError("telemetry_line_invalid")
-        event = load_canonical_input(line)
-        state = _consume_event(state, event, limits)
+        event = _load_bounded_semantic_json(line)
+        state = _consume_event(state, event, checked_limits)
     return _finish_telemetry(state, price_snapshot)
 ```
 
 - [ ] Support the lifecycle types `thread.started`, `turn.started`, `item.started`, `item.updated`, `item.completed`, `turn.completed`, and `error`.
+- [ ] Recognize `turn.failed` only as a rejection marker and never project
+  it. Implement the exact event/item schemas, lifecycle matrix, and
+  single-turn DFA in the Task 5 binding contract.
 - [ ] Treat raw Codex JSONL as semantic JSON, not canonical plan input. Preserve duplicate-key, float, non-finite, UTF-8, NFC, exact-schema, ordering, and size rejection, but do not require wire key order or whitespace to equal `canonical_bytes(event)`.
 - [ ] Count a structured response only from `item.completed` where `item.type=agent_message` and `item.text` parses to one JSON object. Store only `sha256:` over its canonical bytes.
 - [ ] Finish through Task 3's typed summary constructor so parser output,
   receipt reconstruction, canonical document generation, and digest
   calculation share one schema and invariant path.
-- [ ] Test that semantically equivalent terminal streams produce byte-identical typed summary documents and equal summary digests, while changing any usage value changes the summary digest.
-- [ ] Require `turn.completed` to be final and to contain:
+- [ ] Test that semantically equivalent terminal streams produce byte-identical typed summary documents and equal summary digests, while changing any accepted retained usage value changes the summary digest. Non-zero cache-write fails before projection.
+- [ ] Require `turn.completed` to be final and to contain the pinned
+  five-field wire shape:
 
 ```json
-{"cached_input_tokens":0,"input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}
+{"cache_write_input_tokens":0,"cached_input_tokens":0,"input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}
 ```
 
-The values shown are shape examples; actual values may be any non-negative integers within the configured cap and subset constraints.
+The values shown are shape examples. Accepted values satisfy the configured
+cap and subset constraints, and cache-write must be exactly zero. The typed
+summary retains the original four provider counts; non-zero cache-write
+support requires a later versioned price and receipt contract.
 
 ### Step 5: Run focused tests and commit
 
