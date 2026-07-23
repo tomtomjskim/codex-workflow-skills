@@ -1,12 +1,16 @@
 import os
+import ast
 from collections.abc import Mapping as ABCMapping
 from pathlib import Path
 import subprocess
 import tempfile
 import errno
 import hashlib
+import inspect
 import io
 import socket
+import stat
+import sys
 import threading
 from types import MappingProxyType
 import unittest
@@ -43,6 +47,10 @@ from scripts.live_eval.task_snapshot import (
     _validate_physical_root,
     prepare_task_source,
 )
+
+
+class CleanupCancellation(BaseException):
+    pass
 
 
 class RepositoryFixture:
@@ -525,6 +533,7 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
                         wraps=task_snapshot_module._same_identity,
                     )
                 )
+                owner = task_snapshot_module._SourceResourceOwner()
                 try:
                     with patch(
                         "scripts.live_eval.task_snapshot.os.open",
@@ -541,6 +550,7 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
                             ".git",
                             real_fstat(parent_fd).st_dev,
                             "task_source_git_dir_invalid",
+                            owner,
                         )
                     self.assertEqual(len(acquired), 1)
                     self.assertEqual(closed, acquired)
@@ -613,11 +623,258 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
             "scripts.live_eval.task_snapshot.os.close",
             side_effect=close_then_reuse,
         ), self.assertRaises(TaskSnapshotError):
-            _open_root_descriptor(repo)
+            _open_root_descriptor(
+                repo,
+                task_snapshot_module._SourceResourceOwner(),
+            )
 
         self.assertEqual(len(replacement), 1)
         real_fstat(replacement[0])
         real_close(replacement[0])
+
+    def test_root_handoff_fault_never_recloses_reused_descriptor(self):
+        function_lines, first_line = inspect.getsourcelines(
+            task_snapshot_module._open_root_descriptor
+        )
+        boundary = None
+        for index, line in enumerate(function_lines):
+            stripped = line.strip()
+            if (
+                stripped == "child_descriptor = -1"
+                and index > 0
+                and function_lines[index - 1].strip()
+                == "descriptor = child_descriptor"
+            ):
+                boundary = ("raw", first_line + index)
+                break
+            if (
+                stripped
+                == "current_owner, child_owner = child_owner, current_owner"
+            ):
+                boundary = ("owner", first_line + index)
+                break
+        self.assertIsNotNone(boundary)
+
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                repo, oid = self.make_repository()
+                real_close = os.close
+                real_open = os.open
+                real_fstat = os.fstat
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                trace_error = (
+                    CleanupCancellation("root-handoff-cancellation")
+                    if terminal
+                    else RuntimeError("root-handoff-runtime")
+                )
+                target_descriptor = {"value": None}
+                replacement = {"value": None}
+                close_attempts = []
+                trace_fired = {"value": False}
+                caught = None
+
+                def interrupt_handoff(frame, event, unused_arg):
+                    if (
+                        not trace_fired["value"]
+                        and frame.f_code
+                        is task_snapshot_module._open_root_descriptor.__code__
+                        and event == "line"
+                        and frame.f_lineno == boundary[1]
+                    ):
+                        trace_fired["value"] = True
+                        if boundary[0] == "raw":
+                            target_descriptor["value"] = frame.f_locals[
+                                "descriptor"
+                            ]
+                        else:
+                            target_descriptor["value"] = frame.f_locals[
+                                "child_owner"
+                            ].descriptor
+                        sys.settrace(None)
+                        raise trace_error
+                    return interrupt_handoff
+
+                def close_then_reuse(descriptor):
+                    if descriptor == target_descriptor["value"]:
+                        close_attempts.append(descriptor)
+                        if replacement["value"] is None:
+                            real_close(descriptor)
+                            reused = real_open(str(repo.parent), flags)
+                            if reused != descriptor:
+                                os.dup2(reused, descriptor)
+                                real_close(reused)
+                                reused = descriptor
+                            replacement["value"] = reused
+                            raise OSError(
+                                errno.EINTR,
+                                "root-handoff-close-reuse",
+                            )
+                    return real_close(descriptor)
+
+                replacement_alive = False
+                try:
+                    with patch(
+                        "scripts.live_eval.task_snapshot.os.close",
+                        side_effect=close_then_reuse,
+                    ):
+                        try:
+                            sys.settrace(interrupt_handoff)
+                            _open_root_descriptor(
+                                repo,
+                                task_snapshot_module._SourceResourceOwner(),
+                            )
+                        except BaseException as error:
+                            caught = error
+                        finally:
+                            sys.settrace(None)
+                    self.assertTrue(trace_fired["value"])
+                    self.assertIsNotNone(
+                        replacement["value"],
+                        (
+                            target_descriptor["value"],
+                            close_attempts,
+                            repr(caught),
+                        ),
+                    )
+                    try:
+                        real_fstat(replacement["value"])
+                        replacement_alive = True
+                    except OSError:
+                        replacement_alive = False
+                finally:
+                    if replacement_alive:
+                        real_close(replacement["value"])
+
+                self.assertEqual(
+                    close_attempts,
+                    [target_descriptor["value"]],
+                )
+                self.assertTrue(replacement_alive)
+                if terminal:
+                    self.assertIs(caught, trace_error)
+                else:
+                    self.assertIs(type(caught), TaskSnapshotError)
+                    self.assertEqual(
+                        str(caught),
+                        "task_snapshot_cleanup_required",
+                    )
+                self.assertIsNone(caught.__context__)
+                self.assertIsNone(caught.__cause__)
+
+    def test_root_caller_publication_fault_uses_one_shared_owner_cell(self):
+        helper = task_snapshot_module._open_root_descriptor
+        function_lines, first_line = inspect.getsourcelines(helper)
+        boundary = None
+        for index, line in enumerate(function_lines):
+            stripped = line.strip()
+            if (
+                stripped == "descriptor = -1"
+                and index > 0
+                and function_lines[index - 1].strip()
+                == "owner.descriptor = descriptor"
+            ):
+                boundary = ("raw", first_line + index)
+                break
+            if (
+                stripped == "success = True"
+                and "owner.share_from(current_owner)"
+                in "".join(function_lines[:index])
+            ):
+                boundary = ("shared", first_line + index)
+                break
+        self.assertIsNotNone(boundary)
+
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                repo, unused_oid = self.make_repository()
+                real_close = os.close
+                real_open = os.open
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                target_descriptor = {"value": None}
+                replacement = {"value": None}
+                close_attempts = []
+                trace_fired = {"value": False}
+                trace_error = (
+                    CleanupCancellation("root-publication-cancellation")
+                    if terminal
+                    else RuntimeError("root-publication-runtime")
+                )
+                caller_owner = task_snapshot_module._SourceResourceOwner()
+                caught = None
+
+                def interrupt_publication(frame, event, unused_arg):
+                    if (
+                        not trace_fired["value"]
+                        and frame.f_code is helper.__code__
+                        and event == "line"
+                        and frame.f_lineno == boundary[1]
+                    ):
+                        trace_fired["value"] = True
+                        target_descriptor["value"] = (
+                            frame.f_locals["descriptor"]
+                            if boundary[0] == "raw"
+                            else caller_owner.descriptor
+                        )
+                        sys.settrace(None)
+                        raise trace_error
+                    return interrupt_publication
+
+                def close_then_reuse(descriptor):
+                    if descriptor == target_descriptor["value"]:
+                        close_attempts.append(descriptor)
+                        if replacement["value"] is None:
+                            real_close(descriptor)
+                            reused = real_open(str(repo.parent), flags)
+                            if reused != descriptor:
+                                os.dup2(reused, descriptor)
+                                real_close(reused)
+                                reused = descriptor
+                            replacement["value"] = reused
+                            raise OSError(
+                                errno.EINTR,
+                                "root-publication-close-reuse",
+                            )
+                    return real_close(descriptor)
+
+                replacement_alive = False
+                try:
+                    with patch(
+                        "scripts.live_eval.task_snapshot.os.close",
+                        side_effect=close_then_reuse,
+                    ):
+                        try:
+                            sys.settrace(interrupt_publication)
+                            helper(repo, caller_owner)
+                        except BaseException as error:
+                            caught = error
+                        finally:
+                            sys.settrace(None)
+                    self.assertTrue(trace_fired["value"])
+                    self.assertIsNotNone(replacement["value"])
+                    try:
+                        os.fstat(replacement["value"])
+                        replacement_alive = True
+                    except OSError:
+                        replacement_alive = False
+                finally:
+                    if replacement_alive:
+                        real_close(replacement["value"])
+
+                self.assertEqual(
+                    close_attempts,
+                    [target_descriptor["value"]],
+                )
+                self.assertTrue(replacement_alive)
+                if terminal:
+                    self.assertIs(caught, trace_error)
+                else:
+                    self.assertIs(type(caught), TaskSnapshotError)
+                    self.assertEqual(
+                        str(caught),
+                        "task_snapshot_cleanup_required",
+                    )
+                self.assertIsNone(caught.__context__)
+                self.assertIsNone(caught.__cause__)
 
     def test_frame_close_error_preserves_reused_descriptor(self):
         repo, oid = self.make_repository()
@@ -659,6 +916,1054 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
         real_fstat(replacement[0])
         real_close(replacement[0])
 
+    def test_topology_preserves_cancellation_and_exhausts_later_closes(self):
+        repo, oid = self.make_repository()
+        cancellation = CleanupCancellation("topology cancellation")
+        cleanup_error = RuntimeError("iterator cleanup trace exception")
+        original_open = task_snapshot_module.os.open
+        original_close = task_snapshot_module.os.close
+        active_descriptors = set()
+        closes_after_iterator_failure = []
+        iterator_close_calls = {"value": 0}
+        cleanup_started = {"value": False}
+        caught = None
+        active_after_call = None
+
+        class CancellingIterator:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise cancellation
+
+            def close(self):
+                iterator_close_calls["value"] += 1
+                cleanup_started["value"] = True
+                raise cleanup_error
+
+        def tracked_open(*args, **kwargs):
+            descriptor = original_open(*args, **kwargs)
+            active_descriptors.add(descriptor)
+            return descriptor
+
+        def tracked_close(descriptor):
+            original_close(descriptor)
+            active_descriptors.discard(descriptor)
+            if cleanup_started["value"]:
+                closes_after_iterator_failure.append(descriptor)
+
+        try:
+            with patch(
+                "scripts.live_eval.task_snapshot.os.open",
+                side_effect=tracked_open,
+            ), patch(
+                "scripts.live_eval.task_snapshot.os.close",
+                side_effect=tracked_close,
+            ), patch(
+                "scripts.live_eval.task_snapshot.os.scandir",
+                return_value=CancellingIterator(),
+            ):
+                try:
+                    _capture_object_topology(
+                        self.source_for(repo, oid),
+                        TaskSnapshotPolicy(),
+                        "sha1",
+                    )
+                except BaseException as error:
+                    caught = error
+                active_after_call = set(active_descriptors)
+        finally:
+            for descriptor in tuple(active_descriptors):
+                try:
+                    original_close(descriptor)
+                except OSError:
+                    pass
+                active_descriptors.discard(descriptor)
+
+        self.assertIs(caught, cancellation)
+        self.assertIsNone(caught.__context__)
+        self.assertIsNone(caught.__cause__)
+        self.assertEqual(iterator_close_calls["value"], 1)
+        self.assertEqual(len(closes_after_iterator_failure), 3)
+        self.assertEqual(active_after_call, set())
+
+    def test_topology_frame_publication_has_one_resource_owner(self):
+        function_lines, first_line = inspect.getsourcelines(
+            task_snapshot_module._capture_object_topology
+        )
+
+        def publication_line(preferred, fallback):
+            preferred_lines = [
+                first_line + index
+                for index, line in enumerate(function_lines)
+                if preferred in line
+            ]
+            if preferred_lines:
+                return preferred_lines[0]
+            fallback_lines = [
+                first_line + index
+                for index, line in enumerate(function_lines)
+                if fallback in line
+            ]
+            self.assertGreaterEqual(len(fallback_lines), 2)
+            return fallback_lines[1]
+
+        cases = (
+            (
+                "root",
+                1,
+                publication_line(
+                    "root_published = True",
+                    "root_iterator = None",
+                ),
+            ),
+            (
+                "child",
+                2,
+                publication_line(
+                    "child_published = True",
+                    "child_fd = -1",
+                ),
+            ),
+        )
+        for label, target_scan_call, target_line in cases:
+            with self.subTest(label=label):
+                repo, oid = self.make_repository()
+                original_scandir = task_snapshot_module.os.scandir
+                original_close = task_snapshot_module.os.close
+                original_open = task_snapshot_module.os.open
+                target = {
+                    "descriptor": None,
+                    "iterator": None,
+                    "close_calls": 0,
+                    "replacement": None,
+                }
+                scan_calls = {"value": 0}
+                trace_error = RuntimeError(label + "-transfer-trace")
+                caught = None
+
+                class TrackedIterator:
+                    def __init__(self, iterator):
+                        self.iterator = iterator
+                        self.close_calls = 0
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        return next(self.iterator)
+
+                    def close(self):
+                        self.close_calls += 1
+                        return self.iterator.close()
+
+                def tracked_scandir(descriptor):
+                    scan_calls["value"] += 1
+                    iterator = TrackedIterator(
+                        original_scandir(descriptor)
+                    )
+                    if scan_calls["value"] == target_scan_call:
+                        target["descriptor"] = descriptor
+                        target["iterator"] = iterator
+                    return iterator
+
+                def close_then_reuse(descriptor):
+                    if descriptor == target["descriptor"]:
+                        target["close_calls"] += 1
+                        result = original_close(descriptor)
+                        if target["replacement"] is None:
+                            replacement = original_open(
+                                str(repo.parent),
+                                (
+                                    os.O_RDONLY
+                                    | os.O_DIRECTORY
+                                    | os.O_CLOEXEC
+                                ),
+                            )
+                            self.assertEqual(replacement, descriptor)
+                            target["replacement"] = replacement
+                        return result
+                    return original_close(descriptor)
+
+                def interrupt_publication(frame, event, unused_arg):
+                    if (
+                        frame.f_code
+                        is task_snapshot_module._capture_object_topology.__code__
+                        and event == "line"
+                        and frame.f_lineno == target_line
+                    ):
+                        sys.settrace(None)
+                        raise trace_error
+                    return interrupt_publication
+
+                replacement_alive = False
+                try:
+                    with patch(
+                        "scripts.live_eval.task_snapshot.os.scandir",
+                        side_effect=tracked_scandir,
+                    ), patch(
+                        "scripts.live_eval.task_snapshot.os.close",
+                        side_effect=close_then_reuse,
+                    ):
+                        try:
+                            sys.settrace(interrupt_publication)
+                            _capture_object_topology(
+                                self.source_for(repo, oid),
+                                TaskSnapshotPolicy(),
+                                "sha1",
+                            )
+                        except BaseException as error:
+                            caught = error
+                        finally:
+                            sys.settrace(None)
+                    if target["replacement"] is not None:
+                        try:
+                            os.fstat(target["replacement"])
+                            replacement_alive = True
+                        except OSError:
+                            replacement_alive = False
+                finally:
+                    if replacement_alive:
+                        original_close(target["replacement"])
+
+                self.assertIs(type(caught), TaskSnapshotError)
+                self.assertEqual(
+                    str(caught),
+                    "task_snapshot_cleanup_required",
+                )
+                self.assertIsNone(caught.__context__)
+                self.assertIsNone(caught.__cause__)
+                self.assertIsNotNone(target["iterator"])
+                self.assertEqual(target["iterator"].close_calls, 1)
+                self.assertEqual(target["close_calls"], 1)
+                self.assertTrue(replacement_alive)
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_source_descriptor_helpers_retain_ownership_at_return_trace(
+        self,
+    ):
+        for helper_name in (
+            "_open_root_descriptor",
+            "_open_child_directory",
+        ):
+            with self.subTest(helper=helper_name):
+                repo, oid = self.make_repository()
+                helper = getattr(task_snapshot_module, helper_name)
+                trace_error = RuntimeError(helper_name + "-return-trace")
+                baseline = {
+                    int(name)
+                    for name in os.listdir("/dev/fd")
+                    if name.isdigit()
+                }
+                caught = None
+
+                def interrupt_return(frame, event, unused_arg):
+                    if frame.f_code is helper.__code__ and event == "return":
+                        sys.settrace(None)
+                        raise trace_error
+                    return interrupt_return
+
+                try:
+                    try:
+                        sys.settrace(interrupt_return)
+                        _capture_object_topology(
+                            self.source_for(repo, oid),
+                            TaskSnapshotPolicy(),
+                            "sha1",
+                        )
+                    except BaseException as error:
+                        caught = error
+                    finally:
+                        sys.settrace(None)
+                    after = {
+                        int(name)
+                        for name in os.listdir("/dev/fd")
+                        if name.isdigit()
+                    }
+                    leaked = after - baseline
+                finally:
+                    for descriptor in leaked if "leaked" in locals() else ():
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+
+                self.assertIs(type(caught), TaskSnapshotError)
+                self.assertEqual(
+                    str(caught),
+                    "task_snapshot_cleanup_required",
+                )
+                self.assertIsNone(caught.__context__)
+                self.assertIsNone(caught.__cause__)
+                self.assertEqual(leaked, set())
+
+    def test_source_owner_close_is_idempotent_and_failure_is_sticky(self):
+        owner_type = getattr(
+            task_snapshot_module,
+            "_SourceResourceOwner",
+            None,
+        )
+        self.assertIsNotNone(owner_type)
+        original_close = os.close
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+        successful_fd = os.open(str(Path.cwd()), flags)
+        successful_calls = []
+
+        def track_success(descriptor):
+            successful_calls.append(descriptor)
+            original_close(descriptor)
+
+        successful_owner = owner_type()
+        successful_owner.descriptor = successful_fd
+        with patch(
+            "scripts.live_eval.task_snapshot.os.close",
+            side_effect=track_success,
+        ):
+            self.assertTrue(successful_owner.close())
+            self.assertTrue(successful_owner.close())
+        self.assertEqual(successful_calls, [successful_fd])
+
+        failing_fd = os.open(str(Path.cwd()), flags)
+        replacement = {"descriptor": None}
+        failing_calls = []
+
+        def close_then_report_false(descriptor):
+            failing_calls.append(descriptor)
+            original_close(descriptor)
+            replacement["descriptor"] = os.open(str(Path.cwd()), flags)
+            if replacement["descriptor"] != descriptor:
+                os.dup2(replacement["descriptor"], descriptor)
+                original_close(replacement["descriptor"])
+                replacement["descriptor"] = descriptor
+            raise OSError(errno.EINTR, "owner-close-reuse")
+
+        failing_owner = owner_type()
+        failing_owner.descriptor = failing_fd
+        replacement_alive = False
+        try:
+            with patch(
+                "scripts.live_eval.task_snapshot.os.close",
+                side_effect=close_then_report_false,
+            ):
+                self.assertFalse(failing_owner.close())
+                self.assertFalse(failing_owner.close())
+            os.fstat(replacement["descriptor"])
+            replacement_alive = True
+        finally:
+            if replacement_alive:
+                os.close(replacement["descriptor"])
+        self.assertEqual(failing_calls, [failing_fd])
+
+    def test_source_owner_trace_fault_keeps_resources_recoverable(self):
+        owner_type = task_snapshot_module._SourceResourceOwner
+        real_close = os.close
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+        descriptor_owner = owner_type()
+        descriptor_owner.descriptor = os.open(str(Path.cwd()), flags)
+        descriptor = descriptor_owner.descriptor
+        close_calls = []
+        descriptor_error = RuntimeError("descriptor-detach-trace")
+        descriptor_lines, descriptor_first = inspect.getsourcelines(
+            owner_type.close_descriptor
+        )
+        descriptor_target = next(
+            descriptor_first + index
+            for index, line in enumerate(descriptor_lines)
+            if (
+                "_close_source_descriptors" in line
+                or "owned_descriptor, self.descriptor" in line
+                or "cell.inflight_descriptor, cell.descriptor" in line
+            )
+        )
+
+        def interrupt_descriptor(frame, event, unused_arg):
+            if (
+                frame.f_code is owner_type.close_descriptor.__code__
+                and event == "line"
+                and frame.f_lineno == descriptor_target
+            ):
+                sys.settrace(None)
+                raise descriptor_error
+            return interrupt_descriptor
+
+        def tracking_close(descriptor_to_close):
+            close_calls.append(descriptor_to_close)
+            return real_close(descriptor_to_close)
+
+        descriptor_closed = False
+        try:
+            with patch(
+                "scripts.live_eval.task_snapshot.os.close",
+                side_effect=tracking_close,
+            ):
+                try:
+                    sys.settrace(interrupt_descriptor)
+                    descriptor_owner.close_descriptor()
+                except BaseException as error:
+                    caught_descriptor = error
+                finally:
+                    sys.settrace(None)
+                self.assertIs(caught_descriptor, descriptor_error)
+                self.assertIsNone(caught_descriptor.__context__)
+                self.assertIsNone(caught_descriptor.__cause__)
+                self.assertFalse(descriptor_owner.close_descriptor())
+            with self.assertRaises(OSError) as caught:
+                os.fstat(descriptor)
+            self.assertEqual(caught.exception.errno, errno.EBADF)
+            descriptor_closed = True
+        finally:
+            if not descriptor_closed:
+                try:
+                    real_close(descriptor)
+                except OSError:
+                    pass
+        self.assertEqual(close_calls, [descriptor])
+
+        class TrackedIterator:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        iterator = TrackedIterator()
+        iterator_owner = owner_type(iterator=iterator)
+        iterator_error = RuntimeError("iterator-detach-trace")
+        iterator_lines, iterator_first = inspect.getsourcelines(
+            owner_type.close_iterator
+        )
+        iterator_target = next(
+            iterator_first + index
+            for index, line in enumerate(iterator_lines)
+            if (
+                "_close_source_iterator" in line
+                or "owned_iterator, self.iterator" in line
+                or "cell.inflight_iterator, cell.iterator" in line
+            )
+        )
+
+        def interrupt_iterator(frame, event, unused_arg):
+            if (
+                frame.f_code is owner_type.close_iterator.__code__
+                and event == "line"
+                and frame.f_lineno == iterator_target
+            ):
+                sys.settrace(None)
+                raise iterator_error
+            return interrupt_iterator
+
+        try:
+            sys.settrace(interrupt_iterator)
+            iterator_owner.close_iterator()
+        except BaseException as error:
+            caught_iterator = error
+        finally:
+            sys.settrace(None)
+        self.assertIs(caught_iterator, iterator_error)
+        self.assertIsNone(caught_iterator.__context__)
+        self.assertIsNone(caught_iterator.__cause__)
+        self.assertFalse(iterator_owner.close_iterator())
+        self.assertEqual(iterator.close_calls, 1)
+
+    def test_source_owner_critical_line_fault_runs_recovery_once(self):
+        owner_type = task_snapshot_module._SourceResourceOwner
+        real_close = os.close
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+        descriptor_owner = owner_type()
+        descriptor_owner.descriptor = os.open(str(Path.cwd()), flags)
+        descriptor = descriptor_owner.descriptor
+        close_calls = []
+        descriptor_lines, descriptor_first = inspect.getsourcelines(
+            owner_type.close_descriptor
+        )
+        descriptor_target = next(
+            descriptor_first + index
+            for index, line in enumerate(descriptor_lines)
+            if "descriptor_close_started = True;" in line
+        )
+        descriptor_error = RuntimeError("descriptor-critical-line")
+
+        def interrupt_descriptor(frame, event, unused_arg):
+            if (
+                frame.f_code is owner_type.close_descriptor.__code__
+                and event == "line"
+                and frame.f_lineno == descriptor_target
+            ):
+                sys.settrace(None)
+                raise descriptor_error
+            return interrupt_descriptor
+
+        def tracking_close(descriptor_to_close):
+            close_calls.append(descriptor_to_close)
+            return real_close(descriptor_to_close)
+
+        descriptor_closed = False
+        try:
+            with patch(
+                "scripts.live_eval.task_snapshot.os.close",
+                side_effect=tracking_close,
+            ):
+                try:
+                    sys.settrace(interrupt_descriptor)
+                    first_result = descriptor_owner.close_descriptor()
+                finally:
+                    sys.settrace(None)
+                self.assertFalse(first_result)
+                self.assertFalse(descriptor_owner.close_descriptor())
+            with self.assertRaises(OSError) as caught:
+                os.fstat(descriptor)
+            self.assertEqual(caught.exception.errno, errno.EBADF)
+            descriptor_closed = True
+        finally:
+            if not descriptor_closed:
+                try:
+                    real_close(descriptor)
+                except OSError:
+                    pass
+        self.assertEqual(close_calls, [descriptor])
+
+        class TrackedIterator:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        iterator = TrackedIterator()
+        iterator_owner = owner_type(iterator=iterator)
+        iterator_lines, iterator_first = inspect.getsourcelines(
+            owner_type.close_iterator
+        )
+        iterator_target = next(
+            iterator_first + index
+            for index, line in enumerate(iterator_lines)
+            if "iterator_close_started = True;" in line
+        )
+        iterator_error = RuntimeError("iterator-critical-line")
+
+        def interrupt_iterator(frame, event, unused_arg):
+            if (
+                frame.f_code is owner_type.close_iterator.__code__
+                and event == "line"
+                and frame.f_lineno == iterator_target
+            ):
+                sys.settrace(None)
+                raise iterator_error
+            return interrupt_iterator
+
+        try:
+            sys.settrace(interrupt_iterator)
+            first_iterator_result = iterator_owner.close_iterator()
+        finally:
+            sys.settrace(None)
+        self.assertFalse(first_iterator_result)
+        self.assertFalse(iterator_owner.close_iterator())
+        self.assertEqual(iterator.close_calls, 1)
+
+    def test_source_owner_attempt_failures_are_sticky_and_behavioral(self):
+        owner_type = task_snapshot_module._SourceResourceOwner
+        real_close = os.close
+        real_open = os.open
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        descriptor = real_open(str(Path.cwd()), flags)
+        replacement = {"value": None}
+        descriptor_calls = []
+        replacement_alive = False
+
+        def close_reuse_then_raise(value):
+            descriptor_calls.append(value)
+            real_close(value)
+            reused = real_open(str(Path.cwd()), flags)
+            if reused != value:
+                os.dup2(reused, value)
+                real_close(reused)
+                reused = value
+            replacement["value"] = reused
+            raise RuntimeError("descriptor-close-result-interrupt")
+
+        descriptor_owner = owner_type(descriptor=descriptor)
+        try:
+            with patch(
+                "scripts.live_eval.task_snapshot.os.close",
+                side_effect=close_reuse_then_raise,
+            ):
+                self.assertFalse(descriptor_owner.close_descriptor())
+                self.assertFalse(descriptor_owner.close_descriptor())
+            os.fstat(replacement["value"])
+            replacement_alive = True
+        finally:
+            if replacement_alive:
+                real_close(replacement["value"])
+        self.assertEqual(descriptor_calls, [descriptor])
+
+        class ReportingIterator:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                raise RuntimeError("iterator-close-result-interrupt")
+
+        iterator = ReportingIterator()
+        iterator_owner = owner_type(iterator=iterator)
+        self.assertFalse(iterator_owner.close_iterator())
+        self.assertFalse(iterator_owner.close_iterator())
+        self.assertEqual(iterator.close_calls, 1)
+
+    def test_owner_aggregators_exhaust_after_pre_attempt_line_fault(self):
+        owner_type = task_snapshot_module._SourceResourceOwner
+        real_close = os.close
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        cases = (
+            (
+                task_snapshot_module._close_source_owners,
+                "return _drain_source_owner_snapshot(owner_snapshot)",
+                False,
+            ),
+            (
+                task_snapshot_module._close_target_descriptors,
+                "return _drain_target_descriptor_owners(",
+                True,
+            ),
+        )
+
+        for aggregator, target_source, uses_ledger in cases:
+            with self.subTest(aggregator=aggregator.__name__):
+                descriptors = [
+                    os.open(str(Path.cwd()), flags)
+                    for unused_index in range(3)
+                ]
+                owners = [
+                    owner_type(descriptor=descriptor)
+                    for descriptor in descriptors
+                ]
+                ledger = task_snapshot_module._TargetOwnershipLedger()
+                lines, first_line = inspect.getsourcelines(aggregator)
+                target_line = next(
+                    first_line + index
+                    for index, line in enumerate(lines)
+                    if target_source in line
+                )
+                trace_error = RuntimeError(
+                    aggregator.__name__ + "-pre-attempt"
+                )
+
+                def interrupt_aggregator(frame, event, unused_arg):
+                    if (
+                        frame.f_code is aggregator.__code__
+                        and event == "line"
+                        and frame.f_lineno == target_line
+                    ):
+                        sys.settrace(None)
+                        raise trace_error
+                    return interrupt_aggregator
+
+                leaked = []
+                try:
+                    sys.settrace(interrupt_aggregator)
+                    arguments = (
+                        (owners, ledger)
+                        if uses_ledger
+                        else (owners,)
+                    )
+                    result = task_snapshot_module._guard_cleanup_boolean(
+                        aggregator,
+                        *arguments,
+                    )
+                finally:
+                    sys.settrace(None)
+                    for descriptor in descriptors:
+                        try:
+                            os.fstat(descriptor)
+                        except OSError as error:
+                            self.assertEqual(error.errno, errno.EBADF)
+                        else:
+                            leaked.append(descriptor)
+                    for descriptor in leaked:
+                        real_close(descriptor)
+
+                self.assertFalse(result)
+                self.assertEqual(leaked, [])
+                if uses_ledger:
+                    self.assertTrue(ledger.close_uncertain)
+
+    def test_owner_aggregator_recovery_never_recloses_completed_owner(self):
+        owner_type = task_snapshot_module._SourceResourceOwner
+        real_close = os.close
+        real_open = os.open
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        cases = (
+            (
+                task_snapshot_module._close_source_owners,
+                task_snapshot_module._drain_source_owner_snapshot,
+                "closed = _guard_cleanup_boolean(owner.close)",
+                False,
+            ),
+            (
+                task_snapshot_module._close_target_descriptors,
+                task_snapshot_module._drain_target_descriptor_owners,
+                "closed = _guard_cleanup_boolean(owner.close_descriptor)",
+                True,
+            ),
+        )
+
+        for aggregator, drain, target_source, uses_ledger in cases:
+            with self.subTest(aggregator=aggregator.__name__):
+                descriptors = [
+                    real_open(str(Path.cwd()), flags)
+                    for unused_index in range(3)
+                ]
+                owners = [
+                    owner_type(descriptor=descriptor)
+                    for descriptor in descriptors
+                ]
+                ledger = task_snapshot_module._TargetOwnershipLedger()
+                lines, first_line = inspect.getsourcelines(drain)
+                target_line = next(
+                    first_line + index
+                    for index, line in enumerate(lines)
+                    if target_source in line
+                )
+                line_visits = {"value": 0}
+                close_calls = []
+                replacement = {"value": None}
+                replacement_alive = False
+
+                def interrupt_second_owner(frame, event, unused_arg):
+                    if (
+                        frame.f_code is drain.__code__
+                        and event == "line"
+                        and frame.f_lineno == target_line
+                    ):
+                        line_visits["value"] += 1
+                        if line_visits["value"] == 2:
+                            sys.settrace(None)
+                            raise RuntimeError(
+                                aggregator.__name__
+                                + "-second-pre-attempt"
+                            )
+                    return interrupt_second_owner
+
+                def close_then_reuse_first(value):
+                    close_calls.append(value)
+                    real_close(value)
+                    if replacement["value"] is None:
+                        reused = real_open(str(Path.cwd()), flags)
+                        if reused != value:
+                            os.dup2(reused, value)
+                            real_close(reused)
+                            reused = value
+                        replacement["value"] = reused
+
+                leaked = []
+                try:
+                    with patch(
+                        "scripts.live_eval.task_snapshot.os.close",
+                        side_effect=close_then_reuse_first,
+                    ):
+                        sys.settrace(interrupt_second_owner)
+                        arguments = (
+                            (owners, ledger)
+                            if uses_ledger
+                            else (owners,)
+                        )
+                        result = aggregator(*arguments)
+                    os.fstat(replacement["value"])
+                    replacement_alive = True
+                    for descriptor in descriptors:
+                        if descriptor == replacement["value"]:
+                            continue
+                        try:
+                            os.fstat(descriptor)
+                        except OSError as error:
+                            self.assertEqual(error.errno, errno.EBADF)
+                        else:
+                            leaked.append(descriptor)
+                finally:
+                    sys.settrace(None)
+                    for descriptor in leaked:
+                        real_close(descriptor)
+                    if replacement_alive:
+                        real_close(replacement["value"])
+
+                self.assertFalse(result)
+                self.assertEqual(leaked, [])
+                self.assertEqual(
+                    sorted(close_calls),
+                    sorted(descriptors),
+                )
+                if uses_ledger:
+                    self.assertTrue(ledger.close_uncertain)
+
+    def test_owner_aggregators_redrain_guarded_pre_attempt_faults(self):
+        owner_type = task_snapshot_module._SourceResourceOwner
+        real_close = os.close
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        close_lines, close_first = inspect.getsourcelines(owner_type.close)
+        close_line = next(
+            close_first + index
+            for index, line in enumerate(close_lines)
+            if "descriptor_ok = _guard_cleanup_boolean" in line
+        )
+        descriptor_lines, descriptor_first = inspect.getsourcelines(
+            owner_type.close_descriptor
+        )
+        descriptor_line = next(
+            descriptor_first + index
+            for index, line in enumerate(descriptor_lines)
+            if "cell = self._cell" in line
+        )
+        cases = (
+            (
+                "source-owner",
+                task_snapshot_module._close_source_owners,
+                owner_type.close,
+                close_line,
+                False,
+                False,
+            ),
+            (
+                "target-owner",
+                task_snapshot_module._close_target_descriptors,
+                owner_type.close_descriptor,
+                descriptor_line,
+                True,
+                False,
+            ),
+            (
+                "target-raw",
+                task_snapshot_module._close_target_descriptors,
+                owner_type.close_descriptor,
+                descriptor_line,
+                True,
+                True,
+            ),
+        )
+
+        for (
+            label,
+            aggregator,
+            traced_method,
+            target_line,
+            uses_ledger,
+            uses_raw,
+        ) in cases:
+            for target_visit in (1, 2):
+                with self.subTest(label=label, target_visit=target_visit):
+                    descriptors = [
+                        os.open(str(Path.cwd()), flags)
+                        for unused_index in range(3)
+                    ]
+                    owners = [
+                        owner_type(descriptor=descriptor)
+                        for descriptor in descriptors
+                    ]
+                    arguments_value = (
+                        descriptors if uses_raw else owners
+                    )
+                    ledger = task_snapshot_module._TargetOwnershipLedger()
+                    visits = {"value": 0}
+                    close_calls = []
+                    leaked = []
+
+                    def interrupt_owner(frame, event, unused_arg):
+                        if (
+                            frame.f_code is traced_method.__code__
+                            and event == "line"
+                            and frame.f_lineno == target_line
+                        ):
+                            visits["value"] += 1
+                            if visits["value"] == target_visit:
+                                sys.settrace(None)
+                                raise RuntimeError(
+                                    label + "-guarded-pre-attempt"
+                                )
+                        return interrupt_owner
+
+                    def tracking_close(value):
+                        close_calls.append(value)
+                        real_close(value)
+
+                    try:
+                        with patch(
+                            "scripts.live_eval.task_snapshot.os.close",
+                            side_effect=tracking_close,
+                        ):
+                            sys.settrace(interrupt_owner)
+                            arguments = (
+                                (arguments_value, ledger)
+                                if uses_ledger
+                                else (arguments_value,)
+                            )
+                            result = aggregator(*arguments)
+                    finally:
+                        sys.settrace(None)
+                        for descriptor in descriptors:
+                            try:
+                                os.fstat(descriptor)
+                            except OSError as error:
+                                self.assertEqual(error.errno, errno.EBADF)
+                            else:
+                                leaked.append(descriptor)
+                        for descriptor in leaked:
+                            real_close(descriptor)
+
+                    self.assertFalse(result)
+                    self.assertEqual(leaked, [])
+                    self.assertEqual(
+                        sorted(close_calls),
+                        sorted(descriptors),
+                    )
+                    if uses_ledger:
+                        self.assertTrue(ledger.close_uncertain)
+
+    def test_source_owner_aggregator_redrains_iterator_pre_attempt_fault(
+        self,
+    ):
+        owner_type = task_snapshot_module._SourceResourceOwner
+        method = owner_type.close_iterator
+        lines, first_line = inspect.getsourcelines(method)
+        target_line = next(
+            first_line + index
+            for index, line in enumerate(lines)
+            if "cell = self._cell" in line
+        )
+
+        class TrackedIterator:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        for target_visit in (1, 2):
+            with self.subTest(target_visit=target_visit):
+                iterators = [TrackedIterator() for unused_index in range(3)]
+                owners = [
+                    owner_type(iterator=iterator)
+                    for iterator in iterators
+                ]
+                visits = {"value": 0}
+
+                def interrupt_iterator_owner(frame, event, unused_arg):
+                    if (
+                        frame.f_code is method.__code__
+                        and event == "line"
+                        and frame.f_lineno == target_line
+                    ):
+                        visits["value"] += 1
+                        if visits["value"] == target_visit:
+                            sys.settrace(None)
+                            raise RuntimeError(
+                                "iterator-owner-guarded-pre-attempt"
+                            )
+                    return interrupt_iterator_owner
+
+                try:
+                    sys.settrace(interrupt_iterator_owner)
+                    result = task_snapshot_module._close_source_owners(
+                        owners
+                    )
+                finally:
+                    sys.settrace(None)
+
+                self.assertFalse(result)
+                self.assertEqual(
+                    [iterator.close_calls for iterator in iterators],
+                    [1, 1, 1],
+                )
+                self.assertFalse(
+                    any(owner.has_resources() for owner in owners)
+                )
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_control_file_close_trace_retains_caller_cleanup_authority(self):
+        repo, unused_oid = self.make_repository()
+        parent_descriptor = os.open(
+            str(repo / ".git"),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        helper = task_snapshot_module._read_control_file
+        helper_lines, first_line = inspect.getsourcelines(helper)
+        target_line = next(
+            first_line + index
+            for index, line in enumerate(helper_lines)
+            if (
+                "_close_source_descriptors" in line
+                or "control_owner.close" in line
+            )
+        )
+        supports_owner = "control_owner" in inspect.signature(
+            helper
+        ).parameters
+        control_owner = task_snapshot_module._SourceResourceOwner()
+        trace_error = RuntimeError("control-file-close-trace")
+        baseline = {
+            int(name)
+            for name in os.listdir("/dev/fd")
+            if name.isdigit()
+        }
+        caught = None
+
+        def interrupt_close(frame, event, unused_arg):
+            if (
+                frame.f_code is helper.__code__
+                and event == "line"
+                and frame.f_lineno == target_line
+            ):
+                sys.settrace(None)
+                raise trace_error
+            return interrupt_close
+
+        leaked = set()
+        try:
+            try:
+                sys.settrace(interrupt_close)
+                arguments = (
+                    parent_descriptor,
+                    "config",
+                    os.fstat(parent_descriptor).st_dev,
+                    64 * 1024,
+                    "task_source_config_invalid",
+                )
+                if supports_owner:
+                    helper(*arguments, control_owner)
+                else:
+                    helper(*arguments)
+            except BaseException as error:
+                caught = error
+            finally:
+                sys.settrace(None)
+            if supports_owner:
+                control_owner.close()
+            after = {
+                int(name)
+                for name in os.listdir("/dev/fd")
+                if name.isdigit()
+            }
+            leaked = after - baseline
+        finally:
+            for descriptor in leaked:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            os.close(parent_descriptor)
+
+        self.assertIs(caught, trace_error)
+        self.assertIsNone(caught.__context__)
+        self.assertIsNone(caught.__cause__)
+        self.assertEqual(leaked, set())
+
     def test_sibling_churn_inside_descriptor_window_is_stable(self):
         repo, oid = self.make_repository()
         real_open = os.open
@@ -675,13 +1980,14 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
             "scripts.live_eval.task_snapshot.os.open",
             side_effect=opening_with_sibling_churn,
         ):
-            descriptor, metadata, ancestors = _open_root_descriptor(repo)
+            owner = task_snapshot_module._SourceResourceOwner()
+            metadata, ancestors = _open_root_descriptor(repo, owner)
         try:
             self.assertTrue(churned["value"])
             self.assertEqual(metadata.st_ino, os.stat(repo).st_ino)
             self.assertTrue(ancestors)
         finally:
-            os.close(descriptor)
+            self.assertTrue(owner.close())
 
     def test_nonfinal_private_tmp_sibling_churn_is_stable(self):
         private_temp_root = Path("/private/tmp")
@@ -698,7 +2004,7 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
         repo.mkdir(mode=0o700)
         real_open = os.open
         sibling_directories = []
-        descriptor = -1
+        owner = task_snapshot_module._SourceResourceOwner()
 
         def opening_with_temp_sibling_churn(path, flags, *args, **kwargs):
             opened_descriptor = real_open(path, flags, *args, **kwargs)
@@ -722,8 +2028,9 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
                     "scripts.live_eval.task_snapshot.os.open",
                     side_effect=opening_with_temp_sibling_churn,
                 ):
-                    descriptor, metadata, ancestors = (
-                        _open_root_descriptor(repo)
+                    metadata, ancestors = _open_root_descriptor(
+                        repo,
+                        owner,
                     )
             except TaskSnapshotError as error:
                 self.fail(
@@ -734,8 +2041,7 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
             self.assertEqual(metadata.st_ino, os.stat(repo).st_ino)
             self.assertTrue(ancestors)
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            self.assertTrue(owner.close())
             for sibling in sibling_directories:
                 sibling.rmdir()
 
@@ -3057,6 +4363,241 @@ class TaskSnapshotCaptureTests(RepositoryFixture, unittest.TestCase):
         ):
             materializer.capture(prepared)
 
+    def test_capture_preserves_cancellation_when_cleanup_reports_false(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        cancellation = CleanupCancellation("capture cancellation")
+        original_clear = materializer._clear_locked
+
+        def clear_then_report_false():
+            original_clear()
+            return False
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=cancellation,
+        ), patch.object(
+            materializer,
+            "_clear_locked",
+            side_effect=clear_then_report_false,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaises(
+            CleanupCancellation
+        ) as caught:
+            materializer.capture(prepared)
+
+        self.assertIs(caught.exception, cancellation)
+        make_receipt.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    def test_capture_preserves_cancellation_when_cleanup_raises(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        cancellation = CleanupCancellation("capture cancellation")
+        cleanup_error = RuntimeError("cleanup trace exception")
+        original_clear = materializer._clear_locked
+
+        def clear_then_raise():
+            original_clear()
+            raise cleanup_error
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=cancellation,
+        ), patch.object(
+            materializer,
+            "_clear_locked",
+            side_effect=clear_then_raise,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaises(
+            CleanupCancellation
+        ) as caught:
+            materializer.capture(prepared)
+
+        self.assertIs(caught.exception, cancellation)
+        make_receipt.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    def test_capture_cleanup_exception_requires_cleanup_without_terminal(
+        self,
+    ):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        cleanup_error = RuntimeError("cleanup trace exception")
+        original_clear = materializer._clear_locked
+
+        def clear_then_raise():
+            original_clear()
+            raise cleanup_error
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=RuntimeError("capture operation failure"),
+        ), patch.object(
+            materializer,
+            "_clear_locked",
+            side_effect=clear_then_raise,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError,
+            "^task_snapshot_cleanup_required$",
+        ):
+            materializer.capture(prepared)
+
+        make_receipt.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    def test_public_capture_preserves_source_cleanup_cancellation_identity(
+        self,
+    ):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        cancellation = CleanupCancellation("source read cancellation")
+        cleanup_error = RuntimeError("cleanup trace exception")
+        original_close = task_snapshot_module._close_fd_once
+        injected = {
+            "body": False,
+            "cleanup": False,
+        }
+
+        def cancel_source_read(unused_descriptor, unused_size):
+            injected["body"] = True
+            raise cancellation
+
+        def close_then_raise(descriptor):
+            closed = original_close(descriptor)
+            if injected["body"] and not injected["cleanup"]:
+                injected["cleanup"] = True
+                raise cleanup_error
+            return closed
+
+        with patch(
+            "scripts.live_eval.task_snapshot.os.read",
+            side_effect=cancel_source_read,
+        ), patch(
+            "scripts.live_eval.task_snapshot._close_fd_once",
+            side_effect=close_then_raise,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaises(
+            CleanupCancellation
+        ) as caught:
+            materializer.capture(prepared)
+
+        self.assertIs(caught.exception, cancellation)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(
+            injected,
+            {
+                "body": True,
+                "cleanup": True,
+            },
+        )
+        make_receipt.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    def test_public_capture_normalizes_source_cleanup_exception(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        cleanup_error = RuntimeError("cleanup trace exception")
+        original_close = task_snapshot_module._close_fd_once
+        injected = {"value": False}
+
+        def close_once_then_raise(descriptor):
+            closed = original_close(descriptor)
+            if not injected["value"]:
+                injected["value"] = True
+                raise cleanup_error
+            return closed
+
+        with patch(
+            "scripts.live_eval.task_snapshot._close_fd_once",
+            side_effect=close_once_then_raise,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError,
+            "^task_snapshot_cleanup_required$",
+        ) as caught:
+            materializer.capture(prepared)
+
+        self.assertTrue(injected["value"])
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        make_receipt.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    def test_public_capture_rejects_false_source_close_without_receipt(
+        self,
+    ):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        self.addCleanup(materializer.close)
+        original_close = task_snapshot_module._close_fd_once
+        reported = {"value": False}
+        caught = None
+
+        def close_regular_file_then_report_false(descriptor):
+            is_regular = stat.S_ISREG(os.fstat(descriptor).st_mode)
+            closed = original_close(descriptor)
+            if is_regular and not reported["value"]:
+                reported["value"] = True
+                return False
+            return closed
+
+        with patch(
+            "scripts.live_eval.task_snapshot._close_fd_once",
+            side_effect=close_regular_file_then_report_false,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt",
+            wraps=task_snapshot_module.make_receipt,
+        ) as make_receipt:
+            try:
+                materializer.capture(prepared)
+            except TaskSnapshotError as error:
+                caught = error
+
+        self.assertIsNotNone(caught)
+        self.assertEqual(str(caught), "task_snapshot_cleanup_required")
+        self.assertIsNone(caught.__context__)
+        self.assertIsNone(caught.__cause__)
+        self.assertTrue(reported["value"])
+        make_receipt.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_successful_public_capture_retains_no_file_descriptors(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        baseline = len(os.listdir("/dev/fd"))
+        try:
+            captured = materializer.capture(prepared)
+            self.assertIs(materializer._captured, captured)
+            self.assertEqual(materializer._state, "captured")
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+        finally:
+            materializer.close()
+        self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+
     def test_capture_lifecycle_retains_exact_object_and_physical_keys(self):
         repo, policy, prepared = self.prepared_source()
         materializer = TaskSnapshotMaterializer(policy)
@@ -3636,6 +5177,3275 @@ class TaskSnapshotMaterializedSurfaceTests(
         captured = materializer.capture(prepared)
         return repo, policy, materializer, captured
 
+    def restore_pair_permissions(self, parent):
+        for root_name in ("current", "lean"):
+            root = parent / root_name
+            if not root.exists():
+                continue
+            for path in sorted(
+                root.rglob("*"),
+                key=lambda value: len(value.parts),
+                reverse=True,
+            ):
+                if path.is_dir():
+                    os.chmod(path, 0o700)
+                elif path.is_file():
+                    os.chmod(path, 0o600)
+            os.chmod(root, 0o700)
+
+    def test_directory_chain_publication_fault_preserves_reused_descriptor(
+        self,
+    ):
+        cases = (
+            (
+                "owned",
+                task_snapshot_module._open_owned_directory_chain,
+            ),
+            (
+                "sealed",
+                task_snapshot_module._open_sealed_directory_chain,
+            ),
+        )
+        for label, helper in cases:
+            helper_lines, first_line = inspect.getsourcelines(helper)
+            boundary = None
+            for index, line in enumerate(helper_lines):
+                stripped = line.strip()
+                if (
+                    stripped == "child_descriptor = -1"
+                    and index > 0
+                    and helper_lines[index - 1].strip()
+                    == "current_descriptor = child_descriptor"
+                ):
+                    boundary = ("raw", first_line + index)
+                    break
+                if stripped == "child_published = True":
+                    boundary = ("owner", first_line + index)
+                    break
+            self.assertIsNotNone(boundary)
+
+            for terminal in (False, True):
+                with self.subTest(label=label, terminal=terminal):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary).resolve()
+                        child = root / "child"
+                        child.mkdir(mode=0o700)
+                        if label == "sealed":
+                            os.chmod(child, 0o555)
+                            os.chmod(root, 0o555)
+                        else:
+                            os.chmod(root, 0o700)
+                        root_descriptor = os.open(
+                            str(root),
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_CLOEXEC,
+                        )
+                        root_metadata = os.fstat(root_descriptor)
+                        child_metadata = os.stat(
+                            child,
+                            follow_symlinks=False,
+                        )
+                        opened_owners = []
+                        ledger = task_snapshot_module._TargetOwnershipLedger()
+                        if label == "owned":
+                            entry = task_snapshot_module._OwnedTargetEntry(
+                                parent_components=(),
+                                basename="child",
+                                kind="directory",
+                                created=True,
+                                token=(
+                                    task_snapshot_module
+                                    ._target_ownership_token(
+                                        child_metadata,
+                                        "directory",
+                                    )
+                                ),
+                            )
+                            ledger.entries.append(entry)
+                            ledger.by_path[("child",)] = entry
+
+                            class Gate:
+                                descriptor = root_descriptor
+                                device = root_metadata.st_dev
+                                metadata = root_metadata
+
+                            invoke = lambda: helper(
+                                Gate(),
+                                ("child",),
+                                ledger,
+                                "task_target_changed",
+                                opened_owners,
+                            )
+                        else:
+                            invoke = lambda: helper(
+                                root_descriptor,
+                                ("child",),
+                                root_metadata.st_dev,
+                                "task_target_changed",
+                                opened_owners,
+                            )
+
+                        real_close = os.close
+                        real_open = os.open
+                        target_descriptor = {"value": None}
+                        replacement = {"value": None}
+                        close_attempts = []
+                        trace_fired = {"value": False}
+                        trace_error = (
+                            CleanupCancellation(
+                                label + "-chain-cancellation"
+                            )
+                            if terminal
+                            else RuntimeError(label + "-chain-runtime")
+                        )
+                        caught = None
+
+                        def interrupt_publication(
+                            frame,
+                            event,
+                            unused_arg,
+                        ):
+                            if (
+                                not trace_fired["value"]
+                                and frame.f_code is helper.__code__
+                                and event == "line"
+                                and frame.f_lineno == boundary[1]
+                            ):
+                                trace_fired["value"] = True
+                                if boundary[0] == "raw":
+                                    target_descriptor["value"] = (
+                                        frame.f_locals["current_descriptor"]
+                                    )
+                                else:
+                                    target_descriptor["value"] = (
+                                        frame.f_locals["child_owner"].descriptor
+                                    )
+                                sys.settrace(None)
+                                raise trace_error
+                            return interrupt_publication
+
+                        def close_then_reuse(descriptor):
+                            if descriptor == target_descriptor["value"]:
+                                close_attempts.append(descriptor)
+                                if replacement["value"] is None:
+                                    real_close(descriptor)
+                                    reused = real_open(
+                                        str(root.parent),
+                                        os.O_RDONLY
+                                        | os.O_DIRECTORY
+                                        | os.O_CLOEXEC,
+                                    )
+                                    if reused != descriptor:
+                                        os.dup2(reused, descriptor)
+                                        real_close(reused)
+                                        reused = descriptor
+                                    replacement["value"] = reused
+                                    raise OSError(
+                                        errno.EINTR,
+                                        "chain-close-reuse",
+                                    )
+                            return real_close(descriptor)
+
+                        replacement_alive = False
+                        try:
+                            with patch(
+                                "scripts.live_eval.task_snapshot.os.close",
+                                side_effect=close_then_reuse,
+                            ):
+                                try:
+                                    sys.settrace(interrupt_publication)
+                                    invoke()
+                                except BaseException as error:
+                                    caught = error
+                                finally:
+                                    sys.settrace(None)
+                            self.assertTrue(trace_fired["value"])
+                            self.assertIsNotNone(replacement["value"])
+                            try:
+                                os.fstat(replacement["value"])
+                                replacement_alive = True
+                            except OSError:
+                                replacement_alive = False
+                        finally:
+                            try:
+                                real_close(root_descriptor)
+                            except OSError:
+                                pass
+                            if replacement_alive:
+                                real_close(replacement["value"])
+                            os.chmod(root, 0o700)
+                            os.chmod(child, 0o700)
+
+                        self.assertEqual(
+                            close_attempts,
+                            [target_descriptor["value"]],
+                        )
+                        self.assertTrue(replacement_alive)
+                        if terminal:
+                            self.assertIs(caught, trace_error)
+                        else:
+                            self.assertIs(type(caught), TaskSnapshotError)
+                            self.assertEqual(
+                                str(caught),
+                                "task_snapshot_cleanup_required",
+                            )
+                        self.assertIsNone(caught.__context__)
+                        self.assertIsNone(caught.__cause__)
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_directory_chain_return_trace_keeps_caller_owned_stack(self):
+        for label, helper in (
+            (
+                "owned",
+                task_snapshot_module._open_owned_directory_chain,
+            ),
+            (
+                "sealed",
+                task_snapshot_module._open_sealed_directory_chain,
+            ),
+        ):
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    child = root / "child"
+                    child.mkdir(mode=0o700)
+                    if label == "sealed":
+                        os.chmod(root, 0o555)
+                        os.chmod(child, 0o555)
+                    root_descriptor = os.open(
+                        str(root),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                    )
+                    root_metadata = os.fstat(root_descriptor)
+                    child_metadata = os.stat(
+                        child,
+                        follow_symlinks=False,
+                    )
+                    ledger = task_snapshot_module._TargetOwnershipLedger()
+                    owners = []
+                    if label == "owned":
+                        entry = task_snapshot_module._OwnedTargetEntry(
+                            parent_components=(),
+                            basename="child",
+                            kind="directory",
+                            created=True,
+                            token=(
+                                task_snapshot_module._target_ownership_token(
+                                    child_metadata,
+                                    "directory",
+                                )
+                            ),
+                        )
+                        ledger.entries.append(entry)
+                        ledger.by_path[("child",)] = entry
+
+                        class Gate:
+                            descriptor = root_descriptor
+                            metadata = root_metadata
+                            device = root_metadata.st_dev
+
+                        arguments = (
+                            Gate(),
+                            ("child",),
+                            ledger,
+                            "task_target_changed",
+                        )
+                    else:
+                        arguments = (
+                            root_descriptor,
+                            ("child",),
+                            root_metadata.st_dev,
+                            "task_target_changed",
+                        )
+                    supports_caller_stack = "opened_owners" in (
+                        inspect.signature(helper).parameters
+                    )
+                    trace_error = RuntimeError(label + "-return-trace")
+                    baseline = {
+                        int(name)
+                        for name in os.listdir("/dev/fd")
+                        if name.isdigit()
+                    }
+                    caught = None
+                    leaked = set()
+
+                    def interrupt_return(frame, event, unused_arg):
+                        if frame.f_code is helper.__code__ and event == "return":
+                            sys.settrace(None)
+                            raise trace_error
+                        return interrupt_return
+
+                    try:
+                        try:
+                            sys.settrace(interrupt_return)
+                            if supports_caller_stack:
+                                helper(*arguments, owners)
+                            else:
+                                helper(*arguments)
+                        except BaseException as error:
+                            caught = error
+                        finally:
+                            sys.settrace(None)
+                        if label == "owned":
+                            task_snapshot_module._close_target_descriptors(
+                                owners,
+                                ledger,
+                            )
+                        else:
+                            task_snapshot_module._close_source_owners(
+                                owners
+                            )
+                        after = {
+                            int(name)
+                            for name in os.listdir("/dev/fd")
+                            if name.isdigit()
+                        }
+                        leaked = after - baseline
+                    finally:
+                        for descriptor in leaked:
+                            try:
+                                os.close(descriptor)
+                            except OSError:
+                                pass
+                        os.close(root_descriptor)
+                        os.chmod(root, 0o700)
+                        os.chmod(child, 0o700)
+
+                    self.assertIs(caught, trace_error)
+                    self.assertIsNone(caught.__context__)
+                    self.assertIsNone(caught.__cause__)
+                    self.assertEqual(leaked, set())
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_owned_leaf_return_trace_keeps_caller_owned_resources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            root = parent / "current"
+            root.mkdir(mode=0o700)
+            target = root / "tracked.txt"
+            target.write_bytes(b"fixture\n")
+            os.chmod(target, 0o444)
+            parent_descriptor = os.open(
+                str(parent),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            parent_metadata = os.fstat(parent_descriptor)
+            ledger = task_snapshot_module._TargetOwnershipLedger()
+            for components, path, kind in (
+                ((), root, "directory"),
+                (("current",), target, "file"),
+            ):
+                metadata = os.stat(path, follow_symlinks=False)
+                entry = task_snapshot_module._OwnedTargetEntry(
+                    parent_components=components,
+                    basename=path.name,
+                    kind=kind,
+                    created=True,
+                    token=task_snapshot_module._target_ownership_token(
+                        metadata,
+                        kind,
+                    ),
+                )
+                ledger.entries.append(entry)
+                ledger.by_path[
+                    components + (path.name,)
+                ] = entry
+            leaf_entry = ledger.by_path[("current", "tracked.txt")]
+
+            class Gate:
+                descriptor = parent_descriptor
+                metadata = parent_metadata
+                device = parent_metadata.st_dev
+
+            helper = task_snapshot_module._open_owned_leaf
+            caller_stack = []
+            leaf_owner = task_snapshot_module._SourceResourceOwner()
+            supports_caller_owners = "descriptor_stack" in (
+                inspect.signature(helper).parameters
+            )
+            trace_error = RuntimeError("owned-leaf-return-trace")
+            baseline = {
+                int(name)
+                for name in os.listdir("/dev/fd")
+                if name.isdigit()
+            }
+            caught = None
+            leaked = set()
+
+            def interrupt_return(frame, event, unused_arg):
+                if frame.f_code is helper.__code__ and event == "return":
+                    sys.settrace(None)
+                    raise trace_error
+                return interrupt_return
+
+            try:
+                try:
+                    sys.settrace(interrupt_return)
+                    if supports_caller_owners:
+                        helper(
+                            Gate(),
+                            leaf_entry,
+                            ledger,
+                            caller_stack,
+                            leaf_owner,
+                        )
+                    else:
+                        helper(Gate(), leaf_entry, ledger)
+                except BaseException as error:
+                    caught = error
+                finally:
+                    sys.settrace(None)
+                task_snapshot_module._close_target_descriptors(
+                    [leaf_owner] + caller_stack,
+                    ledger,
+                )
+                after = {
+                    int(name)
+                    for name in os.listdir("/dev/fd")
+                    if name.isdigit()
+                }
+                leaked = after - baseline
+            finally:
+                for descriptor in leaked:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                os.close(parent_descriptor)
+                os.chmod(target, 0o600)
+
+            self.assertIs(caught, trace_error)
+            self.assertIsNone(caught.__context__)
+            self.assertIsNone(caught.__cause__)
+            self.assertEqual(leaked, set())
+
+    def test_target_walk_handoff_fault_preserves_reused_descriptor(self):
+        helpers = (
+            task_snapshot_module._open_target_parent_gate,
+            task_snapshot_module._open_materialized_snapshot_root,
+            task_snapshot_module._rebind_owned_pair_namespace,
+        )
+        for helper in helpers:
+            implementation = getattr(helper, "__wrapped__", helper)
+            helper_lines, first_line = inspect.getsourcelines(helper)
+            boundary = None
+            for index, line in enumerate(helper_lines):
+                stripped = line.strip()
+                if (
+                    stripped == "child_descriptor = -1"
+                    and index > 0
+                    and helper_lines[index - 1].strip()
+                    == "descriptor = child_descriptor"
+                ):
+                    boundary = ("raw", first_line + index)
+                    break
+                if (
+                    stripped
+                    == "current_owner, child_owner = child_owner, current_owner"
+                ):
+                    boundary = ("owner", first_line + index)
+                    break
+            self.assertIsNotNone(boundary)
+
+            for terminal in (False, True):
+                with self.subTest(
+                    helper=helper.__name__,
+                    terminal=terminal,
+                ):
+                    repo, unused_oid = self.make_repository()
+                    with tempfile.TemporaryDirectory() as temporary:
+                        parent = Path(temporary).resolve()
+                        os.chmod(parent, 0o700)
+                        parent_descriptor = -1
+                        ledger = (
+                            task_snapshot_module._TargetOwnershipLedger()
+                        )
+                        if (
+                            helper
+                            is task_snapshot_module._open_target_parent_gate
+                        ):
+                            protected = tuple(
+                                task_snapshot_module
+                                ._target_directory_identity_key(
+                                    os.stat(path, follow_symlinks=False)
+                                )
+                                for path in (repo, repo / ".git")
+                            )
+
+                            def invoke():
+                                with helper(
+                                    parent,
+                                    "current",
+                                    "lean",
+                                    repo,
+                                    repo / ".git",
+                                    protected,
+                                    TaskSnapshotPolicy(),
+                                ):
+                                    pass
+
+                        elif (
+                            helper
+                            is task_snapshot_module
+                            ._open_materialized_snapshot_root
+                        ):
+                            target = parent / "current"
+                            target.mkdir(mode=0o700)
+                            os.chmod(target, 0o555)
+
+                            def invoke():
+                                with helper(target):
+                                    pass
+
+                        else:
+                            for name in ("current", "lean"):
+                                root = parent / name
+                                root.mkdir(mode=0o700)
+                                os.chmod(root, 0o555)
+                                metadata = os.stat(
+                                    root,
+                                    follow_symlinks=False,
+                                )
+                                entry = (
+                                    task_snapshot_module._OwnedTargetEntry(
+                                        parent_components=(),
+                                        basename=name,
+                                        kind="directory",
+                                        created=True,
+                                        token=(
+                                            task_snapshot_module
+                                            ._target_ownership_token(
+                                                metadata,
+                                                "directory",
+                                            )
+                                        ),
+                                    )
+                                )
+                                ledger.entries.append(entry)
+                                ledger.by_path[(name,)] = entry
+                            parent_descriptor = os.open(
+                                str(parent),
+                                os.O_RDONLY
+                                | os.O_DIRECTORY
+                                | os.O_CLOEXEC,
+                            )
+                            parent_metadata = os.fstat(
+                                parent_descriptor
+                            )
+
+                            class Gate:
+                                descriptor = parent_descriptor
+                                target_parent = parent
+                                metadata = parent_metadata
+                                device = parent_metadata.st_dev
+                                current_name = "current"
+                                lean_name = "lean"
+
+                            root_metadata = {
+                                name: os.stat(
+                                    parent / name,
+                                    follow_symlinks=False,
+                                )
+                                for name in ("current", "lean")
+                            }
+
+                            def invoke():
+                                helper(
+                                    Gate(),
+                                    ledger,
+                                    root_metadata,
+                                )
+
+                        real_close = os.close
+                        real_open = os.open
+                        target_descriptor = {"value": None}
+                        replacement = {"value": None}
+                        close_attempts = []
+                        trace_fired = {"value": False}
+                        trace_error = (
+                            CleanupCancellation(
+                                helper.__name__ + "-cancellation"
+                            )
+                            if terminal
+                            else RuntimeError(
+                                helper.__name__ + "-runtime"
+                            )
+                        )
+                        caught = None
+
+                        def interrupt_handoff(frame, event, unused_arg):
+                            if (
+                                not trace_fired["value"]
+                                and frame.f_code is implementation.__code__
+                                and event == "line"
+                                and frame.f_lineno == boundary[1]
+                            ):
+                                trace_fired["value"] = True
+                                if boundary[0] == "raw":
+                                    target_descriptor["value"] = (
+                                        frame.f_locals["descriptor"]
+                                    )
+                                else:
+                                    target_descriptor["value"] = (
+                                        frame.f_locals["child_owner"].descriptor
+                                    )
+                                sys.settrace(None)
+                                raise trace_error
+                            return interrupt_handoff
+
+                        def close_then_reuse(descriptor):
+                            if descriptor == target_descriptor["value"]:
+                                close_attempts.append(descriptor)
+                                if replacement["value"] is None:
+                                    real_close(descriptor)
+                                    reused = real_open(
+                                        str(parent.parent),
+                                        os.O_RDONLY
+                                        | os.O_DIRECTORY
+                                        | os.O_CLOEXEC,
+                                    )
+                                    if reused != descriptor:
+                                        os.dup2(reused, descriptor)
+                                        real_close(reused)
+                                        reused = descriptor
+                                    replacement["value"] = reused
+                                    raise OSError(
+                                        errno.EINTR,
+                                        "target-walk-close-reuse",
+                                    )
+                            return real_close(descriptor)
+
+                        replacement_alive = False
+                        try:
+                            with patch(
+                                "scripts.live_eval.task_snapshot.os.close",
+                                side_effect=close_then_reuse,
+                            ):
+                                try:
+                                    sys.settrace(interrupt_handoff)
+                                    invoke()
+                                except BaseException as error:
+                                    caught = error
+                                finally:
+                                    sys.settrace(None)
+                            self.assertTrue(trace_fired["value"])
+                            self.assertIsNotNone(replacement["value"])
+                            try:
+                                os.fstat(replacement["value"])
+                                replacement_alive = True
+                            except OSError:
+                                replacement_alive = False
+                        finally:
+                            if parent_descriptor >= 0:
+                                try:
+                                    real_close(parent_descriptor)
+                                except OSError:
+                                    pass
+                            if replacement_alive:
+                                real_close(replacement["value"])
+                            self.restore_pair_permissions(parent)
+
+                        self.assertEqual(
+                            close_attempts,
+                            [target_descriptor["value"]],
+                        )
+                        self.assertTrue(replacement_alive)
+                        if terminal:
+                            self.assertIs(caught, trace_error)
+                        else:
+                            self.assertIs(type(caught), TaskSnapshotError)
+                            self.assertEqual(
+                                str(caught),
+                                "task_snapshot_cleanup_required",
+                            )
+                        self.assertIsNone(caught.__context__)
+                        self.assertIsNone(caught.__cause__)
+
+    def test_gate_close_trace_fault_keeps_descriptor_recoverable(self):
+        real_close = os.close
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        gate_types = (
+            task_snapshot_module._TargetParentGate,
+            task_snapshot_module._MaterializedRootGate,
+        )
+        for gate_type in gate_types:
+            with self.subTest(gate=gate_type.__name__):
+                descriptor = os.open(str(Path.cwd()), flags)
+                metadata = os.fstat(descriptor)
+                if gate_type is task_snapshot_module._TargetParentGate:
+                    gate = gate_type(
+                        descriptor=descriptor,
+                        target_parent=Path.cwd(),
+                        metadata=metadata,
+                        device=metadata.st_dev,
+                        current_name="current",
+                        lean_name="lean",
+                    )
+                else:
+                    gate = gate_type(
+                        descriptor=descriptor,
+                        metadata=metadata,
+                    )
+                method_lines, first_line = inspect.getsourcelines(
+                    gate_type.close
+                )
+                target_line = next(
+                    first_line + index
+                    for index, line in enumerate(method_lines)
+                    if "_guard_cleanup_boolean" in line
+                )
+                trace_error = RuntimeError(
+                    gate_type.__name__ + "-close-trace"
+                )
+                close_calls = []
+                closed = False
+
+                def interrupt_close(frame, event, unused_arg):
+                    if (
+                        frame.f_code is gate_type.close.__code__
+                        and event == "line"
+                        and frame.f_lineno == target_line
+                    ):
+                        sys.settrace(None)
+                        raise trace_error
+                    return interrupt_close
+
+                def tracking_close(value):
+                    close_calls.append(value)
+                    return real_close(value)
+
+                try:
+                    with patch(
+                        "scripts.live_eval.task_snapshot.os.close",
+                        side_effect=tracking_close,
+                    ):
+                        try:
+                            sys.settrace(interrupt_close)
+                            gate.close()
+                        except BaseException as error:
+                            caught = error
+                        finally:
+                            sys.settrace(None)
+                        self.assertIs(caught, trace_error)
+                        self.assertIsNone(caught.__context__)
+                        self.assertIsNone(caught.__cause__)
+                        self.assertTrue(gate.close())
+                    with self.assertRaises(OSError) as caught_close:
+                        os.fstat(descriptor)
+                    self.assertEqual(
+                        caught_close.exception.errno,
+                        errno.EBADF,
+                    )
+                    closed = True
+                finally:
+                    if not closed:
+                        try:
+                            real_close(descriptor)
+                        except OSError:
+                            pass
+                self.assertEqual(close_calls, [descriptor])
+
+    def test_gate_close_failure_is_sticky_and_never_retries(self):
+        real_close = os.close
+        real_open = os.open
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        for gate_type in (
+            task_snapshot_module._TargetParentGate,
+            task_snapshot_module._MaterializedRootGate,
+        ):
+            with self.subTest(gate=gate_type.__name__):
+                descriptor = real_open(str(Path.cwd()), flags)
+                metadata = os.fstat(descriptor)
+                if gate_type is task_snapshot_module._TargetParentGate:
+                    gate = gate_type(
+                        descriptor=descriptor,
+                        target_parent=Path.cwd(),
+                        metadata=metadata,
+                        device=metadata.st_dev,
+                        current_name="current",
+                        lean_name="lean",
+                    )
+                else:
+                    gate = gate_type(
+                        descriptor=descriptor,
+                        metadata=metadata,
+                    )
+                replacement = {"value": None}
+                close_calls = []
+                replacement_alive = False
+
+                def close_then_reuse(value):
+                    close_calls.append(value)
+                    real_close(value)
+                    reused = real_open(str(Path.cwd()), flags)
+                    if reused != value:
+                        os.dup2(reused, value)
+                        real_close(reused)
+                        reused = value
+                    replacement["value"] = reused
+                    raise OSError(errno.EINTR, "gate-close-reuse")
+
+                try:
+                    with patch(
+                        "scripts.live_eval.task_snapshot.os.close",
+                        side_effect=close_then_reuse,
+                    ):
+                        self.assertFalse(gate.close())
+                        self.assertFalse(gate.close())
+                    os.fstat(replacement["value"])
+                    replacement_alive = True
+                finally:
+                    if replacement_alive:
+                        real_close(replacement["value"])
+                self.assertEqual(close_calls, [descriptor])
+
+    def test_owned_file_close_boundary_retains_cleanup_authority(self):
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                with tempfile.TemporaryDirectory() as temporary:
+                    parent = Path(temporary).resolve()
+                    os.chmod(parent, 0o700)
+                    root = parent / "current"
+                    root.mkdir(mode=0o700)
+                    parent_descriptor = os.open(
+                        str(parent),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                    )
+                    parent_metadata = os.fstat(parent_descriptor)
+                    root_metadata = os.stat(root, follow_symlinks=False)
+                    root_entry = task_snapshot_module._OwnedTargetEntry(
+                        parent_components=(),
+                        basename="current",
+                        kind="directory",
+                        created=True,
+                        token=(
+                            task_snapshot_module._target_ownership_token(
+                                root_metadata,
+                                "directory",
+                            )
+                        ),
+                    )
+                    ledger = task_snapshot_module._TargetOwnershipLedger(
+                        entries=[root_entry],
+                        by_path={("current",): root_entry},
+                    )
+
+                    class Gate:
+                        descriptor = parent_descriptor
+                        metadata = parent_metadata
+                        device = parent_metadata.st_dev
+
+                    content = b"fixture\n"
+                    entry = TaskTreeEntry(
+                        path="tracked.txt",
+                        git_mode="100644",
+                        blob_oid="a" * 40,
+                        size=len(content),
+                        content_digest=(
+                            "sha256:" + hashlib.sha256(content).hexdigest()
+                        ),
+                    )
+                    helper = task_snapshot_module._create_owned_file
+                    helper_lines, first_line = inspect.getsourcelines(
+                        helper
+                    )
+                    boundary = None
+                    for index, line in enumerate(helper_lines):
+                        if "_close_target_descriptors" not in line:
+                            continue
+                        prefix = "".join(helper_lines[:index])
+                        if "owned_write_descriptor" in prefix:
+                            boundary = ("raw", first_line + index)
+                            break
+                        if "write_owner" in prefix:
+                            boundary = ("owner", first_line + index)
+                            break
+                    self.assertIsNotNone(boundary)
+                    target_descriptor = {"value": None}
+                    replacement = {"value": None}
+                    close_attempts = []
+                    trace_fired = {"value": False}
+                    trace_error = (
+                        CleanupCancellation("owned-file-cancellation")
+                        if terminal
+                        else RuntimeError("owned-file-runtime")
+                    )
+                    real_close = os.close
+                    real_open = os.open
+                    caught = None
+
+                    def interrupt_close_boundary(
+                        frame,
+                        event,
+                        unused_arg,
+                    ):
+                        if (
+                            not trace_fired["value"]
+                            and frame.f_code is helper.__code__
+                            and event == "line"
+                            and frame.f_lineno == boundary[1]
+                        ):
+                            trace_fired["value"] = True
+                            if boundary[0] == "raw":
+                                target_descriptor["value"] = frame.f_locals[
+                                    "owned_write_descriptor"
+                                ]
+                            else:
+                                target_descriptor["value"] = frame.f_locals[
+                                    "write_owner"
+                                ].descriptor
+                            sys.settrace(None)
+                            raise trace_error
+                        return interrupt_close_boundary
+
+                    def close_then_reuse(descriptor):
+                        if descriptor == target_descriptor["value"]:
+                            close_attempts.append(descriptor)
+                            if replacement["value"] is None:
+                                real_close(descriptor)
+                                reused = real_open(
+                                    str(parent.parent),
+                                    os.O_RDONLY
+                                    | os.O_DIRECTORY
+                                    | os.O_CLOEXEC,
+                                )
+                                if reused != descriptor:
+                                    os.dup2(reused, descriptor)
+                                    real_close(reused)
+                                    reused = descriptor
+                                replacement["value"] = reused
+                                raise OSError(
+                                    errno.EINTR,
+                                    "owned-file-close-reuse",
+                                )
+                        return real_close(descriptor)
+
+                    replacement_alive = False
+                    target_alive = False
+                    try:
+                        with patch(
+                            "scripts.live_eval.task_snapshot.os.close",
+                            side_effect=close_then_reuse,
+                        ):
+                            try:
+                                sys.settrace(interrupt_close_boundary)
+                                helper(
+                                    Gate(),
+                                    "current",
+                                    entry,
+                                    content,
+                                    TaskSnapshotPolicy(),
+                                    ledger,
+                                )
+                            except BaseException as error:
+                                caught = error
+                            finally:
+                                sys.settrace(None)
+                        self.assertTrue(trace_fired["value"])
+                        self.assertIsNotNone(replacement["value"])
+                        try:
+                            os.fstat(replacement["value"])
+                            replacement_alive = True
+                        except OSError:
+                            replacement_alive = False
+                    finally:
+                        if target_descriptor["value"] is not None:
+                            try:
+                                os.fstat(target_descriptor["value"])
+                                target_alive = True
+                            except OSError:
+                                target_alive = False
+                        if target_alive and not replacement_alive:
+                            real_close(target_descriptor["value"])
+                        if replacement_alive:
+                            real_close(replacement["value"])
+                        try:
+                            real_close(parent_descriptor)
+                        except OSError:
+                            pass
+                        target = root / "tracked.txt"
+                        if target.exists():
+                            os.chmod(target, 0o600)
+                            target.unlink()
+
+                    self.assertEqual(
+                        close_attempts,
+                        [target_descriptor["value"]],
+                    )
+                    self.assertTrue(replacement_alive)
+                    if terminal:
+                        self.assertIs(caught, trace_error)
+                    else:
+                        self.assertIs(type(caught), TaskSnapshotError)
+                        self.assertEqual(
+                            str(caught),
+                            "task_snapshot_cleanup_required",
+                        )
+                    self.assertIsNone(caught.__context__)
+                    self.assertIsNone(caught.__cause__)
+
+    def test_materialize_pair_builds_equal_sealed_roots_with_shared_receipt(
+        self,
+    ):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                current, lean = materializer.materialize_pair(
+                    captured,
+                    parent,
+                )
+
+                self.assertEqual(materializer._state, "paired")
+                self.assertIsNone(materializer._captured)
+                self.assertIsNone(materializer._operational_seal)
+                self.assertEqual(current.target_root, parent / "current")
+                self.assertEqual(lean.target_root, parent / "lean")
+                self.assertIs(
+                    current.snapshot_receipt,
+                    lean.snapshot_receipt,
+                )
+                self.assertEqual(
+                    current.materialized_tree_digest,
+                    lean.materialized_tree_digest,
+                )
+                self.assertNotEqual(
+                    current.target_identity_digest,
+                    lean.target_identity_digest,
+                )
+                self.assertNotEqual(
+                    os.lstat(current.target_root).st_ino,
+                    os.lstat(lean.target_root).st_ino,
+                )
+                for snapshot in (current, lean):
+                    self.assertEqual(
+                        stat.S_IMODE(os.lstat(snapshot.target_root).st_mode),
+                        0o555,
+                    )
+                    tracked = snapshot.target_root / "tracked.txt"
+                    self.assertEqual(tracked.read_bytes(), b"fixture\n")
+                    self.assertEqual(
+                        stat.S_IMODE(os.lstat(tracked).st_mode),
+                        0o444,
+                    )
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    def test_verify_is_repeatable_stateless_and_read_only(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                snapshots = materializer.materialize_pair(captured, parent)
+                with patch(
+                    "scripts.live_eval.task_snapshot.os.mkdir",
+                    side_effect=AssertionError("verify attempted mkdir"),
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.fchmod",
+                    side_effect=AssertionError("verify attempted chmod"),
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.unlink",
+                    side_effect=AssertionError("verify attempted unlink"),
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.rmdir",
+                    side_effect=AssertionError("verify attempted rmdir"),
+                ):
+                    for snapshot in snapshots:
+                        self.assertIsNone(materializer.verify(snapshot))
+                        self.assertIsNone(materializer.verify(snapshot))
+
+                os.chmod(snapshots[0].target_root, 0o700)
+                changed_file = (
+                    snapshots[0].target_root / "tracked.txt"
+                )
+                os.chmod(changed_file, 0o600)
+                changed_file.write_bytes(b"changed\n")
+                os.chmod(snapshots[0].target_root, 0o555)
+                with self.assertRaisesRegex(
+                    TaskSnapshotError, "^task_target_changed$"
+                ):
+                    materializer.verify(snapshots[0])
+                self.assertIsNone(materializer.verify(snapshots[1]))
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    def test_verify_rejects_exact_mutation_matrix(self):
+        cases = (
+            "extra",
+            "missing",
+            "wrong-mode",
+            "wrong-size",
+            "symlink",
+            "hardlink",
+            "fifo",
+        )
+        for case in cases:
+            (
+                unused_repo,
+                unused_policy,
+                materializer,
+                captured,
+            ) = self.captured_fixture()
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary).resolve()
+                os.chmod(parent, 0o700)
+                try:
+                    current, unused_lean = materializer.materialize_pair(
+                        captured,
+                        parent,
+                    )
+                    root = current.target_root
+                    tracked = root / "tracked.txt"
+                    os.chmod(root, 0o700)
+                    if case == "extra":
+                        extra = root / "extra.txt"
+                        extra.write_bytes(b"extra\n")
+                        os.chmod(extra, 0o444)
+                    elif case == "missing":
+                        tracked.unlink()
+                    elif case == "wrong-mode":
+                        os.chmod(tracked, 0o600)
+                    elif case == "wrong-size":
+                        os.chmod(tracked, 0o600)
+                        tracked.write_bytes(b"wrong-size\n")
+                        os.chmod(tracked, 0o444)
+                    elif case == "symlink":
+                        tracked.unlink()
+                        tracked.symlink_to(
+                            parent / "lean" / "tracked.txt"
+                        )
+                    elif case == "hardlink":
+                        tracked.unlink()
+                        os.link(
+                            parent / "lean" / "tracked.txt",
+                            tracked,
+                        )
+                    else:
+                        tracked.unlink()
+                        os.mkfifo(tracked, 0o444)
+                    os.chmod(root, 0o555)
+
+                    with self.subTest(case=case), self.assertRaisesRegex(
+                        TaskSnapshotError,
+                        "^task_target_changed$",
+                    ) as caught:
+                        materializer.verify(current)
+                    self.assertIsNone(caught.exception.__context__)
+                    self.assertIsNone(caught.exception.__cause__)
+                    self.assertEqual(materializer._state, "paired")
+                finally:
+                    self.restore_pair_permissions(parent)
+                    materializer.close()
+
+    def test_materialize_pair_write_failure_rolls_back_the_whole_pair(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            with patch(
+                "scripts.live_eval.task_snapshot.os.write",
+                side_effect=OSError(errno.EIO, "private write detail"),
+            ), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_target_invalid$"
+            ) as caught:
+                materializer.materialize_pair(captured, parent)
+
+            self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertFalse((parent / "current").exists())
+            self.assertFalse((parent / "lean").exists())
+            self.assertEqual(materializer._state, "closed")
+            self.assertIsNone(materializer._captured)
+            self.assertIsNone(materializer._operational_seal)
+
+    def test_materialize_create_chmod_reopen_read_hash_faults_are_fixed(
+        self,
+    ):
+        cases = ("mkdir", "fchmod", "reopen", "read", "hash")
+        for case in cases:
+            (
+                unused_repo,
+                unused_policy,
+                materializer,
+                captured,
+            ) = self.captured_fixture()
+            calls = {"value": 0}
+            if case == "mkdir":
+                target = "scripts.live_eval.task_snapshot.os.mkdir"
+                original = task_snapshot_module.os.mkdir
+
+                def fail_operation(*args, **kwargs):
+                    calls["value"] += 1
+                    if calls["value"] == 2:
+                        raise OSError(errno.EIO, "private mkdir detail")
+                    return original(*args, **kwargs)
+
+            elif case == "fchmod":
+                target = "scripts.live_eval.task_snapshot.os.fchmod"
+                original = task_snapshot_module.os.fchmod
+
+                def fail_operation(*args, **kwargs):
+                    calls["value"] += 1
+                    if calls["value"] == 3:
+                        raise OSError(errno.EIO, "private chmod detail")
+                    return original(*args, **kwargs)
+
+            elif case == "reopen":
+                target = "scripts.live_eval.task_snapshot.os.open"
+                original = task_snapshot_module.os.open
+
+                def fail_operation(path, flags, *args, **kwargs):
+                    if (
+                        not calls["value"]
+                        and path == "tracked.txt"
+                        and flags == task_snapshot_module._file_flags()
+                    ):
+                        calls["value"] = 1
+                        raise OSError(errno.EIO, "private reopen detail")
+                    return original(path, flags, *args, **kwargs)
+
+            elif case == "read":
+                target = "scripts.live_eval.task_snapshot.os.read"
+                original = task_snapshot_module.os.read
+
+                def fail_operation(*args, **kwargs):
+                    if not calls["value"]:
+                        calls["value"] = 1
+                        raise OSError(errno.EIO, "private read detail")
+                    return original(*args, **kwargs)
+
+            else:
+                target = (
+                    "scripts.live_eval.task_snapshot."
+                    "_read_exact_target_bytes"
+                )
+                original = (
+                    task_snapshot_module._read_exact_target_bytes
+                )
+
+                def fail_operation(*args, **kwargs):
+                    content = original(*args, **kwargs)
+                    if not calls["value"]:
+                        calls["value"] = 1
+                        return bytes((content[0] ^ 1,)) + content[1:]
+                    return content
+
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary).resolve()
+                os.chmod(parent, 0o700)
+                try:
+                    with self.subTest(case=case), patch(
+                        target,
+                        side_effect=fail_operation,
+                    ), self.assertRaisesRegex(
+                        TaskSnapshotError,
+                        "^task_target_invalid$",
+                    ) as caught:
+                        materializer.materialize_pair(captured, parent)
+                    self.assertIsNone(caught.exception.__context__)
+                    self.assertIsNone(caught.exception.__cause__)
+                    self.assertFalse((parent / "current").exists())
+                    self.assertFalse((parent / "lean").exists())
+                    self.assertEqual(materializer._state, "closed")
+                    self.assertIsNone(
+                        materializer._retained_target_gate
+                    )
+                finally:
+                    self.restore_pair_permissions(parent)
+                    materializer.close()
+
+    def test_rollback_unlink_and_rmdir_failures_require_cleanup(self):
+        for operation in ("unlink", "rmdir"):
+            (
+                unused_repo,
+                unused_policy,
+                materializer,
+                captured,
+            ) = self.captured_fixture()
+            original = getattr(task_snapshot_module.os, operation)
+            calls = {"value": 0}
+
+            def fail_first_cleanup_mutation(*args, **kwargs):
+                calls["value"] += 1
+                if calls["value"] == 1:
+                    raise OSError(
+                        errno.EIO,
+                        "private rollback detail",
+                    )
+                return original(*args, **kwargs)
+
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary).resolve()
+                os.chmod(parent, 0o700)
+                try:
+                    with self.subTest(operation=operation), patch(
+                        "scripts.live_eval.task_snapshot."
+                        "_make_task_snapshot_receipt",
+                        side_effect=RuntimeError(
+                            "private receipt detail"
+                        ),
+                    ), patch(
+                        "scripts.live_eval.task_snapshot.os."
+                        + operation,
+                        side_effect=fail_first_cleanup_mutation,
+                    ), self.assertRaisesRegex(
+                        TaskSnapshotError,
+                        "^task_snapshot_cleanup_required$",
+                    ) as caught:
+                        materializer.materialize_pair(captured, parent)
+                    self.assertIsNone(caught.exception.__context__)
+                    self.assertIsNone(caught.exception.__cause__)
+                    self.assertEqual(calls["value"], 1)
+                    self.assertTrue((parent / "current").is_dir())
+                    self.assertTrue((parent / "lean").is_dir())
+                    if operation == "unlink":
+                        self.assertEqual(
+                            (
+                                parent / "current" / "tracked.txt"
+                            ).read_bytes(),
+                            b"fixture\n",
+                        )
+                        self.assertEqual(
+                            (
+                                parent / "lean" / "tracked.txt"
+                            ).read_bytes(),
+                            b"fixture\n",
+                        )
+                    else:
+                        self.assertFalse(
+                            (
+                                parent / "current" / "tracked.txt"
+                            ).exists()
+                        )
+                        self.assertFalse(
+                            (
+                                parent / "lean" / "tracked.txt"
+                            ).exists()
+                        )
+                    self.assertEqual(materializer._state, "closed")
+                    self.assertIsNone(
+                        materializer._retained_target_gate
+                    )
+                finally:
+                    self.restore_pair_permissions(parent)
+                    materializer.close()
+
+    def test_cleanup_helpers_propagate_nonexception_baseexceptions(self):
+        cancellation = CleanupCancellation("descriptor close")
+        ledger = task_snapshot_module._TargetOwnershipLedger()
+        with patch(
+            "scripts.live_eval.task_snapshot._close_fd_once",
+            side_effect=cancellation,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._close_target_descriptors(
+                (123,),
+                ledger,
+            )
+        self.assertIs(caught.exception, cancellation)
+        self.assertFalse(ledger.close_uncertain)
+
+        cancellation = CleanupCancellation("iterator close")
+
+        class ClosingIterator:
+            def __next__(self):
+                raise StopIteration
+
+            def close(self):
+                raise cancellation
+
+        with patch(
+            "scripts.live_eval.task_snapshot.os.scandir",
+            return_value=ClosingIterator(),
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._bounded_directory_names(
+                123,
+                1,
+                "task_target_changed",
+                task_snapshot_module._SourceResourceOwner(),
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        cancellation = CleanupCancellation("scan cancellation")
+
+        class CancellingIterator:
+            def __next__(self):
+                raise cancellation
+
+            def close(self):
+                raise OSError("iterator close failed")
+
+        with patch(
+            "scripts.live_eval.task_snapshot.os.scandir",
+            return_value=CancellingIterator(),
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._bounded_directory_names(
+                123,
+                1,
+                "task_target_changed",
+                task_snapshot_module._SourceResourceOwner(),
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        class Gate:
+            descriptor = 123
+            device = 1
+
+        cancellation = CleanupCancellation("owned chain cancellation")
+        owned_directory = task_snapshot_module._OwnedTargetEntry(
+            parent_components=(),
+            basename="child",
+            kind="directory",
+            created=True,
+            token=(1, 2, os.getuid(), os.getgid(), "directory"),
+        )
+        owned_ledger = task_snapshot_module._TargetOwnershipLedger(
+            entries=[owned_directory],
+            by_path={("child",): owned_directory},
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot."
+            "_require_live_target_parent",
+            return_value=None,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.stat",
+            side_effect=cancellation,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_close_target_descriptors",
+            return_value=False,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._open_owned_directory_chain(
+                Gate(),
+                ("child",),
+                owned_ledger,
+                "task_target_changed",
+                [],
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        cancellation = CleanupCancellation("sealed chain cancellation")
+        metadata = object()
+        with patch(
+            "scripts.live_eval.task_snapshot.os.stat",
+            side_effect=(metadata, cancellation),
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.open",
+            return_value=456,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.fstat",
+            return_value=metadata,
+        ), patch(
+            "scripts.live_eval.task_snapshot._same_identity",
+            return_value=True,
+        ), patch(
+            "scripts.live_eval.task_snapshot._valid_owned_metadata",
+            return_value=True,
+        ), patch(
+            "scripts.live_eval.task_snapshot._close_fd_once",
+            return_value=False,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._open_sealed_directory_chain(
+                123,
+                ("first", "second"),
+                1,
+                "task_target_changed",
+                [],
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        owned = task_snapshot_module._OwnedTargetEntry(
+            parent_components=(),
+            basename="current",
+            kind="directory",
+            created=True,
+            token=(
+                1,
+                2,
+                os.getuid(),
+                os.getgid(),
+                "directory",
+            ),
+        )
+        ledger = task_snapshot_module._TargetOwnershipLedger(
+            entries=[owned],
+            by_path={("current",): owned},
+        )
+        cancellation = CleanupCancellation("inspection")
+        with patch(
+            "scripts.live_eval.task_snapshot."
+            "_require_live_target_parent",
+            side_effect=cancellation,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._inspect_owned_pair(
+                object(),
+                ledger,
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        cancellation = CleanupCancellation("rollback")
+        with patch(
+            "scripts.live_eval.task_snapshot._inspect_owned_pair",
+            return_value=True,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_require_live_target_parent",
+            side_effect=cancellation,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._rollback_owned_pair(
+                object(),
+                task_snapshot_module._TargetOwnershipLedger(),
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        cancellation = CleanupCancellation("retained close")
+
+        class RetainedGate:
+            def close(self):
+                raise cancellation
+
+        materializer = TaskSnapshotMaterializer(TaskSnapshotPolicy())
+        materializer._retained_target_gate = RetainedGate()
+        with self.assertRaises(CleanupCancellation) as caught:
+            materializer._clear_locked()
+        self.assertIs(caught.exception, cancellation)
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._retained_target_gate)
+
+    def test_active_cancellation_survives_false_close_reports_directly(
+        self,
+    ):
+        cancellation = CleanupCancellation("inspection cancellation")
+        pending = task_snapshot_module._OwnedTargetEntry(
+            parent_components=(),
+            basename="current",
+            kind="directory",
+            created=False,
+            token=None,
+        )
+        ledger = task_snapshot_module._TargetOwnershipLedger(
+            entries=[pending],
+            by_path={("current",): pending},
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot."
+            "_open_owned_directory_chain",
+            side_effect=cancellation,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_close_target_descriptors",
+            return_value=False,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._inspect_owned_pair(
+                object(),
+                ledger,
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        cancellation = CleanupCancellation("rollback cancellation")
+        owned = task_snapshot_module._OwnedTargetEntry(
+            parent_components=(),
+            basename="current",
+            kind="directory",
+            created=True,
+            token=(
+                1,
+                2,
+                os.getuid(),
+                os.getgid(),
+                "directory",
+            ),
+        )
+        ledger = task_snapshot_module._TargetOwnershipLedger(
+            entries=[owned],
+            by_path={("current",): owned},
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot._inspect_owned_pair",
+            return_value=True,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_require_live_target_parent",
+            return_value=None,
+        ), patch(
+            "scripts.live_eval.task_snapshot._open_owned_leaf",
+            return_value=(11, None),
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.fchmod",
+            side_effect=cancellation,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_close_target_descriptors",
+            return_value=False,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._rollback_owned_pair(
+                object(),
+                ledger,
+            )
+        self.assertIs(caught.exception, cancellation)
+
+    def test_active_cancellation_survives_raised_cleanup_directly(self):
+        cancellation = CleanupCancellation("inspection cancellation")
+        cleanup_error = RuntimeError("cleanup trace exception")
+        pending = task_snapshot_module._OwnedTargetEntry(
+            parent_components=(),
+            basename="current",
+            kind="directory",
+            created=False,
+            token=None,
+        )
+        ledger = task_snapshot_module._TargetOwnershipLedger(
+            entries=[pending],
+            by_path={("current",): pending},
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot."
+            "_open_owned_directory_chain",
+            side_effect=cancellation,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_close_target_descriptors",
+            side_effect=cleanup_error,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._inspect_owned_pair(
+                object(),
+                ledger,
+            )
+        self.assertIs(caught.exception, cancellation)
+
+        cancellation = CleanupCancellation("rollback cancellation")
+        cleanup_error = RuntimeError("cleanup trace exception")
+        owned = task_snapshot_module._OwnedTargetEntry(
+            parent_components=(),
+            basename="current",
+            kind="directory",
+            created=True,
+            token=(
+                1,
+                2,
+                os.getuid(),
+                os.getgid(),
+                "directory",
+            ),
+        )
+        ledger = task_snapshot_module._TargetOwnershipLedger(
+            entries=[owned],
+            by_path={("current",): owned},
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot._inspect_owned_pair",
+            return_value=True,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_require_live_target_parent",
+            return_value=None,
+        ), patch(
+            "scripts.live_eval.task_snapshot._open_owned_leaf",
+            return_value=(11, None),
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.fchmod",
+            side_effect=cancellation,
+        ), patch(
+            "scripts.live_eval.task_snapshot."
+            "_close_target_descriptors",
+            side_effect=cleanup_error,
+        ), self.assertRaises(CleanupCancellation) as caught:
+            task_snapshot_module._rollback_owned_pair(
+                object(),
+                ledger,
+            )
+        self.assertIs(caught.exception, cancellation)
+
+    def test_close_preserves_active_cancellation_when_cleanup_reports_false(
+        self,
+    ):
+        materializer = TaskSnapshotMaterializer(TaskSnapshotPolicy())
+        cancellation = CleanupCancellation("close cancellation")
+        with self.assertRaises(CleanupCancellation) as caught:
+            try:
+                raise cancellation
+            finally:
+                with patch.object(
+                    materializer,
+                    "_clear_locked",
+                    return_value=False,
+                ):
+                    materializer.close()
+        self.assertIs(caught.exception, cancellation)
+
+        materializer = TaskSnapshotMaterializer(TaskSnapshotPolicy())
+        with patch.object(
+            materializer,
+            "_clear_locked",
+            return_value=False,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError,
+            "^task_snapshot_cleanup_required$",
+        ):
+            materializer.close()
+
+    def test_close_preserves_active_cancellation_when_cleanup_raises(self):
+        materializer = TaskSnapshotMaterializer(TaskSnapshotPolicy())
+        cancellation = CleanupCancellation("close cancellation")
+        cleanup_error = RuntimeError("cleanup trace exception")
+        with self.assertRaises(CleanupCancellation) as caught:
+            try:
+                raise cancellation
+            finally:
+                with patch.object(
+                    materializer,
+                    "_clear_locked",
+                    side_effect=cleanup_error,
+                ):
+                    materializer.close()
+        self.assertIs(caught.exception, cancellation)
+
+        materializer = TaskSnapshotMaterializer(TaskSnapshotPolicy())
+        cleanup_error = RuntimeError("cleanup trace exception")
+        with patch.object(
+            materializer,
+            "_clear_locked",
+            side_effect=cleanup_error,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError,
+            "^task_snapshot_cleanup_required$",
+        ):
+            materializer.close()
+
+    def test_cleanup_finally_blocks_have_no_control_transfer_or_direct_fail(
+        self,
+    ):
+        source = Path(task_snapshot_module.__file__).read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        control_transfer_lines = []
+        fail_lines = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for statement in node.finalbody:
+                for descendant in ast.walk(statement):
+                    if isinstance(
+                        descendant,
+                        (ast.Return, ast.Break, ast.Continue, ast.Raise),
+                    ):
+                        control_transfer_lines.append(descendant.lineno)
+                    if (
+                        isinstance(descendant, ast.Call)
+                        and isinstance(descendant.func, ast.Name)
+                        and descendant.func.id == "_fail"
+                    ):
+                        fail_lines.append(descendant.lineno)
+        self.assertEqual(control_transfer_lines, [])
+        self.assertEqual(fail_lines, [])
+
+    def test_source_cleanup_uses_explicit_guarded_owner_primitives(self):
+        source = Path(task_snapshot_module.__file__).read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        scoped_functions = {
+            "_open_root_descriptor",
+            "_open_child_directory",
+            "_read_control_file",
+            "_scan_empty_directory",
+            "_scan_hooks",
+            "_check_refs",
+            "_check_object_controls",
+            "_capture_filesystem",
+            "_capture_object_topology",
+        }
+        violations = []
+
+        def starts_with_terminal_capture(node):
+            if not node.finalbody:
+                return True
+            first = node.finalbody[0]
+            return (
+                isinstance(first, ast.Assign)
+                and len(first.targets) == 1
+                and isinstance(first.targets[0], ast.Name)
+                and first.targets[0].id == "preserve_abort"
+                and isinstance(first.value, ast.Call)
+                and isinstance(first.value.func, ast.Name)
+                and first.value.func.id
+                == "_active_terminal_baseexception"
+            )
+
+        def is_os_scandir(call):
+            return (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == "os"
+                and call.func.attr == "scandir"
+            )
+
+        for function in (
+            node
+            for node in tree.body
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name in scoped_functions
+            )
+        ):
+            for node in ast.walk(function):
+                if isinstance(node, ast.Call):
+                    if (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id == "_close_fd_once"
+                    ):
+                        violations.append(
+                            (
+                                function.name,
+                                node.lineno,
+                                "raw-fd-close",
+                            )
+                        )
+                    if (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "close"
+                    ):
+                        violations.append(
+                            (
+                                function.name,
+                                node.lineno,
+                                "raw-object-close",
+                            )
+                        )
+                if isinstance(node, ast.With):
+                    for item in node.items:
+                        if is_os_scandir(item.context_expr):
+                            violations.append(
+                                (
+                                    function.name,
+                                    node.lineno,
+                                    "implicit-scandir-close",
+                                )
+                            )
+                if (
+                    isinstance(node, ast.Try)
+                    and node.finalbody
+                    and not starts_with_terminal_capture(node)
+                ):
+                    violations.append(
+                        (
+                            function.name,
+                            node.finalbody[0].lineno,
+                            "late-terminal-capture",
+                        )
+                    )
+
+        definitions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        topology = definitions["_capture_object_topology"]
+        for node in ast.walk(topology):
+            if isinstance(node, ast.Dict):
+                keys = {
+                    key.value
+                    for key in node.keys
+                    if isinstance(key, ast.Constant)
+                    and isinstance(key.value, str)
+                }
+                for forbidden_key in ("fd", "iterator"):
+                    if forbidden_key in keys:
+                        violations.append(
+                            (
+                                topology.name,
+                                node.lineno,
+                                "raw-frame-" + forbidden_key,
+                            )
+                        )
+
+        for helper_name in (
+            "_open_root_descriptor",
+            "_open_child_directory",
+        ):
+            helper = definitions[helper_name]
+            parameter_names = {
+                argument.arg for argument in helper.args.args
+            }
+            if "owner" not in parameter_names:
+                violations.append(
+                    (
+                        helper_name,
+                        helper.lineno,
+                        "missing-caller-owner",
+                    )
+                )
+            return_annotation = ast.unparse(helper.returns)
+            if (
+                "int" in return_annotation
+                or "_SourceResourceOwner" in return_annotation
+            ):
+                violations.append(
+                    (
+                        helper_name,
+                        helper.lineno,
+                        "raw-owner-return",
+                    )
+                )
+
+        self.assertEqual(violations, [])
+
+    def test_target_local_opens_are_bound_to_persistent_owner_cells(self):
+        source = Path(task_snapshot_module.__file__).read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        scoped_functions = {
+            "_bounded_directory_names",
+            "_create_owned_directory",
+            "_create_owned_file",
+            "_seal_owned_directories",
+            "_scan_sealed_target_root",
+            "_scan_owned_target_root",
+            "_open_materialized_snapshot_root",
+            "_rebind_owned_pair_namespace",
+            "_inspect_owned_pair",
+            "_open_owned_leaf",
+        }
+        violations = []
+
+        def is_os_open(node):
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr == "open"
+            )
+
+        def is_os_scandir(node):
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr == "scandir"
+            )
+
+        for function in (
+            node
+            for node in tree.body
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.name in scoped_functions
+            )
+        ):
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Assign)
+                    and (
+                        is_os_open(node.value)
+                        or is_os_scandir(node.value)
+                    )
+                ):
+                    for target in node.targets:
+                        if (
+                            isinstance(target, ast.Name)
+                            and (
+                                target.id.endswith("descriptor")
+                                or is_os_scandir(node.value)
+                            )
+                        ):
+                            violations.append(
+                                (
+                                    function.name,
+                                    target.id,
+                                    node.lineno,
+                                )
+                            )
+
+        self.assertEqual(violations, [])
+
+    def test_materialize_propagates_first_cancellation_after_rollback(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        cancellation = CleanupCancellation("first cancellation")
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_make_task_snapshot_receipt",
+                    side_effect=cancellation,
+                ), self.assertRaises(CleanupCancellation) as caught:
+                    materializer.materialize_pair(captured, parent)
+                self.assertIs(caught.exception, cancellation)
+                self.assertFalse((parent / "current").exists())
+                self.assertFalse((parent / "lean").exists())
+                self.assertEqual(materializer._state, "closed")
+            finally:
+                self.restore_pair_permissions(parent)
+                materializer.close()
+
+    def test_materialize_preserves_cancellation_when_rollback_reports_false(
+        self,
+    ):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        cancellation = CleanupCancellation("materialize cancellation")
+
+        def record_ownership_then_cancel(*args):
+            ledger = args[6]
+            owned = task_snapshot_module._OwnedTargetEntry(
+                parent_components=(),
+                basename="current",
+                kind="directory",
+                created=False,
+                token=None,
+            )
+            ledger.entries.append(owned)
+            ledger.by_path[("current",)] = owned
+            raise cancellation
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            with patch.object(
+                materializer,
+                "_materialize_pair_under_gate_locked",
+                side_effect=record_ownership_then_cancel,
+            ), patch(
+                "scripts.live_eval.task_snapshot._rollback_owned_pair",
+                return_value=False,
+            ) as rollback, self.assertRaises(
+                CleanupCancellation
+            ) as caught:
+                materializer.materialize_pair(captured, parent)
+
+            self.assertIs(caught.exception, cancellation)
+            rollback.assert_called_once()
+            self.assertFalse((parent / "current").exists())
+            self.assertFalse((parent / "lean").exists())
+            self.assertEqual(materializer._state, "closed")
+            self.assertIsNone(materializer._retained_target_gate)
+
+    def test_materialize_propagates_cancellation_reentering_rollback(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        cancellation = CleanupCancellation("rollback cancellation")
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_make_task_snapshot_receipt",
+                    side_effect=RuntimeError(
+                        "private receipt failure"
+                    ),
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.unlink",
+                    side_effect=cancellation,
+                ), self.assertRaises(CleanupCancellation) as caught:
+                    materializer.materialize_pair(captured, parent)
+                self.assertIs(caught.exception, cancellation)
+                self.assertTrue((parent / "current").is_dir())
+                self.assertTrue((parent / "lean").is_dir())
+                self.assertTrue(
+                    (parent / "current" / "tracked.txt").is_file()
+                )
+                self.assertTrue(
+                    (parent / "lean" / "tracked.txt").is_file()
+                )
+                self.assertEqual(materializer._state, "closed")
+            finally:
+                self.restore_pair_permissions(parent)
+                materializer.close()
+
+    def test_materialize_preserves_cancellation_when_close_reports_false(
+        self,
+    ):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        cancellation = CleanupCancellation("rollback cancellation")
+        original_close = task_snapshot_module._close_fd_once
+        cancelled = {"value": False}
+        false_reported = {"value": False}
+
+        def cancel_first_unlink(*args, **kwargs):
+            cancelled["value"] = True
+            raise cancellation
+
+        def close_then_report_false(descriptor):
+            metadata = os.fstat(descriptor)
+            is_cancelled_file = (
+                cancelled["value"]
+                and not false_reported["value"]
+                and stat.S_ISREG(metadata.st_mode)
+            )
+            closed = original_close(descriptor)
+            if is_cancelled_file:
+                false_reported["value"] = True
+                return False
+            return closed
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_make_task_snapshot_receipt",
+                    side_effect=RuntimeError(
+                        "private receipt failure"
+                    ),
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.unlink",
+                    side_effect=cancel_first_unlink,
+                ), patch(
+                    "scripts.live_eval.task_snapshot._close_fd_once",
+                    side_effect=close_then_report_false,
+                ), self.assertRaises(CleanupCancellation) as caught:
+                    materializer.materialize_pair(captured, parent)
+                self.assertIs(caught.exception, cancellation)
+                self.assertTrue(false_reported["value"])
+                self.assertTrue((parent / "current").is_dir())
+                self.assertTrue((parent / "lean").is_dir())
+                self.assertTrue(
+                    (parent / "current" / "tracked.txt").is_file()
+                )
+                self.assertTrue(
+                    (parent / "lean" / "tracked.txt").is_file()
+                )
+                self.assertEqual(materializer._state, "closed")
+            finally:
+                self.restore_pair_permissions(parent)
+                materializer.close()
+
+    def test_materialize_preserves_cancellation_when_cleanup_raises(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        cancellation = CleanupCancellation("rollback cancellation")
+        cleanup_error = RuntimeError("cleanup trace exception")
+        original_cleanup = task_snapshot_module._close_target_descriptors
+        cancelled = {"value": False}
+        cleanup_raised = {"value": False}
+
+        def cancel_first_unlink(*args, **kwargs):
+            cancelled["value"] = True
+            raise cancellation
+
+        def close_then_raise(descriptors, ledger):
+            cleanup_ok = original_cleanup(descriptors, ledger)
+            if cancelled["value"] and not cleanup_raised["value"]:
+                cleanup_raised["value"] = True
+                raise cleanup_error
+            return cleanup_ok
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_make_task_snapshot_receipt",
+                    side_effect=RuntimeError(
+                        "private receipt failure"
+                    ),
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.unlink",
+                    side_effect=cancel_first_unlink,
+                ), patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_close_target_descriptors",
+                    side_effect=close_then_raise,
+                ), self.assertRaises(CleanupCancellation) as caught:
+                    materializer.materialize_pair(captured, parent)
+                self.assertIs(caught.exception, cancellation)
+                self.assertTrue(cleanup_raised["value"])
+                self.assertTrue((parent / "current").is_dir())
+                self.assertTrue((parent / "lean").is_dir())
+                self.assertTrue(
+                    (parent / "current" / "tracked.txt").is_file()
+                )
+                self.assertTrue(
+                    (parent / "lean" / "tracked.txt").is_file()
+                )
+                self.assertEqual(materializer._state, "closed")
+                self.assertIsNone(materializer._retained_target_gate)
+            finally:
+                self.restore_pair_permissions(parent)
+                materializer.close()
+
+    def test_materialize_pair_requires_exact_capture_and_live_seal_before_write(
+        self,
+    ):
+        cases = ("copied-capture", "mutated-capture", "policy-drift")
+        for case in cases:
+            (
+                unused_repo,
+                unused_policy,
+                materializer,
+                captured,
+            ) = self.captured_fixture()
+            supplied = captured
+            if case == "copied-capture":
+                supplied = replace(captured)
+            elif case == "mutated-capture":
+                object.__setattr__(
+                    captured.entries[0],
+                    "content_digest",
+                    "sha256:" + "f" * 64,
+                )
+            else:
+                object.__setattr__(
+                    materializer._policy,
+                    "max_files",
+                    materializer._policy.max_files - 1,
+                )
+            with tempfile.TemporaryDirectory() as temporary, patch(
+                "scripts.live_eval.task_snapshot.os.mkdir",
+                side_effect=AssertionError("invalid capture reached write"),
+            ) as mkdir, self.subTest(case=case), self.assertRaisesRegex(
+                TaskSnapshotError,
+                "^task_snapshot_receipt_invalid$",
+            ):
+                parent = Path(temporary).resolve()
+                os.chmod(parent, 0o700)
+                materializer.materialize_pair(supplied, parent)
+            mkdir.assert_not_called()
+            self.assertEqual(materializer._state, "closed")
+            self.assertIsNone(materializer._captured)
+            self.assertIsNone(materializer._operational_seal)
+
+    def test_created_but_unacquired_root_or_file_preserves_whole_pair(self):
+        for failure_call, expected_paths in (
+            (1, ("current",)),
+            (3, ("current", "lean", "current/tracked.txt")),
+        ):
+            (
+                unused_repo,
+                unused_policy,
+                materializer,
+                captured,
+            ) = self.captured_fixture()
+            calls = {"value": 0}
+            original_token = task_snapshot_module._target_ownership_token
+
+            def fail_selected_token(metadata, kind):
+                calls["value"] += 1
+                if calls["value"] == failure_call:
+                    raise OSError(errno.EIO, "private token detail")
+                return original_token(metadata, kind)
+
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary).resolve()
+                os.chmod(parent, 0o700)
+                try:
+                    with self.subTest(
+                        failure_call=failure_call
+                    ), patch(
+                        "scripts.live_eval.task_snapshot."
+                        "_target_ownership_token",
+                        side_effect=fail_selected_token,
+                    ), self.assertRaisesRegex(
+                        TaskSnapshotError,
+                        "^task_snapshot_cleanup_required$",
+                    ):
+                        materializer.materialize_pair(captured, parent)
+                    for relative in expected_paths:
+                        self.assertTrue(
+                            (parent / relative).exists(),
+                            relative,
+                        )
+                    self.assertEqual(materializer._state, "closed")
+                finally:
+                    self.restore_pair_permissions(parent)
+
+    def test_rollback_preinspection_mismatch_preserves_both_roots_without_mutation(
+        self,
+    ):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        injected = {"value": False}
+        cleanup_mutations = []
+
+        original_fchmod = task_snapshot_module.os.fchmod
+        original_unlink = task_snapshot_module.os.unlink
+        original_rmdir = task_snapshot_module.os.rmdir
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+
+            def inject_last_root_mismatch(*args, **kwargs):
+                lean = parent / "lean"
+                os.chmod(lean, 0o700)
+                (lean / "unexpected.txt").write_bytes(b"x")
+                os.chmod(lean, 0o555)
+                injected["value"] = True
+                raise RuntimeError("private receipt detail")
+
+            def track_fchmod(*args, **kwargs):
+                if injected["value"]:
+                    cleanup_mutations.append("fchmod")
+                return original_fchmod(*args, **kwargs)
+
+            def track_unlink(*args, **kwargs):
+                if injected["value"]:
+                    cleanup_mutations.append("unlink")
+                return original_unlink(*args, **kwargs)
+
+            def track_rmdir(*args, **kwargs):
+                if injected["value"]:
+                    cleanup_mutations.append("rmdir")
+                return original_rmdir(*args, **kwargs)
+
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_make_task_snapshot_receipt",
+                    side_effect=inject_last_root_mismatch,
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.fchmod",
+                    side_effect=track_fchmod,
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.unlink",
+                    side_effect=track_unlink,
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.rmdir",
+                    side_effect=track_rmdir,
+                ), self.assertRaisesRegex(
+                    TaskSnapshotError,
+                    "^task_snapshot_cleanup_required$",
+                ):
+                    materializer.materialize_pair(captured, parent)
+                self.assertTrue((parent / "current").is_dir())
+                self.assertTrue((parent / "lean").is_dir())
+                self.assertTrue(
+                    (parent / "lean" / "unexpected.txt").is_file()
+                )
+                self.assertEqual(cleanup_mutations, [])
+            finally:
+                self.restore_pair_permissions(parent)
+
+    def test_receipt_and_snapshot_constructor_failures_roll_back_pair(self):
+        for target_name in (
+            "_make_task_snapshot_receipt",
+            "MaterializedTaskSnapshot",
+        ):
+            (
+                unused_repo,
+                unused_policy,
+                materializer,
+                captured,
+            ) = self.captured_fixture()
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary).resolve()
+                os.chmod(parent, 0o700)
+                patch_target = (
+                    "scripts.live_eval.task_snapshot."
+                    + target_name
+                )
+                with self.subTest(
+                    target_name=target_name
+                ), patch(
+                    patch_target,
+                    side_effect=RuntimeError("private factory detail"),
+                ), self.assertRaisesRegex(
+                    TaskSnapshotError,
+                    "^task_snapshot_receipt_invalid$",
+                ):
+                    materializer.materialize_pair(captured, parent)
+                self.assertFalse((parent / "current").exists())
+                self.assertFalse((parent / "lean").exists())
+                self.assertEqual(materializer._state, "closed")
+
+    def test_v2_identity_detects_same_content_mode_descendant_replacement(self):
+        repo, oid = self.make_repository()
+        nested = repo / "nested"
+        nested.mkdir()
+        leaf = nested / "leaf.txt"
+        leaf.write_bytes(b"same bytes\n")
+        subprocess.run(
+            ("git", "add", "nested/leaf.txt"),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Task Snapshot",
+                "-c",
+                "user.email=snapshot@example.invalid",
+                "commit",
+                "-qm",
+                "nested fixture",
+            ),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        oid = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=str(repo),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+        policy = TaskSnapshotPolicy()
+        prepared = prepare_task_source(self.source_for(repo, oid), policy)
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                current, unused_lean = materializer.materialize_pair(
+                    captured,
+                    parent,
+                )
+                root = current.target_root
+                nested_target = root / "nested"
+                leaf_target = nested_target / "leaf.txt"
+                root_identity_before = (
+                    task_snapshot_module._identity(
+                        os.lstat(root),
+                        "directory",
+                    )
+                )
+                before_inode = os.lstat(leaf_target).st_ino
+                content = leaf_target.read_bytes()
+                os.chmod(nested_target, 0o700)
+                leaf_target.unlink()
+                leaf_target.write_bytes(content)
+                os.chmod(leaf_target, 0o444)
+                os.chmod(nested_target, 0o555)
+                self.assertNotEqual(
+                    before_inode,
+                    os.lstat(leaf_target).st_ino,
+                )
+                self.assertEqual(
+                    root_identity_before,
+                    task_snapshot_module._identity(
+                        os.lstat(root),
+                        "directory",
+                    ),
+                )
+                with (
+                    task_snapshot_module
+                    ._open_materialized_snapshot_root(root)
+                ) as scan_gate:
+                    tree_document, unused_metadata, unused_inventory = (
+                        task_snapshot_module._scan_sealed_target_root(
+                            scan_gate.descriptor,
+                            scan_gate.metadata,
+                            policy,
+                        )
+                    )
+                self.assertEqual(
+                    task_snapshot_module._digest(tree_document),
+                    current.materialized_tree_digest,
+                )
+                with self.assertRaisesRegex(
+                    TaskSnapshotError,
+                    "^task_target_changed$",
+                ):
+                    materializer.verify(current)
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    def test_verify_rebind_rejects_parent_namespace_replacement(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        original_scan = task_snapshot_module._scan_sealed_target_root
+        with tempfile.TemporaryDirectory() as temporary:
+            outer = Path(temporary).resolve()
+            parent = outer / "target"
+            moved = outer / "moved-target"
+            parent.mkdir(mode=0o700)
+            snapshots = materializer.materialize_pair(
+                captured,
+                parent,
+            )
+            replaced = {"value": False}
+
+            def replace_namespace_after_scan(*args, **kwargs):
+                result = original_scan(*args, **kwargs)
+                parent.rename(moved)
+                parent.mkdir(mode=0o700)
+                (parent / "current").mkdir(mode=0o555)
+                replaced["value"] = True
+                return result
+
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_scan_sealed_target_root",
+                    side_effect=replace_namespace_after_scan,
+                ), self.assertRaisesRegex(
+                    TaskSnapshotError,
+                    "^task_target_changed$",
+                ):
+                    materializer.verify(snapshots[0])
+                self.assertTrue(replaced["value"])
+            finally:
+                replacement_root = parent / "current"
+                if replacement_root.exists():
+                    os.chmod(replacement_root, 0o700)
+                self.restore_pair_permissions(moved)
+        materializer.close()
+
+    def test_verify_rejects_immediate_parent_mode_drift(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                snapshot, unused_lean = materializer.materialize_pair(
+                    captured,
+                    parent,
+                )
+                os.chmod(parent, 0o755)
+                with self.assertRaisesRegex(
+                    TaskSnapshotError,
+                    "^task_target_changed$",
+                ):
+                    materializer.verify(snapshot)
+                self.assertEqual(materializer._state, "paired")
+            finally:
+                os.chmod(parent, 0o700)
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    def test_verify_rejects_forged_target_root_type_without_repairing_input(
+        self,
+    ):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                snapshot, unused_lean = materializer.materialize_pair(
+                    captured,
+                    parent,
+                )
+                forged_root = str(snapshot.target_root)
+                object.__setattr__(snapshot, "target_root", forged_root)
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_open_materialized_snapshot_root",
+                ) as open_root, self.assertRaisesRegex(
+                    TaskSnapshotError,
+                    "^task_snapshot_receipt_invalid$",
+                ):
+                    materializer.verify(snapshot)
+                open_root.assert_not_called()
+                self.assertIs(type(snapshot.target_root), str)
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_verify_scan_interrupt_closes_root_gate(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        baseline = len(os.listdir("/dev/fd"))
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                snapshot, unused_lean = materializer.materialize_pair(
+                    captured,
+                    parent,
+                )
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_scan_sealed_target_root",
+                    side_effect=KeyboardInterrupt(
+                        "verify scan interrupt"
+                    ),
+                ), self.assertRaises(KeyboardInterrupt):
+                    materializer.verify(snapshot)
+                self.assertEqual(
+                    len(os.listdir("/dev/fd")),
+                    baseline + 1,
+                )
+                self.assertEqual(materializer._state, "paired")
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_verify_root_close_uncertainty_preserves_interrupt(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        original_close = task_snapshot_module._close_fd_once
+        baseline = len(os.listdir("/dev/fd"))
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                snapshot, unused_lean = materializer.materialize_pair(
+                    captured,
+                    parent,
+                )
+                root_inode = os.lstat(snapshot.target_root).st_ino
+
+                def close_then_report_uncertain(descriptor):
+                    is_root = (
+                        os.fstat(descriptor).st_ino == root_inode
+                    )
+                    closed = original_close(descriptor)
+                    return False if is_root else closed
+
+                interrupt = KeyboardInterrupt("verify scan interrupt")
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_scan_sealed_target_root",
+                    side_effect=interrupt,
+                ), patch(
+                    "scripts.live_eval.task_snapshot._close_fd_once",
+                    side_effect=close_then_report_uncertain,
+                ), self.assertRaises(
+                    KeyboardInterrupt,
+                ) as caught:
+                    materializer.verify(snapshot)
+                self.assertIs(caught.exception, interrupt)
+                self.assertEqual(
+                    len(os.listdir("/dev/fd")),
+                    baseline + 1,
+                )
+                self.assertEqual(materializer._state, "paired")
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_verify_preserves_interrupt_when_root_cleanup_raises(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        original_close = task_snapshot_module._close_fd_once
+        baseline = len(os.listdir("/dev/fd"))
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                snapshot, unused_lean = materializer.materialize_pair(
+                    captured,
+                    parent,
+                )
+                root_inode = os.lstat(snapshot.target_root).st_ino
+                cleanup_raised = {"value": False}
+
+                def close_then_raise(descriptor):
+                    is_root = (
+                        os.fstat(descriptor).st_ino == root_inode
+                    )
+                    closed = original_close(descriptor)
+                    if is_root and not cleanup_raised["value"]:
+                        cleanup_raised["value"] = True
+                        raise RuntimeError("cleanup trace exception")
+                    return closed
+
+                interrupt = KeyboardInterrupt("verify scan interrupt")
+                with patch(
+                    "scripts.live_eval.task_snapshot."
+                    "_scan_sealed_target_root",
+                    side_effect=interrupt,
+                ), patch(
+                    "scripts.live_eval.task_snapshot._close_fd_once",
+                    side_effect=close_then_raise,
+                ), self.assertRaises(
+                    KeyboardInterrupt,
+                ) as caught:
+                    materializer.verify(snapshot)
+                self.assertIs(caught.exception, interrupt)
+                self.assertTrue(cleanup_raised["value"])
+                self.assertEqual(
+                    len(os.listdir("/dev/fd")),
+                    baseline + 1,
+                )
+                self.assertEqual(materializer._state, "paired")
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_gate_helper_interrupt_does_not_leak_descriptor(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        baseline = len(os.listdir("/dev/fd"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+
+            with patch.object(
+                materializer,
+                "_materialize_pair_under_gate_locked",
+                side_effect=KeyboardInterrupt(
+                    "gate transfer interrupt"
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    materializer.materialize_pair(captured, parent)
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+            self.assertEqual(materializer._state, "closed")
+            self.assertIsNone(materializer._retained_target_gate)
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_precommit_transfer_interrupt_rolls_back_and_closes_gate(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        baseline = len(os.listdir("/dev/fd"))
+        original_retain = materializer._retain_target_gate_locked
+
+        def retain_then_interrupt(gate):
+            original_retain(gate)
+            raise KeyboardInterrupt("precommit transfer interrupt")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                with patch.object(
+                    materializer,
+                    "_retain_target_gate_locked",
+                    side_effect=retain_then_interrupt,
+                ), self.assertRaises(KeyboardInterrupt):
+                    materializer.materialize_pair(captured, parent)
+                self.assertFalse((parent / "current").exists())
+                self.assertFalse((parent / "lean").exists())
+                self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+                self.assertEqual(materializer._state, "closed")
+                self.assertIsNone(materializer._retained_target_gate)
+            finally:
+                self.restore_pair_permissions(parent)
+                materializer.close()
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_postcommit_return_interrupt_preserves_pair_until_close(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        baseline = len(os.listdir("/dev/fd"))
+        fired = {"value": False}
+
+        def interrupt_delivery(frame, event, arg):
+            if (
+                not fired["value"]
+                and frame.f_code
+                is TaskSnapshotMaterializer.materialize_pair.__code__
+                and event == "return"
+            ):
+                fired["value"] = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("postcommit delivery interrupt")
+            return interrupt_delivery
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                sys.settrace(interrupt_delivery)
+                with self.assertRaises(KeyboardInterrupt):
+                    materializer.materialize_pair(captured, parent)
+            finally:
+                sys.settrace(None)
+            try:
+                self.assertTrue(fired["value"])
+                self.assertEqual(materializer._state, "paired")
+                self.assertTrue((parent / "current").is_dir())
+                self.assertTrue((parent / "lean").is_dir())
+                committed_identities = {}
+                for root_name in ("current", "lean"):
+                    root = parent / root_name
+                    tracked = root / "tracked.txt"
+                    root_metadata = os.lstat(root)
+                    tracked_metadata = os.lstat(tracked)
+                    committed_identities[root_name] = (
+                        (
+                            root_metadata.st_dev,
+                            root_metadata.st_ino,
+                            root_metadata.st_mode,
+                        ),
+                        (
+                            tracked_metadata.st_dev,
+                            tracked_metadata.st_ino,
+                            tracked_metadata.st_mode,
+                        ),
+                        tracked.read_bytes(),
+                    )
+                    self.assertEqual(
+                        stat.S_IMODE(os.lstat(root).st_mode),
+                        0o555,
+                    )
+                    self.assertEqual(tracked.read_bytes(), b"fixture\n")
+                    self.assertEqual(
+                        stat.S_IMODE(os.lstat(tracked).st_mode),
+                        0o444,
+                    )
+                self.assertEqual(len(os.listdir("/dev/fd")), baseline + 1)
+                materializer.close()
+                self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+                for root_name in ("current", "lean"):
+                    root = parent / root_name
+                    tracked = root / "tracked.txt"
+                    root_metadata = os.lstat(root)
+                    tracked_metadata = os.lstat(tracked)
+                    self.assertEqual(
+                        (
+                            (
+                                root_metadata.st_dev,
+                                root_metadata.st_ino,
+                                root_metadata.st_mode,
+                            ),
+                            (
+                                tracked_metadata.st_dev,
+                                tracked_metadata.st_ino,
+                                tracked_metadata.st_mode,
+                            ),
+                            tracked.read_bytes(),
+                        ),
+                        committed_identities[root_name],
+                    )
+                materializer.close()
+                self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+            finally:
+                self.restore_pair_permissions(parent)
+                materializer.close()
+
+    def test_materialize_preserves_gate_cleanup_required_precedence(self):
+        unused_repo, policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o755)
+            parent_inode = os.lstat(parent).st_ino
+            original_close = task_snapshot_module._close_fd_once
+
+            def report_parent_close_uncertainty(descriptor):
+                is_parent = (
+                    os.fstat(descriptor).st_ino == parent_inode
+                )
+                closed = original_close(descriptor)
+                return False if is_parent else closed
+
+            with patch(
+                "scripts.live_eval.task_snapshot._close_fd_once",
+                side_effect=report_parent_close_uncertainty,
+            ), self.assertRaisesRegex(
+                TaskSnapshotError,
+                "^task_snapshot_cleanup_required$",
+            ) as caught:
+                materializer.materialize_pair(captured, parent)
+            self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertEqual(materializer._state, "closed")
+            os.chmod(parent, 0o700)
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_gate_helper_interrupt_close_uncertainty_preserves_interrupt(
+        self,
+    ):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        original_close = task_snapshot_module._close_fd_once
+        baseline = len(os.listdir("/dev/fd"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            parent_inode = os.lstat(parent).st_ino
+
+            def close_then_report_uncertain(descriptor):
+                is_parent = (
+                    os.fstat(descriptor).st_ino == parent_inode
+                )
+                closed = original_close(descriptor)
+                return False if is_parent else closed
+
+            interrupt = KeyboardInterrupt("gate transfer interrupt")
+            with patch.object(
+                materializer,
+                "_materialize_pair_under_gate_locked",
+                side_effect=interrupt,
+            ), patch(
+                "scripts.live_eval.task_snapshot._close_fd_once",
+                side_effect=close_then_report_uncertain,
+            ), self.assertRaises(KeyboardInterrupt) as caught:
+                materializer.materialize_pair(captured, parent)
+            self.assertIs(caught.exception, interrupt)
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+            self.assertEqual(materializer._state, "closed")
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_gate_helper_interrupt_cleanup_exception_preserves_interrupt(
+        self,
+    ):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        original_close = task_snapshot_module._close_fd_once
+        baseline = len(os.listdir("/dev/fd"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            parent_inode = os.lstat(parent).st_ino
+            cleanup_raised = {"value": False}
+
+            def close_then_raise(descriptor):
+                is_parent = (
+                    os.fstat(descriptor).st_ino == parent_inode
+                )
+                closed = original_close(descriptor)
+                if is_parent and not cleanup_raised["value"]:
+                    cleanup_raised["value"] = True
+                    raise RuntimeError("cleanup trace exception")
+                return closed
+
+            interrupt = KeyboardInterrupt("gate transfer interrupt")
+            with patch.object(
+                materializer,
+                "_materialize_pair_under_gate_locked",
+                side_effect=interrupt,
+            ), patch(
+                "scripts.live_eval.task_snapshot._close_fd_once",
+                side_effect=close_then_raise,
+            ), self.assertRaises(KeyboardInterrupt) as caught:
+                materializer.materialize_pair(captured, parent)
+            self.assertIs(caught.exception, interrupt)
+            self.assertTrue(cleanup_raised["value"])
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+            self.assertEqual(materializer._state, "closed")
+
+    def test_partial_write_completes_and_zero_write_rolls_back(self):
+        (
+            unused_repo,
+            unused_policy,
+            materializer,
+            captured,
+        ) = self.captured_fixture()
+        original_write = task_snapshot_module.os.write
+
+        def partial_write(descriptor, data):
+            return original_write(descriptor, data[:1])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot.os.write",
+                    side_effect=partial_write,
+                ):
+                    snapshots = materializer.materialize_pair(
+                        captured,
+                        parent,
+                    )
+                self.assertEqual(
+                    (snapshots[0].target_root / "tracked.txt").read_bytes(),
+                    b"fixture\n",
+                )
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
+        (
+            unused_repo,
+            unused_policy,
+            materializer,
+            captured,
+        ) = self.captured_fixture()
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            with patch(
+                "scripts.live_eval.task_snapshot.os.write",
+                return_value=0,
+            ), self.assertRaisesRegex(
+                TaskSnapshotError,
+                "^task_target_invalid$",
+            ):
+                materializer.materialize_pair(captured, parent)
+            self.assertFalse((parent / "current").exists())
+            self.assertFalse((parent / "lean").exists())
+
+    def test_final_namespace_rebind_rejects_replaced_parent(self):
+        unused_repo, unused_policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        original_builder = (
+            task_snapshot_module._build_materialized_snapshot_pair
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            outer = Path(temporary).resolve()
+            parent = outer / "target"
+            moved = outer / "moved-target"
+            parent.mkdir(mode=0o700)
+            replaced = {"value": False}
+
+            def replace_parent_namespace(*args, **kwargs):
+                result = original_builder(*args, **kwargs)
+                parent.rename(moved)
+                parent.mkdir(mode=0o700)
+                replaced["value"] = True
+                return result
+
+            with patch(
+                "scripts.live_eval.task_snapshot."
+                "_build_materialized_snapshot_pair",
+                side_effect=replace_parent_namespace,
+            ), self.assertRaisesRegex(
+                TaskSnapshotError,
+                "^task_target_changed$",
+            ):
+                materializer.materialize_pair(captured, parent)
+            self.assertTrue(replaced["value"])
+            self.assertTrue(parent.is_dir())
+            self.assertFalse((moved / "current").exists())
+            self.assertFalse((moved / "lean").exists())
+
+    def test_directory_chain_fstat_fault_closes_once_and_rolls_back(self):
+        for report_close_uncertainty in (False, True):
+            (
+                unused_repo,
+                unused_policy,
+                materializer,
+                captured,
+            ) = self.captured_fixture()
+            original_fstat = task_snapshot_module.os.fstat
+            original_close = task_snapshot_module._close_fd_once
+            current_fstats = {"value": 0}
+            fault_descriptor = {"value": None}
+            fault_close_pending = {"value": False}
+            close_calls = []
+
+            with tempfile.TemporaryDirectory() as temporary:
+                parent = Path(temporary).resolve()
+                os.chmod(parent, 0o700)
+
+                def fail_current_chain_fstat(descriptor):
+                    metadata = original_fstat(descriptor)
+                    current = parent / "current"
+                    if (
+                        current.exists()
+                        and metadata.st_ino
+                        == os.lstat(current).st_ino
+                    ):
+                        current_fstats["value"] += 1
+                        if current_fstats["value"] == 3:
+                            fault_descriptor["value"] = descriptor
+                            fault_close_pending["value"] = True
+                            raise OSError(
+                                errno.EIO,
+                                "private fstat detail",
+                            )
+                    return metadata
+
+                def observe_close(descriptor):
+                    closed = original_close(descriptor)
+                    if (
+                        fault_close_pending["value"]
+                        and descriptor == fault_descriptor["value"]
+                    ):
+                        fault_close_pending["value"] = False
+                        close_calls.append(descriptor)
+                        if report_close_uncertainty:
+                            return False
+                    return closed
+
+                expected = (
+                    "task_snapshot_cleanup_required"
+                    if report_close_uncertainty
+                    else "task_target_invalid"
+                )
+                try:
+                    with self.subTest(
+                        close_uncertain=report_close_uncertainty
+                    ), patch(
+                        "scripts.live_eval.task_snapshot.os.fstat",
+                        side_effect=fail_current_chain_fstat,
+                    ), patch(
+                        "scripts.live_eval.task_snapshot._close_fd_once",
+                        side_effect=observe_close,
+                    ), self.assertRaisesRegex(
+                        TaskSnapshotError,
+                        "^" + expected + "$",
+                    ):
+                        materializer.materialize_pair(captured, parent)
+                    self.assertEqual(len(close_calls), 1)
+                    if report_close_uncertainty:
+                        self.assertTrue((parent / "current").exists())
+                        self.assertTrue((parent / "lean").exists())
+                    else:
+                        self.assertFalse((parent / "current").exists())
+                        self.assertFalse((parent / "lean").exists())
+                finally:
+                    self.restore_pair_permissions(parent)
+
+    @unittest.skipUnless(
+        Path("/dev/fd").is_dir(),
+        "descriptor accounting requires /dev/fd",
+    )
+    def test_pair_and_verify_descriptor_peak_is_bounded_without_double_close(
+        self,
+    ):
+        unused_repo, policy, materializer, captured = (
+            self.captured_fixture()
+        )
+        original_open = task_snapshot_module.os.open
+        original_close = task_snapshot_module.os.close
+        original_scandir = task_snapshot_module.os.scandir
+        active = set()
+        baseline = len(os.listdir("/dev/fd"))
+        peak = {"value": baseline}
+
+        def observe_peak():
+            peak["value"] = max(
+                peak["value"],
+                len(os.listdir("/dev/fd")),
+            )
+
+        def tracked_open(*args, **kwargs):
+            descriptor = original_open(*args, **kwargs)
+            if descriptor in active:
+                raise AssertionError("open descriptor reused while active")
+            active.add(descriptor)
+            observe_peak()
+            return descriptor
+
+        def tracked_close(descriptor):
+            if descriptor not in active:
+                raise AssertionError("descriptor closed twice")
+            original_close(descriptor)
+            active.remove(descriptor)
+
+        def tracked_scandir(*args, **kwargs):
+            iterator = original_scandir(*args, **kwargs)
+            observe_peak()
+            return iterator
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            os.chmod(parent, 0o700)
+            try:
+                with patch(
+                    "scripts.live_eval.task_snapshot.os.open",
+                    side_effect=tracked_open,
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.close",
+                    side_effect=tracked_close,
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.scandir",
+                    side_effect=tracked_scandir,
+                ):
+                    snapshots = materializer.materialize_pair(
+                        captured,
+                        parent,
+                    )
+                    self.assertEqual(
+                        len(os.listdir("/dev/fd")),
+                        baseline + 1,
+                    )
+                    retained_gate = materializer._retained_target_gate
+                    self.assertIsNotNone(retained_gate)
+                    retained_descriptor = retained_gate.descriptor
+                    retained_identity = os.fstat(retained_descriptor)
+                    materializer.verify(snapshots[0])
+                    materializer.verify(snapshots[1])
+                    materializer.verify(snapshots[0])
+                    self.assertIs(
+                        materializer._retained_target_gate,
+                        retained_gate,
+                    )
+                    self.assertEqual(
+                        os.fstat(retained_descriptor),
+                        retained_identity,
+                    )
+                    self.assertEqual(
+                        len(os.listdir("/dev/fd")),
+                        baseline + 1,
+                    )
+                    materializer.close()
+                    materializer.close()
+                self.assertEqual(active, set())
+                self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+                self.assertLessEqual(
+                    peak["value"] - baseline,
+                    policy.max_tree_depth + 8,
+                )
+            finally:
+                self.restore_pair_permissions(parent)
+        materializer.close()
+
     def test_materialized_tree_builder_handles_empty_and_nested_entries(self):
         unused_repo, unused_policy, materializer, captured = (
             self.captured_fixture()
@@ -3799,10 +8609,15 @@ class TaskSnapshotMaterializedSurfaceTests(
 
             os.chmod(target_root, 0o555)
             try:
+                root_metadata = os.stat(
+                    target_root,
+                    follow_symlinks=False,
+                )
                 root_document = (
                     task_snapshot_module._target_root_identity_document(
-                        os.stat(target_root, follow_symlinks=False),
+                        root_metadata,
                         tree_digest,
+                        ((".", root_metadata, "directory"),),
                     )
                 )
             finally:
@@ -3812,17 +8627,24 @@ class TaskSnapshotMaterializedSurfaceTests(
                 frozenset(
                     {
                         "document_type",
+                        "entry_count",
                         "materialized_tree_digest",
-                        "root_identity",
+                        "records",
                         "schema_version",
                     }
                 ),
             )
             self.assertEqual(
                 root_document["document_type"],
-                "task-materialized-root-identity-v1",
+                "task-materialized-root-identity-v2",
             )
-            self.assertEqual(root_document["root_identity"]["mode"], 365)
+            self.assertEqual(root_document["schema_version"], 2)
+            self.assertEqual(root_document["entry_count"], 1)
+            self.assertEqual(root_document["records"][0]["path"], ".")
+            self.assertEqual(
+                root_document["records"][0]["identity"]["mode"],
+                365,
+            )
             self.assertNotIn(str(target_root), repr(root_document))
         materializer.close()
 
@@ -4002,7 +8824,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             ) as unlink, patch(
                 "scripts.live_eval.task_snapshot.os.rmdir"
             ) as rmdir:
-                gate = task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     parent,
                     "current",
                     "lean",
@@ -4010,10 +8832,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                     materializer._git_dir,
                     materializer._protected_identity_keys,
                     policy,
-                )
-            self.assertTrue(
-                task_snapshot_module._close_fd_once(gate.descriptor)
-            )
+                ) as gate:
+                    self.assertGreaterEqual(gate.descriptor, 0)
             mkdir.assert_not_called()
             fchmod.assert_not_called()
             unlink.assert_not_called()
@@ -4023,7 +8843,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             with self.assertRaisesRegex(
                 TaskSnapshotError, "^task_target_invalid$"
             ):
-                task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     parent,
                     "current",
                     "lean",
@@ -4031,7 +8851,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                     materializer._git_dir,
                     materializer._protected_identity_keys,
                     policy,
-                )
+                ):
+                    pass
             (parent / "current").rmdir()
             (parent / "lean").symlink_to(
                 parent / "missing",
@@ -4040,7 +8861,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             with self.assertRaisesRegex(
                 TaskSnapshotError, "^task_target_invalid$"
             ):
-                task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     parent,
                     "current",
                     "lean",
@@ -4048,7 +8869,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                     materializer._git_dir,
                     materializer._protected_identity_keys,
                     policy,
-                )
+                ):
+                    pass
         materializer.close()
 
     def test_target_gate_rechecks_parent_after_absence_lookups(self):
@@ -4071,7 +8893,6 @@ class TaskSnapshotMaterializedSurfaceTests(
                     mutated["value"] = True
                 return original_stat(path, *args, **kwargs)
 
-            gate = None
             try:
                 with patch(
                     "scripts.live_eval.task_snapshot.os.stat",
@@ -4079,7 +8900,7 @@ class TaskSnapshotMaterializedSurfaceTests(
                 ), self.assertRaisesRegex(
                     TaskSnapshotError, "^task_target_invalid$"
                 ):
-                    gate = task_snapshot_module._open_target_parent_gate(
+                    with task_snapshot_module._open_target_parent_gate(
                         parent,
                         "current",
                         "lean",
@@ -4087,10 +8908,9 @@ class TaskSnapshotMaterializedSurfaceTests(
                         materializer._git_dir,
                         materializer._protected_identity_keys,
                         policy,
-                    )
+                    ):
+                        pass
             finally:
-                if gate is not None:
-                    task_snapshot_module._close_fd_once(gate.descriptor)
                 os.chmod(parent, 0o700)
         materializer.close()
 
@@ -4117,7 +8937,6 @@ class TaskSnapshotMaterializedSurfaceTests(
                     mutated["value"] = True
                 return descriptor
 
-            gate = None
             try:
                 with patch(
                     "scripts.live_eval.task_snapshot.os.open",
@@ -4125,7 +8944,7 @@ class TaskSnapshotMaterializedSurfaceTests(
                 ), self.assertRaisesRegex(
                     TaskSnapshotError, "^task_target_invalid$"
                 ):
-                    gate = task_snapshot_module._open_target_parent_gate(
+                    with task_snapshot_module._open_target_parent_gate(
                         inner,
                         "current",
                         "lean",
@@ -4133,10 +8952,9 @@ class TaskSnapshotMaterializedSurfaceTests(
                         materializer._git_dir,
                         materializer._protected_identity_keys,
                         policy,
-                    )
+                    ):
+                        pass
             finally:
-                if gate is not None:
-                    task_snapshot_module._close_fd_once(gate.descriptor)
                 os.chmod(outer, 0o700)
         materializer.close()
 
@@ -4168,7 +8986,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             ), self.assertRaisesRegex(
                 TaskSnapshotError, "^task_snapshot_cleanup_required$"
             ) as caught:
-                task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     parent,
                     "current",
                     "lean",
@@ -4176,7 +8994,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                     materializer._git_dir,
                     materializer._protected_identity_keys,
                     policy,
-                )
+                ):
+                    pass
             self.assertTrue(reported["value"])
             self.assertIsNone(caught.exception.__context__)
             self.assertIsNone(caught.exception.__cause__)
@@ -4200,7 +9019,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             ), self.assertRaisesRegex(
                 TaskSnapshotError, "^task_target_invalid$"
             ) as caught:
-                task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     target_parent,
                     "current",
                     "lean",
@@ -4208,7 +9027,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                     materializer._git_dir,
                     materializer._protected_identity_keys,
                     policy,
-                )
+                ):
+                    pass
             self.assertIsNone(caught.exception.__context__)
             self.assertIsNone(caught.exception.__cause__)
 
@@ -4251,7 +9071,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             ), self.assertRaisesRegex(
                 TaskSnapshotError, "^task_target_invalid$"
             ):
-                task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     target_parent,
                     "current",
                     "lean",
@@ -4259,7 +9079,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                     materializer._git_dir,
                     materializer._protected_identity_keys,
                     policy,
-                )
+                ):
+                    pass
 
         with tempfile.TemporaryDirectory() as temporary:
             parent = Path(temporary).resolve()
@@ -4267,7 +9088,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             with self.assertRaisesRegex(
                 TaskSnapshotError, "^task_target_invalid$"
             ):
-                task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     parent,
                     "current",
                     "lean",
@@ -4275,7 +9096,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                     materializer._git_dir,
                     materializer._protected_identity_keys,
                     policy,
-                )
+                ):
+                    pass
             os.chmod(parent, 0o700)
             parent_metadata = os.stat(parent, follow_symlinks=False)
             alias_keys = (
@@ -4289,7 +9111,7 @@ class TaskSnapshotMaterializedSurfaceTests(
             with self.assertRaisesRegex(
                 TaskSnapshotError, "^task_target_invalid$"
             ):
-                task_snapshot_module._open_target_parent_gate(
+                with task_snapshot_module._open_target_parent_gate(
                     parent,
                     "current",
                     "lean",
@@ -4297,14 +9119,15 @@ class TaskSnapshotMaterializedSurfaceTests(
                     Path("/lexically-unrelated-source/.git"),
                     alias_keys,
                     policy,
-                )
+                ):
+                    pass
             link = parent.parent / (parent.name + "-link")
             try:
                 link.symlink_to(parent, target_is_directory=True)
                 with self.assertRaisesRegex(
                     TaskSnapshotError, "^task_target_invalid$"
                 ):
-                    task_snapshot_module._open_target_parent_gate(
+                    with task_snapshot_module._open_target_parent_gate(
                         link,
                         "current",
                         "lean",
@@ -4312,7 +9135,8 @@ class TaskSnapshotMaterializedSurfaceTests(
                         materializer._git_dir,
                         materializer._protected_identity_keys,
                         policy,
-                    )
+                    ):
+                        pass
             finally:
                 if link.is_symlink():
                     link.unlink()

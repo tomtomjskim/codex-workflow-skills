@@ -1,6 +1,7 @@
 """Fail-closed trust gate for one operator-attested local Git source."""
 
 from dataclasses import dataclass, field, fields
+from contextlib import contextmanager
 import hashlib
 import inspect
 import math
@@ -14,7 +15,7 @@ import sys
 import threading
 import time
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 import unicodedata
 
 from scripts.live_eval.experiment_receipts import (
@@ -264,14 +265,133 @@ class _CapturedOperationalSeal:
     protected_identity_keys: Tuple[Tuple[int, int, str], ...]
 
 
-@dataclass(frozen=True)
+@dataclass(init=False)
 class _TargetParentGate:
-    descriptor: int = field(repr=False)
+    _descriptor_owner: object = field(repr=False)
     target_parent: Path = field(repr=False)
     metadata: os.stat_result = field(repr=False)
     device: int
     current_name: str
     lean_name: str
+    _owns_descriptor: bool = field(default=True, repr=False)
+
+    def __init__(
+        self,
+        descriptor: int = -1,
+        target_parent: Optional[Path] = None,
+        metadata: Optional[os.stat_result] = None,
+        device: int = -1,
+        current_name: str = "",
+        lean_name: str = "",
+        _owns_descriptor: bool = True,
+        _descriptor_owner: Optional[object] = None,
+    ) -> None:
+        self._descriptor_owner = (
+            _SourceResourceOwner(descriptor=descriptor)
+            if _descriptor_owner is None
+            else _descriptor_owner
+        )
+        self.target_parent = target_parent
+        self.metadata = metadata
+        self.device = device
+        self.current_name = current_name
+        self.lean_name = lean_name
+        self._owns_descriptor = _owns_descriptor
+
+    @property
+    def descriptor(self) -> int:
+        return self._descriptor_owner.descriptor
+
+    def close(self) -> bool:
+        if not self._owns_descriptor:
+            return not self._descriptor_owner._uncertain
+        cleanup_ok = _guard_cleanup_boolean(
+            self._descriptor_owner.close_descriptor
+        )
+        if not self._descriptor_owner.has_resources():
+            self._owns_descriptor = False
+        return cleanup_ok and not self._descriptor_owner._uncertain
+
+    def __enter__(self):
+        if self.descriptor < 0:
+            _fail("task_snapshot_cleanup_required")
+        return self
+
+    def __exit__(self, unused_type, unused_value, unused_traceback):
+        preserve_abort = _active_terminal_baseexception()
+        if not _guard_cleanup_boolean(self.close):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+        return False
+
+    def __del__(self):
+        if not getattr(self, "_owns_descriptor", False):
+            return
+        try:
+            self._descriptor_owner.close_descriptor()
+        except BaseException:
+            pass
+
+
+@dataclass(init=False)
+class _MaterializedRootGate:
+    _descriptor_owner: object = field(repr=False)
+    metadata: os.stat_result = field(repr=False)
+    _owns_descriptor: bool = field(default=True, repr=False)
+
+    def __init__(
+        self,
+        descriptor: int = -1,
+        metadata: Optional[os.stat_result] = None,
+        _owns_descriptor: bool = True,
+        _descriptor_owner: Optional[object] = None,
+    ) -> None:
+        self._descriptor_owner = (
+            _SourceResourceOwner(descriptor=descriptor)
+            if _descriptor_owner is None
+            else _descriptor_owner
+        )
+        self.metadata = metadata
+        self._owns_descriptor = _owns_descriptor
+
+    @property
+    def descriptor(self) -> int:
+        return self._descriptor_owner.descriptor
+
+    def close(self) -> bool:
+        if not self._owns_descriptor:
+            return not self._descriptor_owner._uncertain
+        cleanup_ok = _guard_cleanup_boolean(
+            self._descriptor_owner.close_descriptor
+        )
+        if not self._descriptor_owner.has_resources():
+            self._owns_descriptor = False
+        return cleanup_ok and not self._descriptor_owner._uncertain
+
+    def __del__(self):
+        if not getattr(self, "_owns_descriptor", False):
+            return
+        try:
+            self._descriptor_owner.close_descriptor()
+        except BaseException:
+            pass
+
+
+@dataclass
+class _OwnedTargetEntry:
+    parent_components: Tuple[str, ...]
+    basename: str
+    kind: str
+    created: Optional[bool] = None
+    token: Optional[Tuple[int, int, int, int, str]] = None
+
+
+@dataclass
+class _TargetOwnershipLedger:
+    entries: list = field(default_factory=list)
+    by_path: dict = field(default_factory=dict)
+    close_uncertain: bool = False
 
 
 def _fail(code: str) -> None:
@@ -281,6 +401,42 @@ def _fail(code: str) -> None:
         error.__context__ = None
         error.__cause__ = None
         raise
+
+
+def _active_terminal_baseexception() -> bool:
+    active_error = sys.exc_info()[1]
+    return (
+        active_error is not None
+        and not isinstance(active_error, Exception)
+    )
+
+
+def _guard_cleanup_boolean(
+    operation: Callable[..., object],
+    *args: object,
+) -> bool:
+    try:
+        return operation(*args) is True
+    except Exception:
+        return False
+
+
+def _guard_cleanup_action(
+    operation: Callable[..., object],
+    *args: object,
+) -> bool:
+    try:
+        operation(*args)
+    except Exception:
+        return False
+    return True
+
+
+def _fail_cleanup_required_unless_nonexception_active(
+    preserve_abort: bool,
+) -> None:
+    if not preserve_abort:
+        _fail("task_snapshot_cleanup_required")
 
 
 def _exact_fields(value: object, expected_type: type) -> bool:
@@ -1565,6 +1721,210 @@ def _close_fd_once(descriptor: int) -> bool:
         return False
 
 
+def _close_source_descriptors(descriptors: Sequence[int]) -> bool:
+    cleanup_ok = True
+    for descriptor in descriptors:
+        if descriptor < 0:
+            continue
+        cleanup_ok = _guard_cleanup_boolean(
+            _close_fd_once,
+            descriptor,
+        ) and cleanup_ok
+    return cleanup_ok
+
+
+def _close_source_iterator(iterator: object) -> bool:
+    try:
+        iterator.close()
+    except Exception:
+        return False
+    return True
+
+
+def _close_source_resources(
+    iterator: Optional[object],
+    descriptors: Sequence[int],
+) -> bool:
+    cleanup_ok = True
+    if iterator is not None:
+        cleanup_ok = _guard_cleanup_boolean(
+            _close_source_iterator,
+            iterator,
+        ) and cleanup_ok
+    cleanup_ok = _guard_cleanup_boolean(
+        _close_source_descriptors,
+        descriptors,
+    ) and cleanup_ok
+    return cleanup_ok
+
+
+@dataclass
+class _SourceResourceCell:
+    descriptor: int = field(default=-1, repr=False)
+    iterator: Optional[object] = field(default=None, repr=False)
+    inflight_descriptor: int = field(default=-1, repr=False)
+    inflight_iterator: Optional[object] = field(default=None, repr=False)
+    descriptor_close_started: bool = field(default=False, repr=False)
+    iterator_close_started: bool = field(default=False, repr=False)
+    uncertain: bool = field(default=False, repr=False)
+
+
+class _SourceResourceOwner:
+    def __init__(
+        self,
+        descriptor: int = -1,
+        iterator: Optional[object] = None,
+    ) -> None:
+        self._cell = _SourceResourceCell(
+            descriptor=descriptor,
+            iterator=iterator,
+        )
+
+    @property
+    def descriptor(self) -> int:
+        return self._cell.descriptor
+
+    @descriptor.setter
+    def descriptor(self, value: int) -> None:
+        self._cell.descriptor = value
+
+    @property
+    def iterator(self) -> Optional[object]:
+        return self._cell.iterator
+
+    @iterator.setter
+    def iterator(self, value: Optional[object]) -> None:
+        self._cell.iterator = value
+
+    @property
+    def _uncertain(self) -> bool:
+        return self._cell.uncertain
+
+    def has_resources(self) -> bool:
+        return (
+            self._cell.iterator is not None
+            or self._cell.inflight_iterator is not None
+            or self._cell.descriptor >= 0
+            or self._cell.inflight_descriptor >= 0
+        )
+
+    def mark_uncertain(self) -> None:
+        self._cell.uncertain = True
+
+    def share_from(self, source: "_SourceResourceOwner") -> bool:
+        if (
+            type(source) is not _SourceResourceOwner
+            or self.has_resources()
+            or self._cell.uncertain
+            or source.iterator is not None
+            or source.descriptor < 0
+            or source._cell.inflight_iterator is not None
+            or source._cell.inflight_descriptor >= 0
+            or source._cell.uncertain
+        ):
+            return False
+        self._cell = source._cell
+        return True
+
+    def close_iterator(self) -> bool:
+        cell = self._cell
+        if cell.iterator is None and cell.inflight_iterator is None:
+            return not cell.uncertain
+        previous_uncertainty = cell.uncertain
+        cell.uncertain = True
+        cleanup_ok = True
+        if cell.iterator is not None:
+            if cell.inflight_iterator is not None:
+                return False
+            cell.inflight_iterator, cell.iterator = cell.iterator, None
+        if cell.inflight_iterator is not None:
+            if cell.iterator_close_started:
+                cell.inflight_iterator = None
+                cleanup_ok = False
+            else:
+                try:
+                    # Keep the flag, close call, and retirement on one Python
+                    # line so a line-event interruption can only occur before
+                    # the attempt. Opcode-level injection is outside the
+                    # recoverable pure-Python ownership model.
+                    cell.iterator_close_started = True; cleanup_ok = _close_source_iterator(cell.inflight_iterator); cell.inflight_iterator = None
+                except Exception:
+                    if not cell.iterator_close_started:
+                        self.close_iterator()
+                    else:
+                        cell.inflight_iterator = None
+                    cleanup_ok = False
+        cell.uncertain = previous_uncertainty or not cleanup_ok
+        return not cell.uncertain
+
+    def close_descriptor(self) -> bool:
+        cell = self._cell
+        if cell.descriptor < 0 and cell.inflight_descriptor < 0:
+            return not cell.uncertain
+        previous_uncertainty = cell.uncertain
+        cell.uncertain = True
+        cleanup_ok = True
+        if cell.descriptor >= 0:
+            if cell.inflight_descriptor >= 0:
+                return False
+            cell.inflight_descriptor, cell.descriptor = cell.descriptor, -1
+        if cell.inflight_descriptor >= 0:
+            if cell.descriptor_close_started:
+                cell.inflight_descriptor = -1
+                cleanup_ok = False
+            else:
+                try:
+                    # See close_iterator(): this is line-event atomic, not
+                    # bytecode- or asynchronously atomic.
+                    cell.descriptor_close_started = True; cleanup_ok = _close_fd_once(cell.inflight_descriptor); cell.inflight_descriptor = -1
+                except OSError:
+                    cell.inflight_descriptor = -1
+                    cleanup_ok = False
+                except Exception:
+                    if not cell.descriptor_close_started:
+                        self.close_descriptor()
+                    else:
+                        cell.inflight_descriptor = -1
+                    cleanup_ok = False
+        cell.uncertain = previous_uncertainty or not cleanup_ok
+        return not cell.uncertain
+
+    def close(self) -> bool:
+        iterator_ok = _guard_cleanup_boolean(self.close_iterator)
+        descriptor_ok = _guard_cleanup_boolean(self.close_descriptor)
+        return iterator_ok and descriptor_ok and not self._cell.uncertain
+
+
+def _drain_source_owner_snapshot(
+    owners: Sequence[_SourceResourceOwner],
+) -> bool:
+    cleanup_ok = True
+    for owner in owners:
+        closed = _guard_cleanup_boolean(owner.close)
+        if owner.has_resources():
+            closed = _guard_cleanup_boolean(owner.close) and closed
+        cleanup_ok = closed and cleanup_ok
+    return cleanup_ok
+
+
+def _close_source_owners(
+    owners: Sequence[_SourceResourceOwner],
+) -> bool:
+    try:
+        owner_snapshot = tuple(reversed(tuple(owners)))
+        return _drain_source_owner_snapshot(owner_snapshot)
+    except Exception:
+        try:
+            recovery_snapshot = owner_snapshot
+        except UnboundLocalError:
+            recovery_snapshot = tuple(reversed(tuple(owners)))
+        _guard_cleanup_boolean(
+            _drain_source_owner_snapshot,
+            recovery_snapshot,
+        )
+        return False
+
+
 def _require_directory_metadata(
     metadata: os.stat_result,
     device: int,
@@ -1598,21 +1958,29 @@ def _require_file_metadata(
 
 def _open_root_descriptor(
     repository_root: Path,
-) -> Tuple[int, os.stat_result, Tuple[Dict[str, object], ...]]:
+    owner: _SourceResourceOwner,
+) -> Tuple[os.stat_result, Tuple[Dict[str, object], ...]]:
     lexical_ancestors = _validate_physical_root(repository_root)
     raw_root = os.fspath(repository_root)
+    if type(owner) is not _SourceResourceOwner or owner.has_resources():
+        _fail("task_source_root_invalid")
     try:
         lexical_root = os.lstat(raw_root)
     except OSError:
         _fail("task_source_root_invalid")
     components = Path(raw_root).parts[1:]
-    descriptor = -1
+    current_owner = _SourceResourceOwner()
+    success = False
     try:
-        descriptor = os.open(os.sep, _directory_flags())
-        parent_metadata = os.fstat(descriptor)
+        current_owner.descriptor = os.open(os.sep, _directory_flags())
+        parent_metadata = os.fstat(current_owner.descriptor)
         actual_ancestors = []
         for index, component in enumerate(components):
-            observed = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            observed = os.stat(
+                component,
+                dir_fd=current_owner.descriptor,
+                follow_symlinks=False,
+            )
             if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
                 _fail("task_source_root_invalid")
             if parent_metadata.st_uid not in (0, os.getuid()):
@@ -1630,12 +1998,14 @@ def _open_root_descriptor(
             if parent_identity != lexical_ancestors[index]:
                 _fail("task_source_changed")
             actual_ancestors.append(parent_identity)
-            child_descriptor = -1
+            child_owner = _SourceResourceOwner()
             try:
-                child_descriptor = os.open(
-                    component, _directory_flags(), dir_fd=descriptor
+                child_owner.descriptor = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_owner.descriptor,
                 )
-                opened = os.fstat(child_descriptor)
+                opened = os.fstat(child_owner.descriptor)
                 if index == len(components) - 1:
                     if not _same_identity(observed, opened):
                         _fail("task_source_changed")
@@ -1646,20 +2016,24 @@ def _open_root_descriptor(
                     _fail("task_source_changed")
                 if (
                     _stable_ancestor_identity(parent_metadata)
-                    != _stable_ancestor_identity(os.fstat(descriptor))
+                    != _stable_ancestor_identity(
+                        os.fstat(current_owner.descriptor)
+                    )
                 ):
                     _fail("task_source_changed")
-                owned_parent = descriptor
-                descriptor = -1
-                if not _close_fd_once(owned_parent):
-                    _fail("task_source_root_invalid")
-                descriptor = child_descriptor
-                child_descriptor = -1
+                if not _guard_cleanup_boolean(
+                    current_owner.close_descriptor,
+                ):
+                    _fail("task_snapshot_cleanup_required")
+                current_owner, child_owner = child_owner, current_owner
             finally:
-                if child_descriptor >= 0:
-                    owned_child = child_descriptor
-                    child_descriptor = -1
-                    _close_fd_once(owned_child)
+                preserve_abort = _active_terminal_baseexception()
+                if not _guard_cleanup_boolean(
+                    child_owner.close,
+                ):
+                    _fail_cleanup_required_unless_nonexception_active(
+                        preserve_abort
+                    )
             parent_metadata = opened
         if not components:
             _fail("task_source_root_invalid")
@@ -1668,19 +2042,27 @@ def _open_root_descriptor(
         _require_directory_metadata(
             parent_metadata, parent_metadata.st_dev, "task_source_root_invalid"
         )
-        return descriptor, parent_metadata, tuple(actual_ancestors)
+        if not owner.share_from(current_owner):
+            _fail("task_snapshot_cleanup_required")
+        success = True
+        return parent_metadata, tuple(actual_ancestors)
     except TaskSnapshotError:
-        if descriptor >= 0:
-            owned_descriptor = descriptor
-            descriptor = -1
-            _close_fd_once(owned_descriptor)
         raise
     except (OSError, TypeError, ValueError, OverflowError):
-        if descriptor >= 0:
-            owned_descriptor = descriptor
-            descriptor = -1
-            _close_fd_once(owned_descriptor)
         _fail("task_source_root_invalid")
+    finally:
+        preserve_abort = _active_terminal_baseexception()
+        cleanup_ok = True if success else _guard_cleanup_boolean(
+            current_owner.close
+        )
+        if not success and owner.has_resources():
+            cleanup_ok = _guard_cleanup_boolean(
+                owner.close
+            ) and cleanup_ok
+        if not cleanup_ok:
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 def _open_child_directory(
@@ -1688,27 +2070,39 @@ def _open_child_directory(
     name: str,
     device: int,
     code: str,
-) -> Tuple[int, os.stat_result]:
-    descriptor = -1
+    owner: _SourceResourceOwner,
+) -> os.stat_result:
+    if type(owner) is not _SourceResourceOwner or owner.has_resources():
+        _fail(code)
+    success = False
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         _require_directory_metadata(observed, device, code)
-        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
-        opened = os.fstat(descriptor)
+        owner.descriptor = os.open(
+            name,
+            _directory_flags(),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(owner.descriptor)
         if not _same_identity(observed, opened):
             _fail("task_source_changed")
-        result = (descriptor, opened)
-        descriptor = -1
-        return result
+        success = True
+        return opened
     except TaskSnapshotError:
         raise
     except (OSError, TypeError, ValueError, OverflowError):
         _fail(code)
     finally:
-        if descriptor >= 0:
-            owned_descriptor = descriptor
-            descriptor = -1
-            _close_fd_once(owned_descriptor)
+        preserve_abort = _active_terminal_baseexception()
+        cleanup_ok = True
+        if not success and owner.has_resources():
+            cleanup_ok = _guard_cleanup_boolean(
+                owner.close
+            )
+        if not cleanup_ok:
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 def _optional_metadata(parent_fd: int, name: str) -> Optional[os.stat_result]:
@@ -1726,19 +2120,31 @@ def _read_control_file(
     device: int,
     limit: int,
     missing_code: str,
+    control_owner: _SourceResourceOwner,
 ) -> Tuple[bytes, Dict[str, object]]:
-    descriptor = -1
+    if (
+        type(control_owner) is not _SourceResourceOwner
+        or control_owner.has_resources()
+    ):
+        _fail(missing_code)
     try:
         observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         _require_file_metadata(observed, device, missing_code)
-        descriptor = os.open(name, _file_flags(), dir_fd=parent_fd)
-        opened = os.fstat(descriptor)
+        control_owner.descriptor = os.open(
+            name,
+            _file_flags(),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(control_owner.descriptor)
         if not _same_identity(observed, opened):
             _fail("task_source_changed")
         chunks = []
         remaining = limit + 1
         while remaining:
-            chunk = os.read(descriptor, min(65536, remaining))
+            chunk = os.read(
+                control_owner.descriptor,
+                min(65536, remaining),
+            )
             if not chunk:
                 break
             chunks.append(chunk)
@@ -1746,7 +2152,7 @@ def _read_control_file(
         content = b"".join(chunks)
         if len(content) > limit:
             _fail(missing_code)
-        after = os.fstat(descriptor)
+        after = os.fstat(control_owner.descriptor)
         if not _same_identity(opened, after):
             _fail("task_source_changed")
         return content, _identity(after, "file")
@@ -1755,10 +2161,12 @@ def _read_control_file(
     except (OSError, TypeError, ValueError, OverflowError):
         _fail(missing_code)
     finally:
-        if descriptor >= 0:
-            owned_descriptor = descriptor
-            descriptor = -1
-            _close_fd_once(owned_descriptor)
+        preserve_abort = _active_terminal_baseexception()
+        cleanup_ok = _guard_cleanup_boolean(control_owner.close)
+        if not cleanup_ok:
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 def _require_absent(parent_fd: int, name: str) -> None:
@@ -1774,14 +2182,25 @@ def _scan_empty_directory(
     metadata = _optional_metadata(parent_fd, name)
     if metadata is None:
         return "absent"
-    descriptor, opened = _open_child_directory(
-        parent_fd, name, device, "task_source_control_invalid"
-    )
+    owner = _SourceResourceOwner()
+    acquired = False
     try:
-        with os.scandir(descriptor) as entries:
-            if next(entries, None) is not None:
-                _fail("task_source_control_invalid")
-        if not _same_identity(opened, os.fstat(descriptor)):
+        opened = _open_child_directory(
+            parent_fd,
+            name,
+            device,
+            "task_source_control_invalid",
+            owner,
+        )
+        acquired = True
+        owner.iterator = os.scandir(owner.descriptor)
+        if next(owner.iterator, None) is not None:
+            _fail("task_source_control_invalid")
+        if not _guard_cleanup_boolean(
+            owner.close_iterator
+        ):
+            _fail("task_snapshot_cleanup_required")
+        if not _same_identity(opened, os.fstat(owner.descriptor)):
             _fail("task_source_changed")
         return "empty"
     except TaskSnapshotError:
@@ -1789,9 +2208,15 @@ def _scan_empty_directory(
     except (OSError, TypeError, ValueError, OverflowError):
         _fail("task_source_control_invalid")
     finally:
-        owned_descriptor = descriptor
-        descriptor = -1
-        _close_fd_once(owned_descriptor)
+        preserve_abort = _active_terminal_baseexception()
+        if not acquired and owner.has_resources():
+            owner.mark_uncertain()
+        if not _guard_cleanup_boolean(
+            owner.close
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 def _scan_hooks(
@@ -1802,39 +2227,54 @@ def _scan_hooks(
     metadata = _optional_metadata(git_fd, "hooks")
     if metadata is None:
         return "absent"
-    descriptor, opened = _open_child_directory(
-        git_fd, "hooks", device, "task_source_control_invalid"
-    )
+    owner = _SourceResourceOwner()
+    acquired = False
     count = 0
     exact_names = set()
     nfc_names = set()
     folded_names = set()
     try:
-        with os.scandir(descriptor) as entries:
-            for entry in entries:
-                count += 1
-                if count > policy.max_object_entries:
-                    _fail("task_source_control_invalid")
-                name = entry.name
-                normalized = unicodedata.normalize("NFC", name)
-                folded = normalized.casefold()
-                if (
-                    type(name) is not str
-                    or not name.endswith(".sample")
-                    or not unicodedata.is_normalized("NFC", name)
-                    or name in exact_names
-                    or normalized in nfc_names
-                    or folded in folded_names
-                ):
-                    _fail("task_source_control_invalid")
-                exact_names.add(name)
-                nfc_names.add(normalized)
-                folded_names.add(folded)
-                item = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                _require_file_metadata(
-                    item, device, "task_source_control_invalid"
-                )
-        if not _same_identity(opened, os.fstat(descriptor)):
+        opened = _open_child_directory(
+            git_fd,
+            "hooks",
+            device,
+            "task_source_control_invalid",
+            owner,
+        )
+        acquired = True
+        owner.iterator = os.scandir(owner.descriptor)
+        for entry in owner.iterator:
+            count += 1
+            if count > policy.max_object_entries:
+                _fail("task_source_control_invalid")
+            name = entry.name
+            normalized = unicodedata.normalize("NFC", name)
+            folded = normalized.casefold()
+            if (
+                type(name) is not str
+                or not name.endswith(".sample")
+                or not unicodedata.is_normalized("NFC", name)
+                or name in exact_names
+                or normalized in nfc_names
+                or folded in folded_names
+            ):
+                _fail("task_source_control_invalid")
+            exact_names.add(name)
+            nfc_names.add(normalized)
+            folded_names.add(folded)
+            item = os.stat(
+                name,
+                dir_fd=owner.descriptor,
+                follow_symlinks=False,
+            )
+            _require_file_metadata(
+                item, device, "task_source_control_invalid"
+            )
+        if not _guard_cleanup_boolean(
+            owner.close_iterator
+        ):
+            _fail("task_snapshot_cleanup_required")
+        if not _same_identity(opened, os.fstat(owner.descriptor)):
             _fail("task_source_changed")
         return "sample_only"
     except TaskSnapshotError:
@@ -1842,26 +2282,45 @@ def _scan_hooks(
     except (OSError, TypeError, ValueError, OverflowError):
         _fail("task_source_control_invalid")
     finally:
-        owned_descriptor = descriptor
-        descriptor = -1
-        _close_fd_once(owned_descriptor)
+        preserve_abort = _active_terminal_baseexception()
+        if not acquired and owner.has_resources():
+            owner.mark_uncertain()
+        if not _guard_cleanup_boolean(
+            owner.close
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 def _check_refs(git_fd: int, device: int) -> None:
     metadata = _optional_metadata(git_fd, "refs")
     if metadata is None:
         return
-    descriptor, opened = _open_child_directory(
-        git_fd, "refs", device, "task_source_control_invalid"
-    )
+    owner = _SourceResourceOwner()
+    acquired = False
     try:
-        _require_absent(descriptor, "replace")
-        if not _same_identity(opened, os.fstat(descriptor)):
+        opened = _open_child_directory(
+            git_fd,
+            "refs",
+            device,
+            "task_source_control_invalid",
+            owner,
+        )
+        acquired = True
+        _require_absent(owner.descriptor, "replace")
+        if not _same_identity(opened, os.fstat(owner.descriptor)):
             _fail("task_source_changed")
     finally:
-        owned_descriptor = descriptor
-        descriptor = -1
-        _close_fd_once(owned_descriptor)
+        preserve_abort = _active_terminal_baseexception()
+        if not acquired and owner.has_resources():
+            owner.mark_uncertain()
+        if not _guard_cleanup_boolean(
+            owner.close
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 def _check_object_controls(
@@ -1871,38 +2330,74 @@ def _check_object_controls(
 ) -> None:
     info_metadata = _optional_metadata(objects_fd, "info")
     if info_metadata is not None:
-        info_fd, info_opened = _open_child_directory(
-            objects_fd, "info", device, "task_source_control_invalid"
-        )
+        info_owner = _SourceResourceOwner()
+        info_acquired = False
         try:
-            _require_absent(info_fd, "alternates")
-            _require_absent(info_fd, "http-alternates")
-            if not _same_identity(info_opened, os.fstat(info_fd)):
+            info_opened = _open_child_directory(
+                objects_fd,
+                "info",
+                device,
+                "task_source_control_invalid",
+                info_owner,
+            )
+            info_acquired = True
+            _require_absent(info_owner.descriptor, "alternates")
+            _require_absent(info_owner.descriptor, "http-alternates")
+            if not _same_identity(
+                info_opened,
+                os.fstat(info_owner.descriptor),
+            ):
                 _fail("task_source_changed")
         finally:
-            owned_info_fd = info_fd
-            info_fd = -1
-            _close_fd_once(owned_info_fd)
+            preserve_abort = _active_terminal_baseexception()
+            if not info_acquired and info_owner.has_resources():
+                info_owner.mark_uncertain()
+            if not _guard_cleanup_boolean(
+                info_owner.close
+            ):
+                _fail_cleanup_required_unless_nonexception_active(
+                    preserve_abort
+                )
     pack_metadata = _optional_metadata(objects_fd, "pack")
     if pack_metadata is not None:
-        pack_fd, pack_opened = _open_child_directory(
-            objects_fd, "pack", device, "task_source_control_invalid"
-        )
+        pack_owner = _SourceResourceOwner()
+        pack_acquired = False
         entry_count = 0
         try:
-            with os.scandir(pack_fd) as entries:
-                for entry in entries:
-                    entry_count += 1
-                    if entry_count > policy.max_object_entries:
-                        _fail("task_source_control_invalid")
-                    if entry.name.endswith(".promisor"):
-                        _fail("task_source_control_invalid")
-            if not _same_identity(pack_opened, os.fstat(pack_fd)):
+            pack_opened = _open_child_directory(
+                objects_fd,
+                "pack",
+                device,
+                "task_source_control_invalid",
+                pack_owner,
+            )
+            pack_acquired = True
+            pack_owner.iterator = os.scandir(pack_owner.descriptor)
+            for entry in pack_owner.iterator:
+                entry_count += 1
+                if entry_count > policy.max_object_entries:
+                    _fail("task_source_control_invalid")
+                if entry.name.endswith(".promisor"):
+                    _fail("task_source_control_invalid")
+            if not _guard_cleanup_boolean(
+                pack_owner.close_iterator
+            ):
+                _fail("task_snapshot_cleanup_required")
+            if not _same_identity(
+                pack_opened,
+                os.fstat(pack_owner.descriptor),
+            ):
                 _fail("task_source_changed")
         finally:
-            owned_pack_fd = pack_fd
-            pack_fd = -1
-            _close_fd_once(owned_pack_fd)
+            preserve_abort = _active_terminal_baseexception()
+            if not pack_acquired and pack_owner.has_resources():
+                pack_owner.mark_uncertain()
+            if not _guard_cleanup_boolean(
+                pack_owner.close
+            ):
+                _fail_cleanup_required_unless_nonexception_active(
+                    preserve_abort
+                )
 
 
 _REF_FORBIDDEN = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
@@ -1992,44 +2487,91 @@ def _capture_filesystem(
     policy: TaskSnapshotPolicy,
     expected_format: str,
 ) -> _FilesystemSeal:
-    root_fd = git_fd = objects_fd = -1
+    root_owner = _SourceResourceOwner()
+    git_owner = _SourceResourceOwner()
+    objects_owner = _SourceResourceOwner()
+    config_owner = _SourceResourceOwner()
+    packed_owner = _SourceResourceOwner()
+    owners = (
+        root_owner,
+        git_owner,
+        objects_owner,
+        config_owner,
+        packed_owner,
+    )
+    root_acquired = False
+    git_acquired = False
+    objects_acquired = False
     try:
-        root_fd, root_metadata, ancestors = _open_root_descriptor(
-            source.repository_root
+        root_metadata, ancestors = _open_root_descriptor(
+            source.repository_root,
+            root_owner,
         )
+        root_acquired = True
         device = root_metadata.st_dev
-        git_fd, git_metadata = _open_child_directory(
-            root_fd, ".git", device, "task_source_git_dir_invalid"
+        git_metadata = _open_child_directory(
+            root_owner.descriptor,
+            ".git",
+            device,
+            "task_source_git_dir_invalid",
+            git_owner,
         )
-        objects_fd, objects_metadata = _open_child_directory(
-            git_fd, "objects", device, "task_source_control_invalid"
+        git_acquired = True
+        objects_metadata = _open_child_directory(
+            git_owner.descriptor,
+            "objects",
+            device,
+            "task_source_control_invalid",
+            objects_owner,
         )
+        objects_acquired = True
         config_bytes, config_identity = _read_control_file(
-            git_fd,
+            git_owner.descriptor,
             "config",
             device,
             policy.max_config_bytes,
             "task_source_config_invalid",
+            config_owner,
         )
         raw_config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
-        _require_absent(git_fd, "commondir")
-        _require_absent(git_fd, "config.worktree")
-        worktrees_state = _scan_empty_directory(git_fd, "worktrees", device)
-        modules_state = _scan_empty_directory(git_fd, "modules", device)
-        hooks_state = _scan_hooks(git_fd, device, policy)
-        _check_refs(git_fd, device)
-        _check_object_controls(objects_fd, device, policy)
+        _require_absent(git_owner.descriptor, "commondir")
+        _require_absent(git_owner.descriptor, "config.worktree")
+        worktrees_state = _scan_empty_directory(
+            git_owner.descriptor,
+            "worktrees",
+            device,
+        )
+        modules_state = _scan_empty_directory(
+            git_owner.descriptor,
+            "modules",
+            device,
+        )
+        hooks_state = _scan_hooks(
+            git_owner.descriptor,
+            device,
+            policy,
+        )
+        _check_refs(git_owner.descriptor, device)
+        _check_object_controls(
+            objects_owner.descriptor,
+            device,
+            policy,
+        )
 
-        packed_metadata = _optional_metadata(git_fd, "packed-refs")
+        packed_metadata = _optional_metadata(
+            git_owner.descriptor,
+            "packed-refs",
+        )
         if packed_metadata is None:
             packed_document = {"state": "absent"}
         else:
             packed_bytes, packed_identity = _read_control_file(
-                git_fd,
+                git_owner.descriptor,
                 "packed-refs",
                 device,
                 policy.max_packed_refs_bytes,
                 "task_source_control_invalid",
+                packed_owner,
             )
             _parse_packed_refs(packed_bytes, 40 if expected_format == "sha1" else 64)
             packed_document = {
@@ -2039,11 +2581,20 @@ def _capture_filesystem(
                 "state": "present",
             }
 
-        if not _same_identity(objects_metadata, os.fstat(objects_fd)):
+        if not _same_identity(
+            objects_metadata,
+            os.fstat(objects_owner.descriptor),
+        ):
             _fail("task_source_changed")
-        if not _same_identity(git_metadata, os.fstat(git_fd)):
+        if not _same_identity(
+            git_metadata,
+            os.fstat(git_owner.descriptor),
+        ):
             _fail("task_source_changed")
-        if not _same_identity(root_metadata, os.fstat(root_fd)):
+        if not _same_identity(
+            root_metadata,
+            os.fstat(root_owner.descriptor),
+        ):
             _fail("task_source_changed")
         document = {
             "ancestor_identities": list(ancestors),
@@ -2088,11 +2639,21 @@ def _capture_filesystem(
     except (OSError, TypeError, ValueError, OverflowError):
         _fail("task_source_control_invalid")
     finally:
-        owned_descriptors = (objects_fd, git_fd, root_fd)
-        objects_fd = git_fd = root_fd = -1
-        for descriptor in owned_descriptors:
-            if descriptor >= 0:
-                _close_fd_once(descriptor)
+        preserve_abort = _active_terminal_baseexception()
+        for acquired, owner in (
+            (root_acquired, root_owner),
+            (git_acquired, git_owner),
+            (objects_acquired, objects_owner),
+        ):
+            if not acquired and owner.has_resources():
+                owner.mark_uncertain()
+        if not _guard_cleanup_boolean(
+            _close_source_owners,
+            owners,
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 _CONFIG_NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
@@ -2289,22 +2850,42 @@ def _capture_object_topology(
     policy: TaskSnapshotPolicy,
     object_format: str,
 ) -> ObjectTopologySeal:
-    root_fd = git_fd = objects_fd = -1
+    root_owner = _SourceResourceOwner()
+    git_owner = _SourceResourceOwner()
+    objects_owner = _SourceResourceOwner()
+    owners = [root_owner, git_owner, objects_owner]
+    root_acquired = False
+    git_acquired = False
+    objects_acquired = False
+    root_publish_started = False
+    root_published = False
     frames = []
     try:
         if object_format not in ("sha1", "sha256"):
             _fail("task_source_topology_invalid")
         oid_length = 40 if object_format == "sha1" else 64
-        root_fd, root_metadata, unused_ancestors = _open_root_descriptor(
-            source.repository_root
+        root_metadata, unused_ancestors = _open_root_descriptor(
+            source.repository_root,
+            root_owner,
         )
+        root_acquired = True
         device = root_metadata.st_dev
-        git_fd, unused_git_metadata = _open_child_directory(
-            root_fd, ".git", device, "task_source_git_dir_invalid"
+        unused_git_metadata = _open_child_directory(
+            root_owner.descriptor,
+            ".git",
+            device,
+            "task_source_git_dir_invalid",
+            git_owner,
         )
-        objects_fd, objects_metadata = _open_child_directory(
-            git_fd, "objects", device, "task_source_topology_invalid"
+        git_acquired = True
+        objects_metadata = _open_child_directory(
+            git_owner.descriptor,
+            "objects",
+            device,
+            "task_source_topology_invalid",
+            objects_owner,
         )
+        objects_acquired = True
         records = [_topology_record(".", objects_metadata, "directory")]
         entry_count = 1
         file_count = 0
@@ -2313,35 +2894,40 @@ def _capture_object_topology(
         if entry_count > policy.max_object_entries:
             _fail("task_source_topology_invalid")
 
-        root_iterator = os.scandir(objects_fd)
+        objects_owner.iterator = os.scandir(objects_owner.descriptor)
+        root_publish_started = True
         frames.append(
             {
-                "fd": objects_fd,
+                "owner": objects_owner,
                 "metadata": objects_metadata,
                 "path": ".",
                 "depth": 0,
-                "iterator": root_iterator,
                 "exact": set(),
                 "nfc": set(),
                 "casefold": set(),
             }
         )
-        objects_fd = -1
+        root_published = True
         while frames:
             frame = frames[-1]
+            frame_owner = frame["owner"]
             try:
-                entry = next(frame["iterator"])
+                entry = next(frame_owner.iterator)
             except StopIteration:
-                frame["iterator"].close()
-                if not _same_identity(
-                    frame["metadata"], os.fstat(frame["fd"])
+                cleanup_ok = _guard_cleanup_boolean(
+                    frame_owner.close_iterator,
+                )
+                if cleanup_ok and not _same_identity(
+                    frame["metadata"],
+                    os.fstat(frame_owner.descriptor),
                 ):
                     _fail("task_source_changed")
+                cleanup_ok = _guard_cleanup_boolean(
+                    frame_owner.close_descriptor,
+                ) and cleanup_ok
                 frames.pop()
-                owned_frame_fd = frame["fd"]
-                frame["fd"] = -1
-                if not _close_fd_once(owned_frame_fd):
-                    _fail("task_source_topology_invalid")
+                if not cleanup_ok:
+                    _fail("task_snapshot_cleanup_required")
                 continue
 
             name = entry.name
@@ -2373,7 +2959,9 @@ def _capture_object_topology(
             ):
                 _fail("task_source_topology_invalid")
             observed = os.stat(
-                name, dir_fd=frame["fd"], follow_symlinks=False
+                name,
+                dir_fd=frame_owner.descriptor,
+                follow_symlinks=False,
             )
             entry_count += 1
             if entry_count > policy.max_object_entries:
@@ -2386,43 +2974,60 @@ def _capture_object_topology(
                 )
                 if not _object_directory_allowed(path):
                     _fail("task_source_topology_invalid")
-                child_fd = -1
-                child_iterator = None
+                child_owner = _SourceResourceOwner()
+                owners.append(child_owner)
+                child_acquired = False
+                child_publish_started = False
+                child_published = False
                 try:
-                    child_fd = os.open(
-                        name, _directory_flags(), dir_fd=frame["fd"]
+                    child_metadata = _open_child_directory(
+                        frame_owner.descriptor,
+                        name,
+                        device,
+                        "task_source_topology_invalid",
+                        child_owner,
                     )
-                    child_metadata = os.fstat(child_fd)
+                    child_acquired = True
                     if not _same_identity(observed, child_metadata):
                         _fail("task_source_changed")
-                    child_iterator = os.scandir(child_fd)
+                    child_owner.iterator = os.scandir(
+                        child_owner.descriptor
+                    )
                     records.append(
                         _topology_record(path, child_metadata, "directory")
                     )
+                    child_publish_started = True
                     frames.append(
                         {
-                            "fd": child_fd,
+                            "owner": child_owner,
                             "metadata": child_metadata,
                             "path": path,
                             "depth": depth,
-                            "iterator": child_iterator,
                             "exact": set(),
                             "nfc": set(),
                             "casefold": set(),
                         }
                     )
-                    child_fd = -1
-                    child_iterator = None
+                    child_published = True
                 finally:
-                    if child_iterator is not None:
-                        try:
-                            child_iterator.close()
-                        except OSError:
-                            pass
-                    if child_fd >= 0:
-                        owned_child_fd = child_fd
-                        child_fd = -1
-                        _close_fd_once(owned_child_fd)
+                    preserve_abort = _active_terminal_baseexception()
+                    cleanup_ok = True
+                    if (
+                        not child_acquired
+                        and child_owner.has_resources()
+                    ):
+                        child_owner.mark_uncertain()
+                    if child_publish_started and not child_published:
+                        child_owner.mark_uncertain()
+                        cleanup_ok = False
+                    if not child_published:
+                        cleanup_ok = _guard_cleanup_boolean(
+                            child_owner.close
+                        ) and cleanup_ok
+                    if not cleanup_ok:
+                        _fail_cleanup_required_unless_nonexception_active(
+                            preserve_abort
+                        )
                 continue
             _require_file_metadata(
                 observed, device, "task_source_topology_invalid"
@@ -2430,7 +3035,11 @@ def _capture_object_topology(
             family = _object_file_family(path, oid_length)
             if family is None:
                 _fail("task_source_topology_invalid")
-            after = os.stat(name, dir_fd=frame["fd"], follow_symlinks=False)
+            after = os.stat(
+                name,
+                dir_fd=frame_owner.descriptor,
+                follow_symlinks=False,
+            )
             if not _same_identity(observed, after):
                 _fail("task_source_changed")
             file_count += 1
@@ -2468,21 +3077,24 @@ def _capture_object_topology(
     except (OSError, TypeError, ValueError, OverflowError, UnicodeError):
         _fail("task_source_topology_invalid")
     finally:
-        while frames:
-            frame = frames.pop()
-            try:
-                frame["iterator"].close()
-            except (OSError, AttributeError):
-                pass
-            owned_frame_fd = frame["fd"]
-            frame["fd"] = -1
-            if owned_frame_fd >= 0:
-                _close_fd_once(owned_frame_fd)
-        owned_descriptors = (objects_fd, git_fd, root_fd)
-        objects_fd = git_fd = root_fd = -1
-        for descriptor in owned_descriptors:
-            if descriptor >= 0:
-                _close_fd_once(descriptor)
+        preserve_abort = _active_terminal_baseexception()
+        for acquired, owner in (
+            (root_acquired, root_owner),
+            (git_acquired, git_owner),
+            (objects_acquired, objects_owner),
+        ):
+            if not acquired and owner.has_resources():
+                owner.mark_uncertain()
+        if root_publish_started and not root_published:
+            objects_owner.mark_uncertain()
+        cleanup_ok = _guard_cleanup_boolean(
+            _close_source_owners,
+            owners,
+        )
+        if not cleanup_ok:
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
 
 
 _OPERATION_TEMPLATES = [
@@ -3621,6 +4233,9 @@ def _expected_materialized_tree_document(
 def _target_root_identity_document(
     metadata: os.stat_result,
     materialized_tree_digest: str,
+    identity_inventory: Tuple[
+        Tuple[str, os.stat_result, str], ...
+    ],
 ) -> Dict[str, object]:
     try:
         if (
@@ -3632,11 +4247,69 @@ def _target_root_identity_document(
             or stat.S_IMODE(metadata.st_mode) != 0o555
         ):
             _fail("task_target_changed")
+        if (
+            type(identity_inventory) is not tuple
+            or not identity_inventory
+            or len(identity_inventory)
+            > _PUBLIC_TASK_TREE_PATH_POLICY.max_tree_entries
+        ):
+            _fail("task_target_changed")
+        records = []
+        previous_path = None
+        for path, item_metadata, kind in identity_inventory:
+            if (
+                type(path) is not str
+                or type(item_metadata) is not os.stat_result
+                or type(kind) is not str
+                or kind not in ("directory", "file")
+                or (
+                    path == "."
+                    and (
+                        kind != "directory"
+                        or not _same_identity(item_metadata, metadata)
+                    )
+                )
+                or (
+                    path != "."
+                    and not path
+                )
+            ):
+                _fail("task_target_changed")
+            if path != ".":
+                try:
+                    _task_path_components(
+                        path,
+                        _PUBLIC_TASK_TREE_PATH_POLICY,
+                    )
+                except Exception:
+                    _fail("task_target_changed")
+            if (
+                previous_path is not None
+                and previous_path.encode("utf-8")
+                >= path.encode("utf-8")
+            ):
+                _fail("task_target_changed")
+            if (
+                kind == "directory"
+                and not stat.S_ISDIR(item_metadata.st_mode)
+            ) or (
+                kind == "file"
+                and not stat.S_ISREG(item_metadata.st_mode)
+            ):
+                _fail("task_target_changed")
+            previous_path = path
+            records.append(
+                {
+                    "identity": _identity(item_metadata, kind),
+                    "path": path,
+                }
+            )
         return {
-            "document_type": "task-materialized-root-identity-v1",
+            "document_type": "task-materialized-root-identity-v2",
+            "entry_count": len(records),
             "materialized_tree_digest": materialized_tree_digest,
-            "root_identity": _identity(metadata, "directory"),
-            "schema_version": 1,
+            "records": records,
+            "schema_version": 2,
         }
     except Exception:
         _fail("task_target_changed")
@@ -3768,6 +4441,7 @@ def _require_target_ancestor(
             _fail("task_target_invalid")
 
 
+@contextmanager
 def _open_target_parent_gate(
     target_parent: Path,
     current_name: str,
@@ -3777,8 +4451,9 @@ def _open_target_parent_gate(
     protected_identity_keys: Tuple[Tuple[int, int, str], ...],
     policy: TaskSnapshotPolicy,
 ) -> _TargetParentGate:
-    descriptor = -1
-    child_descriptor = -1
+    current_owner = _SourceResourceOwner()
+    gate = None
+    yielded = False
     try:
         checked_names = _validate_target_names(
             current_name,
@@ -3817,8 +4492,8 @@ def _open_target_parent_gate(
         components = Path(raw_parent).parts[1:]
         if not components:
             _fail("task_target_invalid")
-        descriptor = os.open(os.sep, _directory_flags())
-        current_metadata = os.fstat(descriptor)
+        current_owner.descriptor = os.open(os.sep, _directory_flags())
+        current_metadata = os.fstat(current_owner.descriptor)
         if (
             _target_directory_identity_key(current_metadata)
             in protected_identity_keys
@@ -3827,7 +4502,7 @@ def _open_target_parent_gate(
         for component in components:
             observed = os.stat(
                 component,
-                dir_fd=descriptor,
+                dir_fd=current_owner.descriptor,
                 follow_symlinks=False,
             )
             if (
@@ -3836,29 +4511,39 @@ def _open_target_parent_gate(
             ):
                 _fail("task_target_invalid")
             _require_target_ancestor(current_metadata, observed)
-            child_descriptor = os.open(
-                component,
-                _directory_flags(),
-                dir_fd=descriptor,
-            )
-            opened = os.fstat(child_descriptor)
-            if not _same_identity(observed, opened):
-                _fail("task_target_invalid")
-            if (
-                _target_directory_identity_key(opened)
-                in protected_identity_keys
-            ):
-                _fail("task_target_invalid")
-            if (
-                _stable_ancestor_identity(current_metadata)
-                != _stable_ancestor_identity(os.fstat(descriptor))
-            ):
-                _fail("task_target_invalid")
-            owned_parent = descriptor
-            descriptor = child_descriptor
-            child_descriptor = -1
-            if not _close_fd_once(owned_parent):
-                _fail("task_snapshot_cleanup_required")
+            child_owner = _SourceResourceOwner()
+            try:
+                child_owner.descriptor = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_owner.descriptor,
+                )
+                opened = os.fstat(child_owner.descriptor)
+                if not _same_identity(observed, opened):
+                    _fail("task_target_invalid")
+                if (
+                    _target_directory_identity_key(opened)
+                    in protected_identity_keys
+                ):
+                    _fail("task_target_invalid")
+                if (
+                    _stable_ancestor_identity(current_metadata)
+                    != _stable_ancestor_identity(
+                        os.fstat(current_owner.descriptor)
+                    )
+                ):
+                    _fail("task_target_invalid")
+                if not _guard_cleanup_boolean(
+                    current_owner.close_descriptor
+                ):
+                    _fail("task_snapshot_cleanup_required")
+                current_owner, child_owner = child_owner, current_owner
+            finally:
+                preserve_abort = _active_terminal_baseexception()
+                if not _guard_cleanup_boolean(child_owner.close):
+                    _fail_cleanup_required_unless_nonexception_active(
+                        preserve_abort
+                    )
             current_metadata = opened
         if (
             current_metadata.st_uid != os.getuid()
@@ -3869,13 +4554,17 @@ def _open_target_parent_gate(
             _fail("task_target_invalid")
         for name in checked_names:
             try:
-                os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                os.stat(
+                    name,
+                    dir_fd=current_owner.descriptor,
+                    follow_symlinks=False,
+                )
             except FileNotFoundError:
                 continue
             except (OSError, TypeError, ValueError, OverflowError):
                 _fail("task_target_invalid")
             _fail("task_target_invalid")
-        final_metadata = os.fstat(descriptor)
+        final_metadata = os.fstat(current_owner.descriptor)
         if (
             not _same_identity(current_metadata, final_metadata)
             or final_metadata.st_uid != os.getuid()
@@ -3887,42 +4576,1878 @@ def _open_target_parent_gate(
             _fail("task_target_invalid")
         current_metadata = final_metadata
         gate = _TargetParentGate(
-            descriptor=descriptor,
+            _descriptor_owner=current_owner,
             target_parent=Path(raw_parent),
             metadata=current_metadata,
             device=current_metadata.st_dev,
             current_name=checked_names[0],
             lean_name=checked_names[1],
+            _owns_descriptor=False,
         )
-        descriptor = -1
-        return gate
+        yielded = True
+        yield gate
     except TaskSnapshotError:
         raise
     except Exception:
+        if yielded:
+            raise
         _fail("task_target_invalid")
     finally:
-        cleanup_ok = True
-        if child_descriptor >= 0:
-            owned_child = child_descriptor
-            child_descriptor = -1
+        preserve_abort = _active_terminal_baseexception()
+        cleanup_ok = (
+            True
+            if gate is not None and gate._owns_descriptor
+            else _guard_cleanup_boolean(current_owner.close)
+        )
+        if not cleanup_ok:
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+
+
+def _owned_target_path(
+    entry: _OwnedTargetEntry,
+) -> Tuple[str, ...]:
+    return entry.parent_components + (entry.basename,)
+
+
+def _begin_owned_target_entry(
+    ledger: _TargetOwnershipLedger,
+    parent_components: Tuple[str, ...],
+    basename: str,
+    kind: str,
+) -> _OwnedTargetEntry:
+    entry = _OwnedTargetEntry(
+        parent_components=parent_components,
+        basename=basename,
+        kind=kind,
+    )
+    path = _owned_target_path(entry)
+    if path in ledger.by_path:
+        ledger.close_uncertain = True
+        _fail("task_snapshot_cleanup_required")
+    ledger.entries.append(entry)
+    ledger.by_path[path] = entry
+    return entry
+
+
+def _target_ownership_token(
+    metadata: os.stat_result,
+    kind: str,
+) -> Tuple[int, int, int, int, str]:
+    values = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+    if (
+        type(metadata) is not os.stat_result
+        or type(kind) is not str
+        or kind not in ("directory", "file")
+        or any(type(value) is not int or value < 0 for value in values)
+    ):
+        _fail("task_snapshot_cleanup_required")
+    return values + (kind,)
+
+
+def _target_metadata_matches_token(
+    metadata: os.stat_result,
+    token: object,
+    kind: str,
+) -> bool:
+    if (
+        type(metadata) is not os.stat_result
+        or type(token) is not tuple
+        or len(token) != 5
+        or type(kind) is not str
+        or token[4] != kind
+        or any(type(value) is not int or value < 0 for value in token[:4])
+    ):
+        return False
+    expected_kind = (
+        stat.S_ISDIR(metadata.st_mode)
+        if kind == "directory"
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    return (
+        expected_kind
+        and not stat.S_ISLNK(metadata.st_mode)
+        and (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            metadata.st_gid,
+            kind,
+        )
+        == token
+    )
+
+
+def _valid_owned_metadata(
+    metadata: os.stat_result,
+    device: int,
+    kind: str,
+    mode: Optional[int] = None,
+) -> bool:
+    if (
+        type(metadata) is not os.stat_result
+        or type(device) is not int
+        or metadata.st_dev != device
+        or metadata.st_uid != os.getuid()
+        or type(metadata.st_nlink) is not int
+        or metadata.st_nlink < 1
+    ):
+        return False
+    if kind == "directory":
+        kind_ok = stat.S_ISDIR(metadata.st_mode)
+    elif kind == "file":
+        kind_ok = (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+        )
+    else:
+        return False
+    return (
+        kind_ok
+        and not stat.S_ISLNK(metadata.st_mode)
+        and (
+            mode is None
+            or stat.S_IMODE(metadata.st_mode) == mode
+        )
+    )
+
+
+def _target_descriptor_owner_snapshot(
+    descriptors: Sequence[object],
+) -> Tuple[_SourceResourceOwner, ...]:
+    owners = []
+    for descriptor in reversed(tuple(descriptors)):
+        if type(descriptor) is _SourceResourceOwner:
+            owners.append(descriptor)
+        elif descriptor >= 0:
+            owners.append(_SourceResourceOwner(descriptor=descriptor))
+    return tuple(owners)
+
+
+def _drain_target_descriptor_owners(
+    owners: Sequence[_SourceResourceOwner],
+    ledger: _TargetOwnershipLedger,
+) -> bool:
+    cleanup_ok = True
+    for owner in owners:
+        closed = _guard_cleanup_boolean(owner.close_descriptor)
+        if owner.has_resources():
+            closed = (
+                _guard_cleanup_boolean(owner.close_descriptor)
+                and closed
+            )
+        if not closed:
+            ledger.close_uncertain = True
+            cleanup_ok = False
+    return cleanup_ok
+
+
+def _close_target_descriptors(
+    descriptors: Sequence[object],
+    ledger: _TargetOwnershipLedger,
+) -> bool:
+    try:
+        owner_snapshot = _target_descriptor_owner_snapshot(descriptors)
+        return _drain_target_descriptor_owners(owner_snapshot, ledger)
+    except Exception:
+        ledger.close_uncertain = True
+        try:
+            recovery_snapshot = owner_snapshot
+        except UnboundLocalError:
+            recovery_snapshot = _target_descriptor_owner_snapshot(
+                descriptors
+            )
+        _guard_cleanup_boolean(
+            _drain_target_descriptor_owners,
+            recovery_snapshot,
+            ledger,
+        )
+        return False
+
+
+def _require_live_target_parent(
+    gate: _TargetParentGate,
+    code: str,
+) -> os.stat_result:
+    metadata = os.fstat(gate.descriptor)
+    if (
+        type(metadata) is not os.stat_result
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_dev != gate.metadata.st_dev
+        or metadata.st_ino != gate.metadata.st_ino
+        or metadata.st_uid != gate.metadata.st_uid
+        or metadata.st_gid != gate.metadata.st_gid
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        _fail(code)
+    return metadata
+
+
+def _open_owned_directory_chain(
+    gate: _TargetParentGate,
+    components: Tuple[str, ...],
+    ledger: _TargetOwnershipLedger,
+    code: str,
+    opened_owners: list,
+) -> int:
+    current_descriptor = gate.descriptor
+    walked = []
+    try:
+        if type(opened_owners) is not list or opened_owners:
+            _fail(code)
+        _require_live_target_parent(gate, code)
+        for component in components:
+            walked.append(component)
+            path = tuple(walked)
+            expected = ledger.by_path.get(path)
+            if (
+                type(expected) is not _OwnedTargetEntry
+                or expected.kind != "directory"
+                or expected.token is None
+            ):
+                _fail(code)
+            observed = os.stat(
+                component,
+                dir_fd=current_descriptor,
+                follow_symlinks=False,
+            )
+            child_owner = _SourceResourceOwner()
+            child_published = False
             try:
-                cleanup_ok = _close_fd_once(owned_child) and cleanup_ok
-            except Exception:
-                cleanup_ok = False
-        if descriptor >= 0:
-            owned_descriptor = descriptor
-            descriptor = -1
-            try:
-                cleanup_ok = _close_fd_once(owned_descriptor) and cleanup_ok
-            except Exception:
-                cleanup_ok = False
+                child_owner.descriptor = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_descriptor,
+                )
+                opened = os.fstat(child_owner.descriptor)
+                if (
+                    not _same_identity(observed, opened)
+                    or not _valid_owned_metadata(
+                        opened,
+                        gate.device,
+                        "directory",
+                    )
+                    or not _target_metadata_matches_token(
+                        opened,
+                        expected.token,
+                        "directory",
+                    )
+                ):
+                    _fail(code)
+                opened_owners.append(child_owner)
+                current_descriptor = child_owner.descriptor
+                child_published = True
+            finally:
+                preserve_abort = _active_terminal_baseexception()
+                if not child_published and not (
+                    _guard_cleanup_boolean(
+                        _close_target_descriptors,
+                        (child_owner,),
+                        ledger,
+                    )
+                ):
+                    _fail_cleanup_required_unless_nonexception_active(
+                        preserve_abort
+                    )
+        return current_descriptor
+    except BaseException as caught:
+        cleanup_ok = _guard_cleanup_boolean(
+            _close_target_descriptors,
+            opened_owners,
+            ledger,
+        )
+        if not isinstance(caught, Exception):
+            raise
         if not cleanup_ok:
             _fail("task_snapshot_cleanup_required")
+        raise
+
+
+def _create_owned_directory(
+    gate: _TargetParentGate,
+    parent_components: Tuple[str, ...],
+    basename: str,
+    ledger: _TargetOwnershipLedger,
+) -> None:
+    parent_descriptor = -1
+    parent_stack = []
+    child_owner = _SourceResourceOwner()
+    try:
+        parent_descriptor = _open_owned_directory_chain(
+            gate,
+            parent_components,
+            ledger,
+            "task_target_invalid",
+            parent_stack,
+        )
+        owned = _begin_owned_target_entry(
+            ledger,
+            parent_components,
+            basename,
+            "directory",
+        )
+        os.mkdir(
+            basename,
+            0o700,
+            dir_fd=parent_descriptor,
+        )
+        owned.created = True
+        observed = os.stat(
+            basename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        child_owner.descriptor = os.open(
+            basename,
+            _directory_flags(),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(child_owner.descriptor)
+        if (
+            not _same_identity(observed, opened)
+            or not _valid_owned_metadata(
+                opened,
+                gate.device,
+                "directory",
+            )
+        ):
+            _fail("task_snapshot_cleanup_required")
+        owned.token = _target_ownership_token(opened, "directory")
+        os.fchmod(child_owner.descriptor, 0o700)
+        final_metadata = os.fstat(child_owner.descriptor)
+        if (
+            not _target_metadata_matches_token(
+                final_metadata,
+                owned.token,
+                "directory",
+            )
+            or not _valid_owned_metadata(
+                final_metadata,
+                gate.device,
+                "directory",
+                0o700,
+            )
+        ):
+            _fail("task_target_invalid")
+    finally:
+        preserve_abort = _active_terminal_baseexception()
+        descriptors = [child_owner]
+        descriptors.extend(parent_stack)
+        if not _guard_cleanup_boolean(
+            _close_target_descriptors,
+            descriptors,
+            ledger,
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+
+
+def _write_all_target_bytes(
+    descriptor: int,
+    content: bytes,
+) -> None:
+    offset = 0
+    while offset < len(content):
+        try:
+            written = os.write(descriptor, content[offset:])
+        except InterruptedError:
+            continue
+        if (
+            type(written) is not int
+            or written <= 0
+            or written > len(content) - offset
+        ):
+            _fail("task_target_invalid")
+        offset += written
+
+
+def _read_exact_target_bytes(
+    descriptor: int,
+    expected_size: int,
+    code: str,
+) -> bytes:
+    chunks = []
+    remaining = expected_size
+    while remaining:
+        try:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+        except InterruptedError:
+            continue
+        if type(chunk) is not bytes or not chunk:
+            _fail(code)
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    while True:
+        try:
+            extra = os.read(descriptor, 1)
+            break
+        except InterruptedError:
+            continue
+    if type(extra) is not bytes or extra:
+        _fail(code)
+    return b"".join(chunks)
+
+
+def _create_owned_file(
+    gate: _TargetParentGate,
+    root_name: str,
+    entry: TaskTreeEntry,
+    content: bytes,
+    policy: TaskSnapshotPolicy,
+    ledger: _TargetOwnershipLedger,
+) -> None:
+    path_components = _task_path_components(entry.path, policy)
+    parent_components = (root_name,) + path_components[:-1]
+    basename = path_components[-1]
+    parent_descriptor = -1
+    parent_stack = []
+    write_owner = _SourceResourceOwner()
+    read_owner = _SourceResourceOwner()
+    try:
+        parent_descriptor = _open_owned_directory_chain(
+            gate,
+            parent_components,
+            ledger,
+            "task_target_invalid",
+            parent_stack,
+        )
+        owned = _begin_owned_target_entry(
+            ledger,
+            parent_components,
+            basename,
+            "file",
+        )
+        write_owner.descriptor = os.open(
+            basename,
+            (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC
+            ),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        owned.created = True
+        opened = os.fstat(write_owner.descriptor)
+        if not _valid_owned_metadata(
+            opened,
+            gate.device,
+            "file",
+        ):
+            _fail("task_snapshot_cleanup_required")
+        owned.token = _target_ownership_token(opened, "file")
+        _write_all_target_bytes(write_owner.descriptor, content)
+        target_mode = 0o444 if entry.git_mode == "100644" else 0o555
+        os.fchmod(write_owner.descriptor, target_mode)
+        written_metadata = os.fstat(write_owner.descriptor)
+        if (
+            not _target_metadata_matches_token(
+                written_metadata,
+                owned.token,
+                "file",
+            )
+            or not _valid_owned_metadata(
+                written_metadata,
+                gate.device,
+                "file",
+                target_mode,
+            )
+            or written_metadata.st_size != entry.size
+        ):
+            _fail("task_target_invalid")
+        if not _guard_cleanup_boolean(
+            _close_target_descriptors,
+            (write_owner,),
+            ledger,
+        ):
+            _fail("task_snapshot_cleanup_required")
+
+        observed = os.stat(
+            basename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        read_owner.descriptor = os.open(
+            basename,
+            _file_flags(),
+            dir_fd=parent_descriptor,
+        )
+        reopened = os.fstat(read_owner.descriptor)
+        if (
+            not _same_identity(observed, reopened)
+            or not _target_metadata_matches_token(
+                reopened,
+                owned.token,
+                "file",
+            )
+            or not _valid_owned_metadata(
+                reopened,
+                gate.device,
+                "file",
+                target_mode,
+            )
+            or reopened.st_size != entry.size
+        ):
+            _fail("task_target_invalid")
+        reread = _read_exact_target_bytes(
+            read_owner.descriptor,
+            entry.size,
+            "task_target_invalid",
+        )
+        after_read = os.fstat(read_owner.descriptor)
+        if (
+            not _same_identity(reopened, after_read)
+            or hashlib.sha256(reread).hexdigest()
+            != entry.content_digest.removeprefix("sha256:")
+        ):
+            _fail("task_target_invalid")
+    finally:
+        preserve_abort = _active_terminal_baseexception()
+        descriptors = [read_owner, write_owner]
+        descriptors.extend(parent_stack)
+        if not _guard_cleanup_boolean(
+            _close_target_descriptors,
+            descriptors,
+            ledger,
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+
+
+def _seal_owned_directories(
+    gate: _TargetParentGate,
+    ledger: _TargetOwnershipLedger,
+) -> None:
+    directories = [
+        entry for entry in ledger.entries
+        if entry.kind == "directory" and entry.token is not None
+    ]
+    directories.sort(
+        key=lambda entry: (
+            -len(_owned_target_path(entry)),
+            _owned_target_path(entry),
+        )
+    )
+    for entry in directories:
+        parent_descriptor = -1
+        parent_stack = []
+        child_owner = _SourceResourceOwner()
+        try:
+            parent_descriptor = (
+                _open_owned_directory_chain(
+                    gate,
+                    entry.parent_components,
+                    ledger,
+                    "task_target_changed",
+                    parent_stack,
+                )
+            )
+            observed = os.stat(
+                entry.basename,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            child_owner.descriptor = os.open(
+                entry.basename,
+                _directory_flags(),
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(child_owner.descriptor)
+            if (
+                not _same_identity(observed, opened)
+                or not _target_metadata_matches_token(
+                    opened,
+                    entry.token,
+                    "directory",
+                )
+            ):
+                _fail("task_target_changed")
+            os.fchmod(child_owner.descriptor, 0o555)
+            sealed = os.fstat(child_owner.descriptor)
+            if (
+                not _target_metadata_matches_token(
+                    sealed,
+                    entry.token,
+                    "directory",
+                )
+                or not _valid_owned_metadata(
+                    sealed,
+                    gate.device,
+                    "directory",
+                    0o555,
+                )
+            ):
+                _fail("task_target_changed")
+        finally:
+            preserve_abort = _active_terminal_baseexception()
+            descriptors = [child_owner]
+            descriptors.extend(parent_stack)
+            if not _guard_cleanup_boolean(
+                _close_target_descriptors,
+                descriptors,
+                ledger,
+            ):
+                _fail_cleanup_required_unless_nonexception_active(
+                    preserve_abort
+                )
+
+
+def _open_sealed_directory_chain(
+    root_descriptor: int,
+    components: Tuple[str, ...],
+    device: int,
+    code: str,
+    opened_owners: list,
+) -> int:
+    current_descriptor = root_descriptor
+    try:
+        if type(opened_owners) is not list or opened_owners:
+            _fail(code)
+        for component in components:
+            observed = os.stat(
+                component,
+                dir_fd=current_descriptor,
+                follow_symlinks=False,
+            )
+            child_owner = _SourceResourceOwner()
+            child_published = False
+            try:
+                child_owner.descriptor = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_descriptor,
+                )
+                opened = os.fstat(child_owner.descriptor)
+                if (
+                    not _same_identity(observed, opened)
+                    or not _valid_owned_metadata(
+                        opened,
+                        device,
+                        "directory",
+                        0o555,
+                    )
+                ):
+                    _fail(code)
+                opened_owners.append(child_owner)
+                current_descriptor = child_owner.descriptor
+                child_published = True
+            finally:
+                preserve_abort = _active_terminal_baseexception()
+                if not child_published and not _guard_cleanup_boolean(
+                    child_owner.close_descriptor,
+                ):
+                    _fail_cleanup_required_unless_nonexception_active(
+                        preserve_abort
+                    )
+        return current_descriptor
+    except BaseException as caught:
+        cleanup_ok = _guard_cleanup_boolean(
+            _close_source_owners,
+            opened_owners,
+        )
+        if not isinstance(caught, Exception):
+            raise
+        if not cleanup_ok:
+            _fail("task_snapshot_cleanup_required")
+        raise
+
+
+def _bounded_directory_names(
+    descriptor: int,
+    remaining_entries: int,
+    code: str,
+    iterator_owner: _SourceResourceOwner,
+) -> Tuple[str, ...]:
+    if (
+        type(iterator_owner) is not _SourceResourceOwner
+        or iterator_owner.has_resources()
+        or iterator_owner._uncertain
+    ):
+        _fail(code)
+    names = []
+    try:
+        iterator_owner.iterator = os.scandir(descriptor)
+        for unused_index in range(remaining_entries + 1):
+            try:
+                item = next(iterator_owner.iterator)
+            except StopIteration:
+                break
+            if type(item.name) is not str:
+                _fail(code)
+            names.append(item.name)
+            if len(names) > remaining_entries:
+                _fail(code)
+        try:
+            return tuple(
+                sorted(names, key=lambda name: name.encode("utf-8"))
+            )
+        except Exception:
+            _fail(code)
+    finally:
+        preserve_abort = _active_terminal_baseexception()
+        cleanup_ok = _guard_cleanup_boolean(
+            iterator_owner.close_iterator
+        )
+        if not cleanup_ok:
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+
+
+def _scan_sealed_target_root(
+    root_descriptor: int,
+    root_metadata: os.stat_result,
+    policy: TaskSnapshotPolicy,
+    expected_tokens: Optional[
+        Mapping[str, Tuple[int, int, int, int, str]]
+    ] = None,
+) -> Tuple[
+    Dict[str, object],
+    os.stat_result,
+    Tuple[Tuple[str, os.stat_result, str], ...],
+]:
+    device = root_metadata.st_dev
+    if not _valid_owned_metadata(
+        root_metadata,
+        device,
+        "directory",
+        0o555,
+    ):
+        _fail("task_target_changed")
+    records = [
+        {
+            "content_digest": None,
+            "kind": "directory",
+            "mode": 0o555,
+            "path": ".",
+            "size": 0,
+        }
+    ]
+    identity_metadata = {".": (root_metadata, "directory")}
+    pending_directories = [()]
+    pending_index = 0
+    file_count = 0
+    total_bytes = 0
+    while pending_index < len(pending_directories):
+        components = pending_directories[pending_index]
+        pending_index += 1
+        descriptor = root_descriptor
+        descriptor_stack = []
+        iterator_owner = _SourceResourceOwner()
+        try:
+            descriptor = _open_sealed_directory_chain(
+                root_descriptor,
+                components,
+                device,
+                "task_target_changed",
+                descriptor_stack,
+            )
+            before_scan = os.fstat(descriptor)
+            directory_path = "." if not components else "/".join(components)
+            if not _valid_owned_metadata(
+                before_scan,
+                device,
+                "directory",
+                0o555,
+            ) or (
+                expected_tokens is not None
+                and not _target_metadata_matches_token(
+                    before_scan,
+                    expected_tokens.get(directory_path),
+                    "directory",
+                )
+            ):
+                _fail("task_target_changed")
+            names = _bounded_directory_names(
+                descriptor,
+                policy.max_tree_entries - len(records),
+                "task_target_changed",
+                iterator_owner,
+            )
+            name_keys = set()
+            for name in names:
+                try:
+                    key = _task_name_key(name)
+                except Exception:
+                    _fail("task_target_changed")
+                if key in name_keys:
+                    _fail("task_target_changed")
+                name_keys.add(key)
+                child_components = components + (name,)
+                relative_path = "/".join(child_components)
+                try:
+                    _task_path_components(relative_path, policy)
+                except Exception:
+                    _fail("task_target_changed")
+                observed = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(observed.st_mode):
+                    child_owner = _SourceResourceOwner()
+                    try:
+                        child_owner.descriptor = os.open(
+                            name,
+                            _directory_flags(),
+                            dir_fd=descriptor,
+                        )
+                        opened = os.fstat(child_owner.descriptor)
+                        if (
+                            not _same_identity(observed, opened)
+                            or not _valid_owned_metadata(
+                                opened,
+                                device,
+                                "directory",
+                                0o555,
+                            )
+                            or (
+                                expected_tokens is not None
+                                and not _target_metadata_matches_token(
+                                    opened,
+                                    expected_tokens.get(relative_path),
+                                    "directory",
+                                )
+                            )
+                        ):
+                            _fail("task_target_changed")
+                    finally:
+                        preserve_abort = _active_terminal_baseexception()
+                        if not _guard_cleanup_boolean(
+                            child_owner.close_descriptor
+                        ):
+                            (
+                                _fail_cleanup_required_unless_nonexception_active(
+                                    preserve_abort
+                                )
+                            )
+                    pending_directories.append(child_components)
+                    records.append(
+                        {
+                            "content_digest": None,
+                            "kind": "directory",
+                            "mode": 0o555,
+                            "path": relative_path,
+                            "size": 0,
+                        }
+                    )
+                    continue
+                if not stat.S_ISREG(observed.st_mode):
+                    _fail("task_target_changed")
+                file_count += 1
+                if (
+                    file_count > policy.max_files
+                    or type(observed.st_size) is not int
+                    or observed.st_size < 0
+                    or observed.st_size > policy.max_file_bytes
+                    or total_bytes + observed.st_size
+                    > policy.max_total_bytes
+                ):
+                    _fail("task_target_changed")
+                mode = stat.S_IMODE(observed.st_mode)
+                if mode not in (0o444, 0o555):
+                    _fail("task_target_changed")
+                file_owner = _SourceResourceOwner()
+                try:
+                    file_owner.descriptor = os.open(
+                        name,
+                        _file_flags(),
+                        dir_fd=descriptor,
+                    )
+                    opened = os.fstat(file_owner.descriptor)
+                    if (
+                        not _same_identity(observed, opened)
+                        or not _valid_owned_metadata(
+                            opened,
+                            device,
+                            "file",
+                            mode,
+                        )
+                        or (
+                            expected_tokens is not None
+                            and not _target_metadata_matches_token(
+                                opened,
+                                expected_tokens.get(relative_path),
+                                "file",
+                            )
+                        )
+                    ):
+                        _fail("task_target_changed")
+                    content = _read_exact_target_bytes(
+                        file_owner.descriptor,
+                        observed.st_size,
+                        "task_target_changed",
+                    )
+                    final_file = os.fstat(file_owner.descriptor)
+                    if not _same_identity(opened, final_file):
+                        _fail("task_target_changed")
+                    identity_metadata[relative_path] = (
+                        final_file,
+                        "file",
+                    )
+                finally:
+                    preserve_abort = _active_terminal_baseexception()
+                    if not _guard_cleanup_boolean(
+                        file_owner.close_descriptor
+                    ):
+                        (
+                            _fail_cleanup_required_unless_nonexception_active(
+                                preserve_abort
+                            )
+                        )
+                total_bytes += len(content)
+                records.append(
+                    {
+                        "content_digest": (
+                            "sha256:"
+                            + hashlib.sha256(content).hexdigest()
+                        ),
+                        "kind": "file",
+                        "mode": mode,
+                        "path": relative_path,
+                        "size": len(content),
+                    }
+                )
+            after_scan = os.fstat(descriptor)
+            if not _same_identity(before_scan, after_scan):
+                _fail("task_target_changed")
+            identity_metadata[directory_path] = (
+                after_scan,
+                "directory",
+            )
+        finally:
+            preserve_abort = _active_terminal_baseexception()
+            cleanup_ok = _guard_cleanup_boolean(
+                iterator_owner.close_iterator
+            )
+            cleanup_ok = _guard_cleanup_boolean(
+                _close_source_owners,
+                descriptor_stack,
+            ) and cleanup_ok
+            if not cleanup_ok:
+                _fail_cleanup_required_unless_nonexception_active(
+                    preserve_abort
+                )
+    final_root = os.fstat(root_descriptor)
+    if not _same_identity(root_metadata, final_root):
+        _fail("task_target_changed")
+    identity_metadata["."] = (final_root, "directory")
+    if (
+        expected_tokens is not None
+        and frozenset(expected_tokens) != frozenset(identity_metadata)
+    ):
+        _fail("task_target_changed")
+    records.sort(key=lambda record: record["path"].encode("utf-8"))
+    directory_count = sum(
+        record["kind"] == "directory" for record in records
+    )
+    return (
+        {
+            "directory_count": directory_count,
+            "document_type": "task-materialized-tree-v1",
+            "entry_count": len(records),
+            "file_count": file_count,
+            "records": records,
+            "schema_version": 1,
+            "total_bytes": total_bytes,
+        },
+        final_root,
+        tuple(
+            (
+                path,
+                identity_metadata[path][0],
+                identity_metadata[path][1],
+            )
+            for path in sorted(
+                identity_metadata,
+                key=lambda value: value.encode("utf-8"),
+            )
+        ),
+    )
+
+
+def _scan_owned_target_root(
+    gate: _TargetParentGate,
+    root_name: str,
+    root_entry: _OwnedTargetEntry,
+    policy: TaskSnapshotPolicy,
+    ledger: _TargetOwnershipLedger,
+) -> Tuple[
+    Dict[str, object],
+    os.stat_result,
+    Tuple[Tuple[str, os.stat_result, str], ...],
+]:
+    root_owner = _SourceResourceOwner()
+    try:
+        _require_live_target_parent(gate, "task_target_changed")
+        observed = os.stat(
+            root_name,
+            dir_fd=gate.descriptor,
+            follow_symlinks=False,
+        )
+        root_owner.descriptor = os.open(
+            root_name,
+            _directory_flags(),
+            dir_fd=gate.descriptor,
+        )
+        opened = os.fstat(root_owner.descriptor)
+        if (
+            not _same_identity(observed, opened)
+            or not _target_metadata_matches_token(
+                opened,
+                root_entry.token,
+                "directory",
+            )
+            or not _valid_owned_metadata(
+                opened,
+                gate.device,
+                "directory",
+                0o555,
+            )
+        ):
+            _fail("task_target_changed")
+        token_prefix = (root_name,)
+        expected_tokens = {".": root_entry.token}
+        for path, owned in ledger.by_path.items():
+            if (
+                path[:1] == token_prefix
+                and len(path) > 1
+                and owned.token is not None
+            ):
+                expected_tokens["/".join(path[1:])] = owned.token
+        return _scan_sealed_target_root(
+            root_owner.descriptor,
+            opened,
+            policy,
+            MappingProxyType(expected_tokens),
+        )
+    finally:
+        preserve_abort = _active_terminal_baseexception()
+        if not _guard_cleanup_boolean(
+            root_owner.close_descriptor,
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+
+
+def _valid_target_ancestor_metadata(
+    parent: os.stat_result,
+    child: os.stat_result,
+) -> bool:
+    uid = os.getuid()
+    if (
+        type(parent) is not os.stat_result
+        or type(child) is not os.stat_result
+        or not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid not in (0, uid)
+    ):
+        return False
+    if parent.st_mode & 0o022:
+        return (
+            parent.st_uid == 0
+            and bool(parent.st_mode & stat.S_ISVTX)
+            and child.st_uid == uid
+            and not child.st_mode & 0o022
+        )
+    return True
+
+
+@contextmanager
+def _open_materialized_snapshot_root(
+    target_root: Path,
+) -> _MaterializedRootGate:
+    current_owner = _SourceResourceOwner()
+    gate = None
+    yielded = False
+    try:
+        raw_root = os.fspath(target_root)
+        if (
+            type(raw_root) is not str
+            or not os.path.isabs(raw_root)
+            or os.path.normpath(raw_root) != raw_root
+            or os.path.realpath(raw_root) != raw_root
+        ):
+            _fail("task_target_changed")
+        components = Path(raw_root).parts[1:]
+        if not components:
+            _fail("task_target_changed")
+        current_owner.descriptor = os.open(os.sep, _directory_flags())
+        current_metadata = os.fstat(current_owner.descriptor)
+        for component_index, component in enumerate(components):
+            if (
+                component_index == len(components) - 1
+                and (
+                    current_metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(current_metadata.st_mode) != 0o700
+                    or not stat.S_ISDIR(current_metadata.st_mode)
+                    or stat.S_ISLNK(current_metadata.st_mode)
+                )
+            ):
+                _fail("task_target_changed")
+            observed = os.stat(
+                component,
+                dir_fd=current_owner.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or stat.S_ISLNK(observed.st_mode)
+                or not _valid_target_ancestor_metadata(
+                    current_metadata,
+                    observed,
+                )
+            ):
+                _fail("task_target_changed")
+            child_owner = _SourceResourceOwner()
+            try:
+                child_owner.descriptor = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_owner.descriptor,
+                )
+                opened = os.fstat(child_owner.descriptor)
+                if not _same_identity(observed, opened):
+                    _fail("task_target_changed")
+                if (
+                    _stable_ancestor_identity(current_metadata)
+                    != _stable_ancestor_identity(
+                        os.fstat(current_owner.descriptor)
+                    )
+                ):
+                    _fail("task_target_changed")
+                if not _guard_cleanup_boolean(
+                    current_owner.close_descriptor
+                ):
+                    _fail("task_snapshot_cleanup_required")
+                current_owner, child_owner = child_owner, current_owner
+            finally:
+                preserve_abort = _active_terminal_baseexception()
+                if not _guard_cleanup_boolean(child_owner.close):
+                    _fail_cleanup_required_unless_nonexception_active(
+                        preserve_abort
+                    )
+            current_metadata = opened
+        if (
+            current_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(current_metadata.st_mode) != 0o555
+            or not stat.S_ISDIR(current_metadata.st_mode)
+            or stat.S_ISLNK(current_metadata.st_mode)
+        ):
+            _fail("task_target_changed")
+        gate = _MaterializedRootGate(
+            _descriptor_owner=current_owner,
+            metadata=current_metadata,
+            _owns_descriptor=True,
+        )
+        yielded = True
+        yield gate
+    except TaskSnapshotError:
+        raise
+    except Exception:
+        if yielded:
+            raise
+        _fail("task_target_changed")
+    finally:
+        preserve_abort = _active_terminal_baseexception()
+        cleanup_ok = _guard_cleanup_boolean(
+            gate.close if gate is not None else current_owner.close
+        )
+        if not cleanup_ok:
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+
+
+def _copy_materialized_snapshot(
+    snapshot: MaterializedTaskSnapshot,
+    policy: TaskSnapshotPolicy,
+) -> MaterializedTaskSnapshot:
+    try:
+        if (
+            not _exact_fields(snapshot, MaterializedTaskSnapshot)
+            or type(snapshot.target_root) is not type(Path())
+            or type(snapshot.target_identity_digest) is not str
+            or not _valid_digest(snapshot.target_identity_digest)
+            or type(snapshot.materialized_tree_digest) is not str
+            or not _valid_digest(snapshot.materialized_tree_digest)
+            or type(snapshot.file_count) is not int
+            or snapshot.file_count < 0
+            or snapshot.file_count > policy.max_files
+            or type(snapshot.total_bytes) is not int
+            or snapshot.total_bytes < 0
+            or snapshot.total_bytes > policy.max_total_bytes
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        raw_root = os.fspath(snapshot.target_root)
+        if (
+            type(raw_root) is not str
+            or not os.path.isabs(raw_root)
+            or os.path.normpath(raw_root) != raw_root
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        detached = MaterializedTaskSnapshot(
+            snapshot_receipt=snapshot.snapshot_receipt,
+            target_root=Path(raw_root),
+            target_identity_digest=snapshot.target_identity_digest,
+            materialized_tree_digest=snapshot.materialized_tree_digest,
+            file_count=snapshot.file_count,
+            total_bytes=snapshot.total_bytes,
+        )
+        receipt = _reconstruct_receipt(
+            detached.snapshot_receipt,
+            "task_snapshot",
+            policy,
+        )
+        if (
+            detached.file_count > policy.max_files
+            or detached.total_bytes > policy.max_total_bytes
+            or receipt.payload["materializer_policy_version"]
+            != policy.policy_version
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        object.__setattr__(detached, "snapshot_receipt", receipt)
+        return detached
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+
+
+def _rebind_owned_pair_namespace(
+    gate: _TargetParentGate,
+    ledger: _TargetOwnershipLedger,
+    root_metadata: Mapping[str, os.stat_result],
+) -> None:
+    current_owner = _SourceResourceOwner()
+    try:
+        raw_parent = os.fspath(gate.target_parent)
+        if (
+            type(raw_parent) is not str
+            or not os.path.isabs(raw_parent)
+            or os.path.normpath(raw_parent) != raw_parent
+            or os.path.realpath(raw_parent) != raw_parent
+        ):
+            _fail("task_target_changed")
+        current_owner.descriptor = os.open(os.sep, _directory_flags())
+        current_metadata = os.fstat(current_owner.descriptor)
+        for component in Path(raw_parent).parts[1:]:
+            observed = os.stat(
+                component,
+                dir_fd=current_owner.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or stat.S_ISLNK(observed.st_mode)
+                or not _valid_target_ancestor_metadata(
+                    current_metadata,
+                    observed,
+                )
+            ):
+                _fail("task_target_changed")
+            child_owner = _SourceResourceOwner()
+            try:
+                child_owner.descriptor = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_owner.descriptor,
+                )
+                opened = os.fstat(child_owner.descriptor)
+                if not _same_identity(observed, opened):
+                    _fail("task_target_changed")
+                stable_before = (
+                    current_metadata.st_dev,
+                    current_metadata.st_ino,
+                    current_metadata.st_uid,
+                    current_metadata.st_gid,
+                    stat.S_IMODE(current_metadata.st_mode),
+                )
+                rechecked_parent = os.fstat(current_owner.descriptor)
+                stable_after = (
+                    rechecked_parent.st_dev,
+                    rechecked_parent.st_ino,
+                    rechecked_parent.st_uid,
+                    rechecked_parent.st_gid,
+                    stat.S_IMODE(rechecked_parent.st_mode),
+                )
+                if stable_before != stable_after:
+                    _fail("task_target_changed")
+                if not _guard_cleanup_boolean(
+                    _close_target_descriptors,
+                    (current_owner,),
+                    ledger,
+                ):
+                    _fail("task_snapshot_cleanup_required")
+                current_owner, child_owner = child_owner, current_owner
+            finally:
+                preserve_abort = _active_terminal_baseexception()
+                if not _guard_cleanup_boolean(
+                    _close_target_descriptors,
+                    (child_owner,),
+                    ledger,
+                ):
+                    _fail_cleanup_required_unless_nonexception_active(
+                        preserve_abort
+                    )
+            current_metadata = opened
+        gate_current = _require_live_target_parent(
+            gate,
+            "task_target_changed",
+        )
+        if (
+            current_metadata.st_dev != gate_current.st_dev
+            or current_metadata.st_ino != gate_current.st_ino
+            or current_metadata.st_uid != gate_current.st_uid
+            or current_metadata.st_gid != gate_current.st_gid
+            or current_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(current_metadata.st_mode) != 0o700
+        ):
+            _fail("task_target_changed")
+        for root_name in (gate.current_name, gate.lean_name):
+            expected_entry = ledger.by_path.get((root_name,))
+            expected_metadata = root_metadata.get(root_name)
+            if (
+                type(expected_entry) is not _OwnedTargetEntry
+                or expected_entry.token is None
+                or type(expected_metadata) is not os.stat_result
+            ):
+                _fail("task_target_changed")
+            observed = os.stat(
+                root_name,
+                dir_fd=current_owner.descriptor,
+                follow_symlinks=False,
+            )
+            root_owner = _SourceResourceOwner()
+            try:
+                root_owner.descriptor = os.open(
+                    root_name,
+                    _directory_flags(),
+                    dir_fd=current_owner.descriptor,
+                )
+                opened = os.fstat(root_owner.descriptor)
+                if (
+                    not _same_identity(observed, opened)
+                    or not _same_identity(expected_metadata, opened)
+                    or not _target_metadata_matches_token(
+                        opened,
+                        expected_entry.token,
+                        "directory",
+                    )
+                    or not _valid_owned_metadata(
+                        opened,
+                        gate.device,
+                        "directory",
+                        0o555,
+                    )
+                ):
+                    _fail("task_target_changed")
+            finally:
+                preserve_abort = _active_terminal_baseexception()
+                if not _guard_cleanup_boolean(
+                    _close_target_descriptors,
+                    (root_owner,),
+                    ledger,
+                ):
+                    _fail_cleanup_required_unless_nonexception_active(
+                        preserve_abort
+                    )
+        final_parent = os.fstat(current_owner.descriptor)
+        if (
+            final_parent.st_dev != current_metadata.st_dev
+            or final_parent.st_ino != current_metadata.st_ino
+            or final_parent.st_uid != current_metadata.st_uid
+            or final_parent.st_gid != current_metadata.st_gid
+            or stat.S_IMODE(final_parent.st_mode) != 0o700
+        ):
+            _fail("task_target_changed")
+    finally:
+        preserve_abort = _active_terminal_baseexception()
+        if not _guard_cleanup_boolean(
+            _close_target_descriptors,
+            (current_owner,),
+            ledger,
+        ):
+            _fail_cleanup_required_unless_nonexception_active(
+                preserve_abort
+            )
+
+
+def _rebind_snapshot_namespace(
+    target_root: Path,
+    expected_metadata: os.stat_result,
+) -> None:
+    with _open_materialized_snapshot_root(target_root) as gate:
+        if not _same_identity(expected_metadata, gate.metadata):
+            _fail("task_target_changed")
+
+
+def _inspect_owned_pair(
+    gate: _TargetParentGate,
+    ledger: _TargetOwnershipLedger,
+) -> bool:
+    if ledger.close_uncertain or not ledger.entries:
+        return False
+    for pending in (
+        entry for entry in ledger.entries if entry.token is None
+    ):
+        if pending.created is True:
+            return False
+        descriptor_stack = []
+        pending_absent = False
+        cleanup_ok = True
+        try:
+            parent_descriptor = (
+                _open_owned_directory_chain(
+                    gate,
+                    pending.parent_components,
+                    ledger,
+                    "task_target_changed",
+                    descriptor_stack,
+                )
+            )
+            try:
+                os.stat(
+                    pending.basename,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pending_absent = True
+        except Exception:
+            return False
+        finally:
+            cleanup_ok = _guard_cleanup_boolean(
+                _close_target_descriptors,
+                descriptor_stack,
+                ledger,
+            )
+        if not cleanup_ok or not pending_absent:
+            return False
+    expected_paths = frozenset(
+        path for path, entry in ledger.by_path.items()
+        if entry.token is not None
+    )
+    if not expected_paths:
+        return True
+    actual_paths = set()
+    try:
+        _require_live_target_parent(gate, "task_target_changed")
+        roots = sorted(
+            (
+                entry for entry in ledger.entries
+                if (
+                    entry.parent_components == ()
+                    and entry.token is not None
+                )
+            ),
+            key=lambda entry: entry.basename.encode("utf-8"),
+        )
+        pending = [
+            (entry.basename,) for entry in roots
+        ]
+        pending_index = 0
+        while pending_index < len(pending):
+            directory_path = pending[pending_index]
+            pending_index += 1
+            directory_entry = ledger.by_path.get(directory_path)
+            if (
+                type(directory_entry) is not _OwnedTargetEntry
+                or directory_entry.kind != "directory"
+            ):
+                return False
+            descriptor_stack = []
+            directory_descriptor = (
+                _open_owned_directory_chain(
+                    gate,
+                    directory_path,
+                    ledger,
+                    "task_target_changed",
+                    descriptor_stack,
+                )
+            )
+            iterator_owner = _SourceResourceOwner()
+            directory_cleanup_ok = True
+            try:
+                actual_paths.add(directory_path)
+                iterator_owner.iterator = os.scandir(
+                    directory_descriptor
+                )
+                names = []
+                remaining = len(expected_paths) - len(actual_paths)
+                for unused_index in range(remaining + 1):
+                    try:
+                        item = next(iterator_owner.iterator)
+                    except StopIteration:
+                        break
+                    if type(item.name) is not str:
+                        return False
+                    names.append(item.name)
+                    if len(names) > remaining:
+                        return False
+                if not _guard_cleanup_boolean(
+                    iterator_owner.close_iterator
+                ):
+                    ledger.close_uncertain = True
+                    return False
+                for name in names:
+                    path = directory_path + (name,)
+                    expected = ledger.by_path.get(path)
+                    if (
+                        type(expected) is not _OwnedTargetEntry
+                        or path in actual_paths
+                    ):
+                        return False
+                    observed = os.stat(
+                        name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    flags = (
+                        _directory_flags()
+                        if expected.kind == "directory"
+                        else _file_flags()
+                    )
+                    child_owner = _SourceResourceOwner()
+                    child_cleanup_ok = True
+                    try:
+                        child_owner.descriptor = os.open(
+                            name,
+                            flags,
+                            dir_fd=directory_descriptor,
+                        )
+                        opened = os.fstat(child_owner.descriptor)
+                        if (
+                            not _same_identity(observed, opened)
+                            or not _target_metadata_matches_token(
+                                opened,
+                                expected.token,
+                                expected.kind,
+                            )
+                            or (
+                                expected.kind == "file"
+                                and opened.st_nlink != 1
+                            )
+                        ):
+                            return False
+                    finally:
+                        child_cleanup_ok = _guard_cleanup_boolean(
+                            _close_target_descriptors,
+                            (child_owner,),
+                            ledger,
+                        )
+                    if not child_cleanup_ok:
+                        return False
+                    actual_paths.add(path)
+                    if expected.kind == "directory":
+                        pending.append(path)
+            finally:
+                if not _guard_cleanup_boolean(
+                    iterator_owner.close_iterator
+                ):
+                    ledger.close_uncertain = True
+                    directory_cleanup_ok = False
+                directory_cleanup_ok = _guard_cleanup_boolean(
+                    _close_target_descriptors,
+                    descriptor_stack,
+                    ledger,
+                ) and directory_cleanup_ok
+            if not directory_cleanup_ok or ledger.close_uncertain:
+                return False
+        _require_live_target_parent(gate, "task_target_changed")
+        return actual_paths == expected_paths
+    except Exception:
+        return False
+
+
+def _open_owned_leaf(
+    gate: _TargetParentGate,
+    entry: _OwnedTargetEntry,
+    ledger: _TargetOwnershipLedger,
+    descriptor_stack: list,
+    leaf_owner: _SourceResourceOwner,
+) -> Tuple[int, os.stat_result]:
+    if (
+        type(descriptor_stack) is not list
+        or descriptor_stack
+        or type(leaf_owner) is not _SourceResourceOwner
+        or leaf_owner.has_resources()
+    ):
+        _fail("task_target_changed")
+    parent_descriptor = _open_owned_directory_chain(
+        gate,
+        entry.parent_components,
+        ledger,
+        "task_target_changed",
+        descriptor_stack,
+    )
+    try:
+        observed = os.stat(
+            entry.basename,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        flags = (
+            _directory_flags()
+            if entry.kind == "directory"
+            else _file_flags()
+        )
+        leaf_owner.descriptor = os.open(
+            entry.basename,
+            flags,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(leaf_owner.descriptor)
+        if (
+            not _same_identity(observed, opened)
+            or not _target_metadata_matches_token(
+                opened,
+                entry.token,
+                entry.kind,
+            )
+            or (
+                entry.kind == "file"
+                and opened.st_nlink != 1
+            )
+        ):
+            _fail("task_target_changed")
+        return parent_descriptor, opened
+    except BaseException as caught:
+        descriptors = [leaf_owner]
+        descriptors.extend(descriptor_stack)
+        cleanup_ok = _guard_cleanup_boolean(
+            _close_target_descriptors,
+            descriptors,
+            ledger,
+        )
+        if not isinstance(caught, Exception):
+            raise
+        if not cleanup_ok:
+            _fail("task_snapshot_cleanup_required")
+        raise
+
+
+def _rollback_owned_pair(
+    gate: _TargetParentGate,
+    ledger: _TargetOwnershipLedger,
+) -> bool:
+    if not _inspect_owned_pair(gate, ledger):
+        return False
+    directories = [
+        entry for entry in ledger.entries
+        if entry.kind == "directory" and entry.token is not None
+    ]
+    directories.sort(
+        key=lambda entry: (
+            len(_owned_target_path(entry)),
+            _owned_target_path(entry),
+        )
+    )
+    files = [
+        entry for entry in ledger.entries
+        if entry.kind == "file" and entry.token is not None
+    ]
+    files.sort(
+        key=lambda entry: (
+            -len(_owned_target_path(entry)),
+            _owned_target_path(entry),
+        )
+    )
+    try:
+        _require_live_target_parent(
+            gate,
+            "task_snapshot_cleanup_required",
+        )
+        for entry in directories:
+            descriptor_stack = []
+            leaf_owner = _SourceResourceOwner()
+            unused_parent, unused_metadata = _open_owned_leaf(
+                gate,
+                entry,
+                ledger,
+                descriptor_stack,
+                leaf_owner,
+            )
+            close_ok = True
+            try:
+                os.fchmod(leaf_owner.descriptor, 0o700)
+                changed = os.fstat(leaf_owner.descriptor)
+                if (
+                    not _target_metadata_matches_token(
+                        changed,
+                        entry.token,
+                        "directory",
+                    )
+                    or stat.S_IMODE(changed.st_mode) != 0o700
+                ):
+                    return False
+            finally:
+                close_ok = _guard_cleanup_boolean(
+                    _close_target_descriptors,
+                    [leaf_owner] + descriptor_stack,
+                    ledger,
+                )
+            if not close_ok:
+                return False
+        for entry in files:
+            descriptor_stack = []
+            leaf_owner = _SourceResourceOwner()
+            parent_descriptor, opened = _open_owned_leaf(
+                gate,
+                entry,
+                ledger,
+                descriptor_stack,
+                leaf_owner,
+            )
+            close_ok = True
+            try:
+                final_observed = os.stat(
+                    entry.basename,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not _same_identity(opened, final_observed)
+                    or final_observed.st_nlink != 1
+                ):
+                    return False
+                os.unlink(
+                    entry.basename,
+                    dir_fd=parent_descriptor,
+                )
+            finally:
+                close_ok = _guard_cleanup_boolean(
+                    _close_target_descriptors,
+                    [leaf_owner] + descriptor_stack,
+                    ledger,
+                )
+            if not close_ok:
+                return False
+        for entry in reversed(directories):
+            descriptor_stack = []
+            leaf_owner = _SourceResourceOwner()
+            parent_descriptor, opened = _open_owned_leaf(
+                gate,
+                entry,
+                ledger,
+                descriptor_stack,
+                leaf_owner,
+            )
+            close_ok = True
+            try:
+                final_observed = os.stat(
+                    entry.basename,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if not _same_identity(opened, final_observed):
+                    return False
+                os.rmdir(
+                    entry.basename,
+                    dir_fd=parent_descriptor,
+                )
+            finally:
+                close_ok = _guard_cleanup_boolean(
+                    _close_target_descriptors,
+                    [leaf_owner] + descriptor_stack,
+                    ledger,
+                )
+            if not close_ok:
+                return False
+        _require_live_target_parent(
+            gate,
+            "task_snapshot_cleanup_required",
+        )
+        for root_name in (gate.current_name, gate.lean_name):
+            try:
+                os.stat(
+                    root_name,
+                    dir_fd=gate.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            return False
+        return not ledger.close_uncertain
+    except Exception:
+        return False
+
+
+def _require_identity_inventory_matches_tree(
+    tree_document: Mapping[str, object],
+    identity_inventory: Tuple[Tuple[str, os.stat_result, str], ...],
+) -> None:
+    try:
+        expected = tuple(
+            (record["path"], record["kind"])
+            for record in tree_document["records"]
+        )
+        observed = tuple(
+            (path, kind)
+            for path, unused_metadata, kind in identity_inventory
+        )
+        if expected != observed:
+            _fail("task_target_changed")
+    except Exception:
+        _fail("task_target_changed")
+
+
+def _build_materialized_snapshot_pair(
+    seal: _CapturedOperationalSeal,
+    gate: _TargetParentGate,
+    materialized_tree_digest: str,
+    current_identity_digest: str,
+    lean_identity_digest: str,
+) -> Tuple[MaterializedTaskSnapshot, MaterializedTaskSnapshot]:
+    try:
+        receipt = _make_task_snapshot_receipt(
+            seal,
+            materialized_tree_digest,
+        )
+        current_snapshot = MaterializedTaskSnapshot(
+            snapshot_receipt=receipt,
+            target_root=gate.target_parent / gate.current_name,
+            target_identity_digest=current_identity_digest,
+            materialized_tree_digest=materialized_tree_digest,
+            file_count=seal.file_count,
+            total_bytes=seal.total_bytes,
+        )
+        lean_snapshot = MaterializedTaskSnapshot(
+            snapshot_receipt=receipt,
+            target_root=gate.target_parent / gate.lean_name,
+            target_identity_digest=lean_identity_digest,
+            materialized_tree_digest=materialized_tree_digest,
+            file_count=seal.file_count,
+            total_bytes=seal.total_bytes,
+        )
+        shared_receipt = current_snapshot.snapshot_receipt
+        if shared_receipt != lean_snapshot.snapshot_receipt:
+            _fail("task_snapshot_receipt_invalid")
+        object.__setattr__(
+            lean_snapshot,
+            "snapshot_receipt",
+            shared_receipt,
+        )
+        return (current_snapshot, lean_snapshot)
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
 
 
 class TaskSnapshotMaterializer:
     def __init__(self, policy: TaskSnapshotPolicy) -> None:
         self._policy = _copy_task_snapshot_policy(policy)
+        self._policy_seal = _copy_task_snapshot_policy(self._policy)
         self._lock = threading.Lock()
         self._state = "new"
         self._captured = None
@@ -3930,20 +6455,96 @@ class TaskSnapshotMaterializer:
         self._source_root = None
         self._git_dir = None
         self._protected_identity_keys = ()
-        self._owned_top_level_descriptor = -1
+        self._retained_target_gate = None
 
     def _clear_locked(self) -> bool:
-        descriptor = self._owned_top_level_descriptor
-        self._owned_top_level_descriptor = -1
+        retained_gate = self._retained_target_gate
+        self._retained_target_gate = None
         self._captured = None
         self._operational_seal = None
         self._source_root = None
         self._git_dir = None
         self._protected_identity_keys = ()
         self._state = "closed"
-        if descriptor < 0:
+        if retained_gate is None:
             return True
-        return _close_fd_once(descriptor)
+        return _guard_cleanup_boolean(retained_gate.close)
+
+    def _retain_target_gate_locked(
+        self,
+        gate: _TargetParentGate,
+    ) -> None:
+        if (
+            type(gate) is not _TargetParentGate
+            or gate.descriptor < 0
+            or gate._owns_descriptor
+            or self._retained_target_gate is not None
+        ):
+            _fail("task_snapshot_cleanup_required")
+        _require_live_target_parent(
+            gate,
+            "task_snapshot_cleanup_required",
+        )
+        self._retained_target_gate = gate
+        gate._owns_descriptor = True
+
+    def _release_capture_locked(self, state: str) -> None:
+        self._captured = None
+        self._operational_seal = None
+        self._source_root = None
+        self._git_dir = None
+        self._protected_identity_keys = ()
+        self._state = state
+
+    def _validated_pair_inputs_locked(
+        self,
+        captured: CapturedTaskObjects,
+    ) -> Tuple[
+        _CapturedOperationalSeal,
+        TaskSnapshotPolicy,
+        Path,
+        Path,
+        Tuple[Tuple[int, int, str], ...],
+    ]:
+        try:
+            if (
+                captured is not self._captured
+                or type(self._operational_seal)
+                is not _CapturedOperationalSeal
+                or type(self._source_root) is not type(Path())
+                or type(self._git_dir) is not type(Path())
+                or type(self._protected_identity_keys) is not tuple
+                or len(self._protected_identity_keys) != 2
+            ):
+                _fail("task_snapshot_receipt_invalid")
+            live_policy = _copy_task_snapshot_policy(self._policy)
+            if live_policy != self._policy_seal:
+                _fail("task_snapshot_receipt_invalid")
+            _validate_captured_objects(captured)
+            candidate = _make_operational_seal(
+                captured,
+                self._protected_identity_keys,
+            )
+            if (
+                candidate != self._operational_seal
+                or candidate.policy != live_policy
+                or candidate.protected_identity_keys
+                != self._protected_identity_keys
+                or candidate.source.repository_root
+                != self._source_root
+                or Path(self._git_dir)
+                != candidate.source.repository_root / ".git"
+            ):
+                _fail("task_snapshot_receipt_invalid")
+            return (
+                self._operational_seal,
+                live_policy,
+                Path(os.fspath(self._source_root)),
+                Path(os.fspath(self._git_dir)),
+                tuple(self._protected_identity_keys),
+            )
+        except Exception:
+            _fail("task_snapshot_receipt_invalid")
 
     def capture(
         self,
@@ -4208,29 +6809,361 @@ class TaskSnapshotMaterializer:
                 self._state = "captured"
                 return captured
             except TaskSnapshotError as error:
-                cleanup_ok = self._clear_locked()
+                cleanup_ok = _guard_cleanup_boolean(
+                    self._clear_locked
+                )
                 if not cleanup_ok:
                     _fail("task_snapshot_cleanup_required")
                 error.__context__ = None
                 error.__cause__ = None
                 raise
             except Exception:
-                cleanup_ok = self._clear_locked()
+                cleanup_ok = _guard_cleanup_boolean(
+                    self._clear_locked
+                )
                 if not cleanup_ok:
                     _fail("task_snapshot_cleanup_required")
                 _fail("task_snapshot_receipt_invalid")
-            except BaseException:
-                cleanup_ok = self._clear_locked()
+            except BaseException as caught:
+                cleanup_ok = _guard_cleanup_boolean(
+                    self._clear_locked
+                )
+                if not isinstance(caught, Exception):
+                    raise
                 if not cleanup_ok:
                     _fail("task_snapshot_cleanup_required")
                 raise
 
+    def _materialize_pair_under_gate_locked(
+        self,
+        captured: CapturedTaskObjects,
+        seal: _CapturedOperationalSeal,
+        transaction_policy: TaskSnapshotPolicy,
+        expected_document: Mapping[str, object],
+        expected_digest: str,
+        gate: _TargetParentGate,
+        ledger: _TargetOwnershipLedger,
+        failure_state: Dict[str, str],
+    ) -> Tuple[MaterializedTaskSnapshot, MaterializedTaskSnapshot]:
+        (
+            rechecked_seal,
+            rechecked_policy,
+            unused_source_root,
+            unused_git_dir,
+            unused_protected_keys,
+        ) = self._validated_pair_inputs_locked(captured)
+        if (
+            rechecked_seal != seal
+            or rechecked_policy != transaction_policy
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        _require_live_target_parent(gate, "task_target_invalid")
+
+        for root_name in (gate.current_name, gate.lean_name):
+            _create_owned_directory(
+                gate,
+                (),
+                root_name,
+                ledger,
+            )
+        directory_paths = tuple(
+            record["path"]
+            for record in expected_document["records"]
+            if (
+                record["kind"] == "directory"
+                and record["path"] != "."
+            )
+        )
+        for root_name in (gate.current_name, gate.lean_name):
+            for directory_path in directory_paths:
+                components = _task_path_components(
+                    directory_path,
+                    transaction_policy,
+                )
+                _create_owned_directory(
+                    gate,
+                    (root_name,) + components[:-1],
+                    components[-1],
+                    ledger,
+                )
+        for entry in seal.entries:
+            content = seal.blobs[entry.blob_oid]
+            for root_name in (gate.current_name, gate.lean_name):
+                _create_owned_file(
+                    gate,
+                    root_name,
+                    entry,
+                    content,
+                    transaction_policy,
+                    ledger,
+                )
+
+        _seal_owned_directories(gate, ledger)
+        failure_state["code"] = "task_target_changed"
+        _require_live_target_parent(gate, "task_target_changed")
+        current_root_entry = ledger.by_path[(gate.current_name,)]
+        lean_root_entry = ledger.by_path[(gate.lean_name,)]
+        (
+            current_document,
+            current_metadata,
+            current_identity_inventory,
+        ) = _scan_owned_target_root(
+            gate,
+            gate.current_name,
+            current_root_entry,
+            transaction_policy,
+            ledger,
+        )
+        (
+            lean_document,
+            lean_metadata,
+            lean_identity_inventory,
+        ) = _scan_owned_target_root(
+            gate,
+            gate.lean_name,
+            lean_root_entry,
+            transaction_policy,
+            ledger,
+        )
+        if (
+            current_document != expected_document
+            or lean_document != expected_document
+            or current_document != lean_document
+        ):
+            _fail("task_target_changed")
+        current_digest = _digest(current_document)
+        lean_digest = _digest(lean_document)
+        if (
+            current_digest != expected_digest
+            or lean_digest != expected_digest
+        ):
+            _fail("task_target_changed")
+        _require_identity_inventory_matches_tree(
+            current_document,
+            current_identity_inventory,
+        )
+        _require_identity_inventory_matches_tree(
+            lean_document,
+            lean_identity_inventory,
+        )
+        if (
+            current_metadata.st_dev,
+            current_metadata.st_ino,
+        ) == (
+            lean_metadata.st_dev,
+            lean_metadata.st_ino,
+        ):
+            _fail("task_target_changed")
+        current_identity_digest = _digest(
+            _target_root_identity_document(
+                current_metadata,
+                expected_digest,
+                current_identity_inventory,
+            )
+        )
+        lean_identity_digest = _digest(
+            _target_root_identity_document(
+                lean_metadata,
+                expected_digest,
+                lean_identity_inventory,
+            )
+        )
+        if current_identity_digest == lean_identity_digest:
+            _fail("task_target_changed")
+
+        snapshots = _build_materialized_snapshot_pair(
+            seal,
+            gate,
+            expected_digest,
+            current_identity_digest,
+            lean_identity_digest,
+        )
+        _rebind_owned_pair_namespace(
+            gate,
+            ledger,
+            MappingProxyType(
+                {
+                    gate.current_name: current_metadata,
+                    gate.lean_name: lean_metadata,
+                }
+            ),
+        )
+        return snapshots
+
+    def materialize_pair(
+        self,
+        captured: CapturedTaskObjects,
+        target_parent: Path,
+        current_name: str = "current",
+        lean_name: str = "lean",
+    ) -> Tuple[MaterializedTaskSnapshot, MaterializedTaskSnapshot]:
+        with self._lock:
+            if self._state != "captured":
+                _fail("task_snapshot_receipt_invalid")
+            ledger = _TargetOwnershipLedger()
+            failure_state = {"code": "task_target_invalid"}
+            rollback_completed = False
+            try:
+                (
+                    seal,
+                    transaction_policy,
+                    source_root,
+                    git_dir,
+                    protected_identity_keys,
+                ) = self._validated_pair_inputs_locked(captured)
+                expected_document = _expected_materialized_tree_document(
+                    seal
+                )
+                expected_digest = _digest(expected_document)
+                with _open_target_parent_gate(
+                    target_parent,
+                    current_name,
+                    lean_name,
+                    source_root,
+                    git_dir,
+                    protected_identity_keys,
+                    transaction_policy,
+                ) as gate:
+                    try:
+                        snapshots = (
+                            self._materialize_pair_under_gate_locked(
+                                captured,
+                                seal,
+                                transaction_policy,
+                                expected_document,
+                                expected_digest,
+                                gate,
+                                ledger,
+                                failure_state,
+                            )
+                        )
+                        self._retain_target_gate_locked(gate)
+                        self._release_capture_locked("paired")
+                        return snapshots
+                    except BaseException as caught:
+                        if self._state == "paired":
+                            raise
+                        rollback_ok = True
+                        if ledger.entries:
+                            rollback_ok = _guard_cleanup_boolean(
+                                _rollback_owned_pair,
+                                gate,
+                                ledger,
+                            )
+                            if rollback_ok:
+                                rollback_completed = True
+                        if not isinstance(caught, Exception):
+                            raise
+                        if not rollback_ok or ledger.close_uncertain:
+                            _fail("task_snapshot_cleanup_required")
+                        raise
+            except BaseException as caught:
+                if self._state == "paired":
+                    raise
+                cleanup_ok = _guard_cleanup_boolean(
+                    self._clear_locked
+                )
+                if not isinstance(caught, Exception):
+                    raise
+                if (
+                    ledger.entries
+                    and not rollback_completed
+                ):
+                    cleanup_ok = False
+                if ledger.close_uncertain:
+                    cleanup_ok = False
+                if not cleanup_ok:
+                    _fail("task_snapshot_cleanup_required")
+                if isinstance(caught, TaskSnapshotError):
+                    code = str(caught)
+                    if code == "task_snapshot_cleanup_required":
+                        _fail(code)
+                    if code not in {
+                        "task_snapshot_receipt_invalid",
+                        "task_target_invalid",
+                        "task_target_changed",
+                    }:
+                        code = failure_state["code"]
+                    _fail(code)
+                if isinstance(caught, Exception):
+                    _fail(failure_state["code"])
+                raise
+
+    def verify(self, snapshot: MaterializedTaskSnapshot) -> None:
+        with self._lock:
+            if self._state != "paired":
+                _fail("task_snapshot_receipt_invalid")
+            try:
+                live_policy = _copy_task_snapshot_policy(self._policy)
+                if live_policy != self._policy_seal:
+                    _fail("task_snapshot_receipt_invalid")
+                detached = _copy_materialized_snapshot(
+                    snapshot,
+                    live_policy,
+                )
+            except Exception:
+                _fail("task_snapshot_receipt_invalid")
+
+            try:
+                with _open_materialized_snapshot_root(
+                    detached.target_root
+                ) as root_gate:
+                    (
+                        tree_document,
+                        final_root_metadata,
+                        identity_inventory,
+                    ) = _scan_sealed_target_root(
+                        root_gate.descriptor,
+                        root_gate.metadata,
+                        live_policy,
+                    )
+                    tree_digest = _digest(tree_document)
+                    if (
+                        tree_digest
+                        != detached.materialized_tree_digest
+                        or tree_document["file_count"]
+                        != detached.file_count
+                        or tree_document["total_bytes"]
+                        != detached.total_bytes
+                    ):
+                        _fail("task_target_changed")
+                    _require_identity_inventory_matches_tree(
+                        tree_document,
+                        identity_inventory,
+                    )
+                    identity_digest = _digest(
+                        _target_root_identity_document(
+                            final_root_metadata,
+                            tree_digest,
+                            identity_inventory,
+                        )
+                    )
+                    if (
+                        identity_digest
+                        != detached.target_identity_digest
+                    ):
+                        _fail("task_target_changed")
+                    _rebind_snapshot_namespace(
+                        detached.target_root,
+                        final_root_metadata,
+                    )
+            except TaskSnapshotError as error:
+                if str(error) == "task_snapshot_cleanup_required":
+                    raise
+                _fail("task_target_changed")
+            except Exception:
+                _fail("task_target_changed")
+            return None
+
     def close(self) -> None:
+        preserve_abort = _active_terminal_baseexception()
         with self._lock:
             if self._state == "closed":
                 return
-            if not self._clear_locked():
-                _fail("task_snapshot_cleanup_required")
+            if not _guard_cleanup_boolean(self._clear_locked):
+                _fail_cleanup_required_unless_nonexception_active(
+                    preserve_abort
+                )
 
 
 def prepare_task_source(

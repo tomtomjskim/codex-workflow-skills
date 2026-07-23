@@ -39,11 +39,14 @@ The following amendments are normative:
   already-issued source-trust receipt;
 - Task 7 has no public single-target `materialize()` operation. The only
   public write operation is `materialize_pair()`;
-- “atomic pair” means one ownership-tracked all-or-rollback API transaction.
-  POSIX does not provide a portable atomic two-directory publish operation.
-  The method does not claim that an observer with the same UID cannot briefly
-  see one in-progress root. Such an observer is outside the machine-verified
-  source assumptions; detected interference fails closed.
+- “atomic pair” means one ownership-tracked all-or-rollback transaction up to
+  the internal `paired` commit point defined in Sections 2 and 9. POSIX does
+  not provide a portable atomic two-directory publish operation, and a
+  synchronous Python return cannot atomically couple that commit with the
+  caller's later assignment of the returned tuple. The method does not claim
+  that an observer with the same UID cannot briefly see one in-progress root.
+  Such an observer is outside the machine-verified source assumptions;
+  detected interference fails closed.
 
 Capture and materialization are separate trust transitions. A successful
 `capture()` returns one source-trust receipt and retained immutable blob
@@ -210,17 +213,104 @@ only from `new`; `materialize_pair()` is valid only from `captured`.
 `materialize_pair()` first requires `captured is self._captured`, then performs
 the complete semantic and receipt revalidation above. A different, copied,
 serialized, or merely equal object is `task_snapshot_receipt_invalid`.
-The retained reference is consumed and cleared after pair success or rollback.
-A failed capture or pair closes the materializer after its required cleanup.
+The retained reference is consumed and cleared after pair commit or rollback.
+A failed capture or a pre-commit pair failure closes the materializer after
+its required cleanup. Pair commit linearizes while the materializer lock and
+trusted target-parent descriptor are both held, after both roots, v2
+identities, the shared receipt, and final namespace rebind have been fixed.
+The descriptor is first transferred to the materializer and the final
+`_state = "paired"` store is the commit point. Before that store, any exception
+caught by the pair operation rolls back through the live or transferred
+descriptor and enters `closed`. Once that store occurs, the complete sealed
+pair is committed and must not be speculatively removed by the materializer.
+
+Python cannot make the callee's commit, `RETURN_VALUE`, and the caller's
+subsequent assignment one atomic operation. An asynchronous exception at the
+callee return event or between the caller's call and assignment can therefore
+leave a committed `paired` materializer even though the caller did not bind
+the snapshot tuple. This is a post-commit delivery interruption, not a failed
+pair transaction. The complete sealed pair and retained parent descriptor are
+preserved; the caller's already-held materializer must still be closed in
+`finally`. Until Task 8 receives the tuple and completes its immediate bounded
+acquisition scan, however, the outer ledger has no descendant mutation
+authority. A delivery interruption in that interval is therefore a terminal
+process-abort / cleanup-unknown residual: emit no result or receipt, preserve
+and quarantine the whole caller-owned temporary parent, and require operator
+identity inspection before reuse. It must not turn a cleanup-time scan into
+new ownership authority. A
+stronger “rollback until caller acknowledgement” guarantee requires a
+separately reviewed two-phase or context-managed public API and is not claimed
+by this interface.
+
+The cleanup guarantees above cover synchronous failures and one Python
+line-event interruption observed before resource acquisition or close starts,
+provided the ensuing rollback, descriptor transfer/close, ledger acquisition,
+and final cleanup are allowed to run to completion. Pure Python cannot make
+either an `os.open()` return plus the following owner-cell store or an
+`os.close()` syscall plus the surrounding owner bookkeeping asynchronously
+atomic. An exception injected at an opcode boundary, between a resource-return
+and its Python store, inside the close operation, or after the syscall but
+before its result bookkeeping is therefore outside the recoverable ownership
+model. That sub-line injection is a terminal **process-abort /
+cleanup-unknown** residual regardless of the injected Python exception class;
+the API does not claim it can infer that provenance from an ordinary
+`RuntimeError`. This is an external fault-injector/operator obligation, not an
+API-enforced classification: an injector capable of sub-line delivery must
+terminate the hosting process immediately and discard any API value or blocked
+error it happens to observe. In particular, the API may normalize an
+indistinguishable injected `RuntimeError`; that outcome does not authorize
+continued process or `temp_parent` reuse.
+
+A non-`Exception` `BaseException` delivered inside descriptor transfer/close,
+ledger acquisition, rollback, or final cleanup is likewise terminal,
+including a repeated `SIGINT` or cancellation injected by a trace callback or
+another thread. An ordinary synchronous `Exception`, or an ordinary
+`RuntimeError` delivered at a supported pre-attempt Python line boundary, is
+normalized to `task_snapshot_cleanup_required` after the remaining
+uninterrupted cleanup. The terminal handling rule does not produce a reusable
+blocked workflow state: the outer operator discards any in-process outcome,
+publishes no success/preflight receipt or runtime-history root, does not
+continue using the process, and quarantines `temp_parent` for identity
+inspection.
+Process exit reclaims descriptors but does not prove that transient
+directories were removed. Supporting continued execution after arbitrary
+cleanup interruption would require a separately reviewed native or
+signal-deferral owner and is outside Phase A.
+
+Within the supported one-line-interruption-then-uninterrupted-cleanup model,
+every successfully completed acquisition statement publishes its descriptor
+or iterator directly into a function-local idempotent owner cell. This is an
+explicit line-event guarantee, not a claim that the resource-return-to-store
+bytecodes are atomic. A shared cell, rather than a copied integer descriptor,
+crosses helper, frame, gate, and caller publication boundaries. Each resource
+tracks live, in-flight, close-started, and sticky uncertain state. An
+interruption observed before close starts leaves the in-flight resource
+available to the ensuing cleanup; once the close attempt starts, the
+descriptor number is never retried even if the syscall outcome is uncertain.
+Helpers that return a borrowed descriptor require the caller to pre-create and
+retain the owner scope, so a return-event interruption cannot lose cleanup
+authority. Multi-owner cleanup first snapshots those owner cells. If an
+ordinary exception interrupts its first pass before an individual attempt, it
+runs one uninterrupted exhaustive pass over the same cells; their sticky
+attempt state makes already-attempted closes idempotent and prevents
+descriptor-number reuse. If an individual guarded close reports failure while
+its cell still owns a live or in-flight resource, the same pass drains that
+cell once more under the one-interruption model. No global registry,
+descriptor-number lookup, reference count, or cleanup-time ownership inference
+is used.
+
 A wrong-state or closed-state call fails as
 `task_snapshot_receipt_invalid` without authorizing another transition or
 closing a valid capture retained by another serialized call.
 
 `close()` is public, exact, path-free, and idempotent. From every state it
-closes any currently owned top-level descriptor, clears the captured strong
-reference and private path copies, and permanently enters `closed`.
+closes any currently owned top-level descriptor, including the one trusted
+target-parent descriptor retained throughout `paired`, clears the captured
+strong reference and private path copies, and permanently enters `closed`.
 It performs no recursive filesystem cleanup; a partially written pair has
 already followed Section 9 rollback before the public operation returns.
+Closing a committed pair also does not remove it; Task 8 owns that outer
+cleanup boundary.
 Every state-mutating public method other than another `close()` rejects after
 closure.
 
@@ -610,35 +700,91 @@ Both condition roots must independently produce the same document and digest,
 and that digest must equal the document predicted from the captured entries
 and validated blob bytes.
 
-### 7.3 Target root identity document
+### 7.3 Target identity document
 
-Each condition root has a distinct path-free local identity:
+Each condition root has a distinct path-free local identity that binds the
+root and every descendant. Binding only the root directory identity is
+insufficient: replacing a nested file with a new inode while preserving its
+bytes, mode, and size can leave both the materialized-tree digest and root
+directory identity unchanged. The exact v2 document is:
 
 ```json
 {
-  "document_type": "task-materialized-root-identity-v1",
+  "document_type": "task-materialized-root-identity-v2",
+  "entry_count": 3,
   "materialized_tree_digest": "sha256:<64 lowercase hex>",
-  "root_identity": {
-    "ctime_ns": 0,
-    "dev": 0,
-    "gid": 0,
-    "ino": 0,
-    "kind": "directory",
-    "mode": 365,
-    "mtime_ns": 0,
-    "nlink": 1,
-    "size": 0,
-    "uid": 0
-  },
-  "schema_version": 1
+  "records": [
+    {
+      "identity": {
+        "ctime_ns": 0,
+        "dev": 0,
+        "gid": 0,
+        "ino": 0,
+        "kind": "directory",
+        "mode": 365,
+        "mtime_ns": 0,
+        "nlink": 1,
+        "size": 0,
+        "uid": 0
+      },
+      "path": "."
+    },
+    {
+      "identity": {
+        "ctime_ns": 0,
+        "dev": 0,
+        "gid": 0,
+        "ino": 0,
+        "kind": "directory",
+        "mode": 365,
+        "mtime_ns": 0,
+        "nlink": 1,
+        "size": 0,
+        "uid": 0
+      },
+      "path": "src"
+    },
+    {
+      "identity": {
+        "ctime_ns": 0,
+        "dev": 0,
+        "gid": 0,
+        "ino": 0,
+        "kind": "file",
+        "mode": 292,
+        "mtime_ns": 0,
+        "nlink": 1,
+        "size": 1,
+        "uid": 0
+      },
+      "path": "src/example.py"
+    }
+  ],
+  "schema_version": 2
 }
 ```
 
-The displayed stat numbers are shape examples. `root_identity` is the exact
-full identity record defined by Task 6, captured after final chmod and
-successful inventory verification. `target_identity_digest` is the digest of
-this document. It intentionally identifies this local materialization
-instance and therefore differs between current and lean roots.
+The displayed stat numbers are shape examples. `records` contains exactly one
+record for the root `.` and one for every materialized descendant. Each
+`identity` is the exact full identity record defined by Task 6, captured after
+final chmod and successful inventory verification. Records are sorted by
+`path.encode("utf-8")`; their paths and kinds must exactly equal those in the
+materialized-tree document. `entry_count` equals the materialized-tree
+`entry_count` and is bounded by `max_tree_entries`. The empty tree contains
+only the root record.
+
+Every file identity must be stable across its no-follow stat, open, complete
+bounded re-read, and final fstat. Every directory identity must be stable
+across its complete child scan and final fstat. This does not remove the
+documented same-UID final-syscall race, but it prevents a stateless verifier
+from treating a same-content descendant inode replacement as unchanged merely
+because the root directory metadata did not change.
+
+`target_identity_digest` is the digest of this v2 document. It intentionally
+identifies the complete local materialization instance and therefore differs
+between current and lean roots. The document and its relative paths are not
+stored in the shared snapshot receipt or any durable report; only the digest
+enters `MaterializedTaskSnapshot`.
 
 ### 7.4 Receipt construction and public validation
 
@@ -751,8 +897,10 @@ The materialization transaction is:
 4. seal directories bottom-up, roots last, to exact `0555`;
 5. independently scan and re-read both sealed trees, compare their canonical
    documents with the capture-derived expected document, and capture distinct
-   root-identity documents;
-6. only then construct one snapshot receipt and return the two snapshots.
+   v2 target-identity documents covering each root and every descendant;
+6. only then construct one snapshot receipt, transfer the still-live trusted
+   parent descriptor to the materializer, commit with the final
+   `paired` state store, and return the two snapshots.
 
 Every file open is descriptor-relative and uses
 `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC` with an initial mode no
@@ -780,8 +928,11 @@ absence. A host crash can expose residue under the caller-owned
 `temp_parent/phase-a` even if a receipt had already been returned. After any
 crash, the operator must identity-inspect `temp_parent` before reuse. If
 execution is interrupted before a receipt is returned, no receipt is
-observable. Durability for a future Phase B published artifact is a separate
-design and acceptance boundary.
+observable. If that interruption occurs after the internal `paired` commit,
+however, the complete committed pair may remain and must be handled by the
+caller's `finally`; before Task 8's normal-return acquisition scan, the outer
+tree is quarantined rather than recursively cleaned. Durability for a future
+Phase B published artifact is a separate design and acceptance boundary.
 
 Final verification opens every directory and file through verified parent
 descriptors with `O_NOFOLLOW`. It rejects a missing or extra entry, symlink,
@@ -815,8 +966,9 @@ creation/acquisition and is never invented by a cleanup-time scan. Only
 entries created by this invocation enter it. The caller-owned parent and any
 pre-existing or substituted entry never do.
 
-On any failure after the first successful creation, rollback first performs
-one read-only, descriptor-relative inspection of the entire owned pair:
+On any pre-commit failure caught after the first successful creation,
+rollback first performs one read-only, descriptor-relative inspection of the
+entire owned pair:
 
 1. reconstruct the exact expected inventory from the ledger and reject any
    missing or extra component;
@@ -845,14 +997,27 @@ that case. If every owned entry is removed, raise the original sanitized
 operation failure. A target that existed before the transaction is untouched.
 No cleanup path calls `fsync()` or an unverified recursive deleter.
 
+After the `paired` commit point, `materialize_pair()` does not infer cleanup
+authority from a path reopen and does not roll back on a delivery
+interruption. The pair has already passed complete independent verification
+and final namespace rebind, so both sealed roots are preserved as one
+committed unit. The retained trusted-parent descriptor remains owned solely
+for lifecycle closure and does not turn `verify()` into a registry-backed
+operation. Task 8's independently owned `phase-a` ledger is the cleanup
+authority only after a normally returned pair has completed its immediate
+bounded acquisition scan. An unobserved committed return follows the
+process-abort / cleanup-unknown quarantine rule in Section 2.
+
 `verify(snapshot)` performs no write. It validates the exact snapshot and
 publicly reconstructs its receipt, validates the target path with the physical
-no-symlink rules, opens the root without following links, and requires its
-current full identity document and digest to equal
-`snapshot.target_identity_digest`. It then performs the complete bounded
-inventory and byte re-read from Section 8, requiring the recomputed tree
-digest, file count, and total bytes to equal both the snapshot fields and its
-receipt payload. Success returns `None`; any mutation is
+no-symlink rules, and reopens the root without following links from the
+validated namespace. It then performs the complete bounded inventory and byte
+re-read from Section 8. The recomputed v2 target-identity digest must equal
+`snapshot.target_identity_digest`; the recomputed tree digest, file count, and
+total bytes must equal both the snapshot fields and its receipt payload. This
+detects a nested same-content replacement because the descendant full
+identity is target-local evidence even when the condition-independent content
+document remains equal. Success returns `None`; any mutation is
 `task_target_changed`.
 
 Successful verification does not prove that future execution will see an
@@ -891,8 +1056,11 @@ blob-cap or transaction-deadline rule above applies.
 `task_target_invalid` covers bad caller target arguments, parent trust,
 initial occupancy, creation, mode, or unsupported target operation before a
 previously accepted snapshot exists. `task_target_changed` covers mutation
-or mismatch of a created/returned target. Cleanup uncertainty always becomes
-`task_snapshot_cleanup_required`.
+or mismatch of a created/returned target. An ordinarily completed synchronous
+cleanup attempt whose outcome is uncertain becomes
+`task_snapshot_cleanup_required`. A non-`Exception` `BaseException` delivered
+inside cleanup follows the Section 2 process-abort rule and is never
+translated into a public failure.
 
 Every public failure has exactly one fixed message. It contains no source or
 target path, target name, config value, OID, tree record, stdout, stderr,
@@ -913,7 +1081,11 @@ roots, requires the two target identities to be distinct, and requires the
 same snapshot receipt object and digest for the pair. It does not immediately
 repeat `verify()`. A `finally` block always calls idempotent
 `materializer.close()` and drops local captured/current/lean references before
-starting the next task, including every blocked path.
+starting the next task, including every blocked path. This is the ordinary
+cleanup attempt, not an async-atomic guarantee: Task 8 must not catch
+`BaseException` and continue if descriptor/ledger/final-cleanup bookkeeping
+itself is interrupted. That process-abort branch follows the Section 2
+cleanup-unknown residual and emits no public blocked result.
 
 The sealed `0444`/`0555` roots are immutable Phase A baselines. The
 `workspace-write` value in a future pilot plan describes the intended Phase B
@@ -1059,9 +1231,10 @@ creating any descendant. This owned leaf is the experiment temporary root.
 Only one preflight may use a given empty parent at a time; an occupied parent
 or pre-existing leaf fails closed without deletion.
 
-Final cleanup removes the verified owned `phase-a` tree using the ledger
-procedure below, `rmdir()`s that exact identity through the retained
-`temp_parent` descriptor, and leaves the caller-owned empty parent in place.
+When allowed to run to completion, final cleanup removes the verified owned
+`phase-a` tree using the ledger procedure below, `rmdir()`s that exact
+identity through the retained `temp_parent` descriptor, and leaves the
+caller-owned empty parent in place.
 The new Task 8 ownership ledger and final-cleanup layer does not `fsync()` its
 temporary files, directories, or parents. Existing
 `materialize_harness_home()` internals remain unchanged and may perform their
@@ -1111,6 +1284,13 @@ completed. A failure before that point has nullable not-yet-computed digests
 and no preflight receipt as before. No blocked result can root runtime
 history because it has no receipt digest.
 
+This blocked result covers an ordinarily completed cleanup attempt or
+ordinary `Exception`-based cleanup failure normalized to
+`task_snapshot_cleanup_required`. It does not cover a non-`Exception`
+`BaseException` delivered inside cleanup bookkeeping itself. That condition
+terminates the process without constructing a result or receipt, and the
+caller must identity-inspect the quarantined temporary parent before reuse.
+
 Task 8 records the temporary root and every descendant stable token when each
 entry is created or first acquired. For a subtree returned by a trusted
 materializer API, acquisition is one immediate bounded descriptor scan that
@@ -1122,6 +1302,18 @@ chmods or removes a replacement. Production orchestration must not use
 `TemporaryDirectory.cleanup()`, its context-manager exit, a finalizer, or any
 other recursive best-effort deleter; it owns an explicitly created private
 root whose only deletion path is this ledger procedure.
+
+If a task pair call raises an ordinary `Exception` before normal return, Task
+8 may continue ordinary cleanup only when the task parent is still exactly
+empty. A non-empty task parent is unacquired: preserve the whole `phase-a`
+tree and return `task_snapshot_cleanup_required` after closing resources that
+are already owned. If a non-`Exception` `BaseException` is delivered before
+the returned pair has been acquired, construct no result or receipt and apply
+the process-abort / cleanup-unknown quarantine rule. The same handoff rule
+applies to a harness home: descendants created before
+`materialize_harness_home()` returns do not become Task 8 cleanup authority;
+an ordinary partial-return failure with a non-empty home requires whole-tree
+preservation, while a non-`Exception` interruption produces no public result.
 
 Task 8 modifies and tests `experiment_plan.py` and creates the orchestrator.
 `tests/test_live_eval_experiment_receipts.py` may require fixture updates for
@@ -1153,7 +1345,7 @@ Use table-driven tests for:
   unlisted-secret residual behavior;
 - one fetch per unique OID, repeated blobs, short/long bytes, missing object,
   SHA-1/SHA-256 Git object rehash mismatch, and SHA-256 content mismatch;
-- exact canonical entry, materialized-tree, root-identity, source-trust, and
+- exact canonical entry, materialized-tree, v2 target-identity, source-trust, and
   snapshot documents, including the empty tree;
 - receipt reconstruction through public `make_receipt`, forged dataclasses,
   string/int/bool subclasses, mutable inputs, and null exception context and
@@ -1165,20 +1357,26 @@ Use table-driven tests for:
   write/close/reopen/hash verification, pair equality, distinct root
   identity, same receipt object, and verification after extra, missing,
   replaced, linked, special, mode-changed, size-changed, or content-changed
-  entries;
+  entries, including a same-content and same-mode nested inode replacement;
 - representative create, write, chmod, reopen/read/hash, verification,
   receipt, inventory-mismatch, replacement, symlink, hardlink, special-entry,
   permission, unlink, and rmdir failures; creation/acquisition-time ownership
   authority; whole-pair or whole-`phase-a` preservation on pre-mutation
   mismatch; cleanup-error precedence; no recursive `TemporaryDirectory`
   cleanup; peak open descriptors no greater than `max_tree_depth + 8`; and no
-  double close. Do not freeze every syscall position as a test contract;
+  double close; retained trusted-parent descriptor count exactly one after
+  pair commit and zero after an uninterrupted idempotent `close()`. Do not
+  freeze every syscall position as a test contract or claim recovery after
+  arbitrary async injection into cleanup bookkeeping;
 - simple `new -> captured -> paired -> closed` transitions, exact captured
   object identity, coherent in-place mutation and validation-to-use race
   detection through the private detached operational seal, full semantic
   mutation detection, repeatable stateless `verify()`, no immediate Task 8
-  duplicate verification, idempotent close from every state, and
-  strong-reference/seal release;
+  duplicate verification, idempotent close from every state,
+  strong-reference/seal release, pre-commit return-line interruption
+  rollback, and explicit post-commit callee-return/caller-assignment
+  interruption preservation followed by an uninterrupted `finally`
+  descriptor closure;
 - allowed-write existing-file, missing-leaf, empty-list, directory,
   missing-intermediate, exclusion, alias, pair-equality, reverse digest/task
   uniqueness, digest mutation, authoritative relative paths retained once in

@@ -1790,11 +1790,39 @@ is normative for this task and its Task 8 handoff. It supersedes the older
 single-target materializer sketch below with a capture-once,
 `materialize_pair()`-once transaction; adds exact tree/trie/unique-blob and
 60-second capture limits, including a hard 256-unique-blob ceiling; amends the
-fixed Git templates; defines canonical entry, materialized-tree, and
-root-identity documents; and fixes receipt, simple single-task lifecycle,
+fixed Git templates; defines canonical entry, materialized-tree, and v2
+target-identity documents that bind every descendant identity; and fixes
+receipt, simple single-task lifecycle,
 identity-based overlap, descriptor, conservative whole-unit rollback,
 exclusion-scope, and allowed-write-policy timing. Phase A verifies logical
 state but does not promise crash durability for its transient trees.
+The pair commits at the final in-lock `paired` state store after complete
+verification, receipt construction, namespace rebind, and trusted-parent
+descriptor transfer. A synchronous tuple return cannot atomically include the
+caller's subsequent assignment: a post-commit delivery interruption preserves
+the complete pair. The caller still runs `finally: materializer.close()`, but
+Task 8 has no descendant cleanup authority until normal return and its
+immediate bounded acquisition scan. An interruption before acquisition emits
+no result or receipt, preserves and quarantines the whole caller-owned
+temporary parent, and requires operator identity inspection before reuse.
+Rollback is required only for pre-commit failures caught by the materializer.
+A non-`Exception` `BaseException` delivered inside descriptor
+transfer/close, ownership-ledger acquisition, rollback, or final-cleanup
+bookkeeping is a terminal process-abort/cleanup-unknown residual: emit no
+receipt or result, do not continue the process, and quarantine the
+caller-owned temporary parent for identity inspection. The same terminal rule
+applies to any exception asynchronously injected between a resource-return
+and its owner-cell store or inside a close syscall/result-bookkeeping
+boundary, regardless of its Python class. This sub-line rule is enforced by
+the external fault injector/operator: the pure-Python API cannot identify the
+provenance of an ordinary injected `RuntimeError`, so the operator must
+terminate the process and discard any returned or blocked value. An ordinary
+synchronous
+`Exception`-based cleanup failure, or one delivered at a supported
+pre-attempt Python line boundary, is instead normalized to
+`task_snapshot_cleanup_required`. Phase A does not add native async-atomic
+ownership or signal deferral solely to make that exceptional process
+reusable.
 
 **Files:**
 
@@ -1812,7 +1840,9 @@ state but does not promise crash durability for its transient trees.
   - missing object, changed object, per-file, file-count, and total-byte limits fail;
   - declared `ls-tree` size and streamed `cat-file blob` byte count mismatch fails;
   - writes use exclusive no-follow creation and preserve only `0444` or `0555` file modes;
-  - target replacement, extra entry, mode change, content change, hardlink, symlink, or special entry fails the target seal;
+  - target replacement, including a same-content and same-mode nested inode
+    replacement, extra entry, mode change, content change, hardlink, symlink,
+    or special entry fails the target seal;
   - the same commit produces equal entry and tree digests in two distinct condition directories;
   - an empty tree, repeated blobs, derived-directory count, tree depth,
     unique-blob count, and capture-transaction timeout obey their exact
@@ -1889,6 +1919,32 @@ class TaskTreeEntry:
   the new task-snapshot materializer or its cleanup; crash durability is
   outside Phase A. This does not change the existing verified harness
   checkout helper's internal durability calls.
+- [ ] Transfer the still-live trusted-parent descriptor before the final
+  `paired` commit store, retain exactly that one top-level descriptor until
+  idempotent `close()`, and keep `verify()` independent of it. Test
+  pre-commit rollback separately from post-commit callee-return and
+  caller-assignment delivery interruption. Treat an interruption before Task
+  8's normal-return acquisition scan as process-abort / cleanup-unknown; do not
+  derive mutation authority from a cleanup-time scan.
+- [ ] Publish every successfully completed descriptor or iterator acquisition
+  statement directly into an idempotent shared owner cell with persistent
+  in-flight and sticky uncertain state. This is a Python line-event contract,
+  not an atomicity claim for the resource-return-to-store bytecodes. Pass
+  caller-created owner scopes into helpers that return borrowed descriptors;
+  test helper return events, owner publication, pre-attempt recovery,
+  post-attempt close/reuse uncertainty, and one supported interruption
+  followed by uninterrupted cleanup without leaks or repeated
+  descriptor-number closes. Multi-owner aggregators must snapshot owner cells
+  and exhaust the same snapshot after an ordinary pre-attempt interruption;
+  a guarded failure that leaves a cell live or in-flight must redrain that cell
+  once under the one-interruption model. Treat opcode/sub-line injection as
+  terminal process-abort and quarantine.
+- [ ] Treat a non-`Exception` `BaseException` that re-enters cleanup
+  bookkeeping as terminal process abort rather than a recoverable blocked
+  result. Task 8 must let it escape, issue no
+  receipt/result/runtime-history root, and require operator identity
+  inspection before `temp_parent` reuse. Normalize an ordinary
+  `Exception`-based cleanup failure to `task_snapshot_cleanup_required`.
 
 Implement the exact `TaskTreeEntry`, `CapturedTaskObjects`,
 `MaterializedTaskSnapshot`, and `TaskSnapshotMaterializer` public surface in
@@ -2294,6 +2350,11 @@ if __package__ in (None, ""):
 - [ ] Construct `ExperimentPreflightRequest` from the accepted canonical bytes and call `run_experiment_preflight()`.
 - [ ] Serialize `asdict(result)` with `sort_keys=True`, `separators=(",", ":")`, and `ensure_ascii=False`.
 - [ ] Catch only expected input, OS, plan, snapshot, receipt, and orchestration exceptions. Convert them to the fixed blocked result without exposing exception text.
+- [ ] Never convert `KeyboardInterrupt`, `SystemExit`, `GeneratorExit`, or
+  another `BaseException` into blocked JSON. If cleanup bookkeeping is
+  interrupted, emit no JSON, receipt, or runtime-history root; terminate the
+  process (a top-level `KeyboardInterrupt` may map silently to exit `130`) and
+  require operator identity inspection before reusing `--temp-parent`.
 - [ ] Do not import `scripts.run_live_eval` or any authentication, executable, network, Codex-process, or ledger module.
 
 ### Step 4: Extend repository validation once
