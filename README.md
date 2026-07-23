@@ -355,6 +355,20 @@ python3 scripts/run_live_eval.py --tags workflow-intake --model gpt-5.6-sol --dr
 
 Successful dry-run output reports `status=preflight_only` and `model_calls=0`. This is planning evidence, not model-quality evidence.
 
+The separate harness materialization preflight composes that same scenario planning with a fixed `current` or `lean` bundle and the exact clean-HEAD skill repository. Its three harness options are all-or-none and valid only with `--dry-run`:
+
+```bash
+python3 scripts/run_live_eval.py \
+  --tags workflow-intake \
+  --model gpt-5.6-sol \
+  --dry-run \
+  --harness-profile current \
+  --harness-bundle /path/to/private/harness-bundle \
+  --variant-repo /path/to/clean/variant-repo
+```
+
+A successful harness preflight reports `status=harness_preflight_only`, `materialization_result=pass`, `model_conformance=not_run`, and `model_calls=0`. It proves only that the fixed files and clean-HEAD skills were materialized, hashed, sealed, and immediately reverified in a private temporary home. It does not launch or probe Codex, prove that Codex consumed those files, or provide model-quality evidence. Output contains only path-free identifiers, counts, and digests; cleanup that cannot be proven changes the result to `status=blocked_cleanup`, `reason=cleanup_unverified`.
+
 Targeted execution selects at most three scenarios and is bounded to five model calls, 600 seconds, and concurrency one. Release execution selects at most 26 scenarios and is bounded to 30 model calls, 2,700 seconds, and concurrency two. Release planning remains safe without approval because `--dry-run` cannot make a model call:
 
 ```bash

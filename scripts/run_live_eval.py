@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,10 @@ from scripts.live_eval.checkout import (
     CheckoutManifest,
     install_checkout_skills,
     verify_loaded_checkout,
+)
+from scripts.live_eval.harness import (
+    materialize_harness_home,
+    verify_loaded_harness,
 )
 from scripts.live_eval.isolation import (
     CliCapabilities,
@@ -193,6 +198,55 @@ class EvalRequest:
 
 
 @dataclass(frozen=True)
+class HarnessDryRunRequest:
+    planning_request: EvalRequest
+    profile: str
+    bundle_root: Path = field(repr=False)
+    skill_repo: Path = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.planning_request, EvalRequest):
+            raise TypeError("planning request must be EvalRequest")
+        if self.planning_request.dry_run_only is not True:
+            raise ValueError("planning request must be dry-run only")
+        if self.profile not in ("current", "lean"):
+            raise ValueError("harness profile must be current or lean")
+        object.__setattr__(self, "bundle_root", Path(self.bundle_root).absolute())
+        object.__setattr__(self, "skill_repo", Path(self.skill_repo).absolute())
+
+
+@dataclass(frozen=True)
+class HarnessManifestSummary:
+    bundle_id: str
+    bundle_digest: str
+    profile: str
+    agents_hash: str
+    skill_routing_hash: str
+    adapter_source_hash: str
+    adapter_materialized_hash: str
+    common_role_hash: str
+    home_digest: str
+    adapter_count: int
+    role_count: int
+
+
+@dataclass(frozen=True)
+class HarnessDryRunResult:
+    status: str
+    materialization_result: str
+    model_conformance: str
+    model_calls: int
+    scenario_ids: Tuple[str, ...]
+    manifest: Optional[HarnessManifestSummary]
+    retention: str
+    manual_cleanup_required: bool
+    reason: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "scenario_ids", tuple(self.scenario_ids))
+
+
+@dataclass(frozen=True)
 class RunManifest:
     scenario_ids: Tuple[str, ...]
     model: str
@@ -274,6 +328,207 @@ def _validate_and_select(request: EvalRequest) -> Tuple[Scenario, ...]:
     if not request.release_suite and len(selected) > TARGETED_MAX_SCENARIOS:
         raise ValueError("targeted scenario limit exceeded")
     return selected
+
+
+def run_harness_dry_run(request: HarnessDryRunRequest) -> HarnessDryRunResult:
+    """Plan, materialize, verify, and clean up without invoking a model."""
+    if not isinstance(request, HarnessDryRunRequest):
+        raise TypeError("request must be HarnessDryRunRequest")
+    selected = _validate_and_select(request.planning_request)
+    scenario_ids = tuple(item.scenario_id for item in selected)
+    result = _blocked_harness_result(
+        scenario_ids, "blocked_isolation", "materialized_harness_mismatch"
+    )
+    temp_root = None
+    codex_home = None
+    root_identity = None
+    home_identity = None
+    try:
+        temp_root = Path(
+            tempfile.mkdtemp(prefix="codex-harness-preflight-root-")
+        ).absolute()
+        temp_root.chmod(0o700)
+        root_identity = _harness_directory_identity(temp_root)
+        codex_home = temp_root / "home"
+        resolved_root = temp_root.resolve(strict=True)
+        if _harness_directory_identity(resolved_root) != root_identity:
+            raise ValueError("owned harness path identity changed")
+        temp_root = resolved_root
+        codex_home = temp_root / "home"
+        codex_home.mkdir(mode=0o700)
+        codex_home.chmod(0o700)
+        home_identity = _harness_directory_identity(codex_home)
+        manifest = materialize_harness_home(
+            request.skill_repo,
+            request.bundle_root,
+            request.profile,
+            codex_home,
+        )
+        verification = verify_loaded_harness(
+            request.skill_repo, codex_home, manifest
+        )
+        if (
+            verification.classification == "ready"
+            and verification.result == "pass"
+            and verification.reason == "fixed_inventory_verified"
+            and verification.manifest == manifest
+        ):
+            result = HarnessDryRunResult(
+                status="harness_preflight_only",
+                materialization_result="pass",
+                model_conformance="not_run",
+                model_calls=0,
+                scenario_ids=scenario_ids,
+                manifest=_harness_manifest_summary(manifest),
+                retention="none",
+                manual_cleanup_required=False,
+                reason="fixed_inventory_verified",
+            )
+        else:
+            result = _blocked_harness_result(
+                scenario_ids,
+                "blocked_isolation",
+                _fixed_harness_reason(verification.reason),
+            )
+    except ValueError as error:
+        result = _blocked_harness_result(
+            scenario_ids,
+            "blocked_isolation",
+            _fixed_harness_reason(getattr(error, "reason", str(error))),
+        )
+    except (OSError, TypeError):
+        result = _blocked_harness_result(
+            scenario_ids, "blocked_isolation", "materialized_harness_mismatch"
+        )
+    finally:
+        if temp_root is not None:
+            cleanup_verified = False
+            if root_identity is not None and codex_home is not None:
+                try:
+                    cleanup_verified = _cleanup_harness_temp_root(
+                        temp_root,
+                        root_identity,
+                        codex_home,
+                        home_identity,
+                    )
+                except (OSError, TypeError, ValueError):
+                    cleanup_verified = False
+            if not cleanup_verified:
+                result = replace(
+                    result,
+                    status="blocked_cleanup",
+                    materialization_result="blocked",
+                    retention="cleanup_required",
+                    manual_cleanup_required=True,
+                    reason="cleanup_unverified",
+                )
+    return result
+
+
+def _harness_manifest_summary(manifest: object) -> HarnessManifestSummary:
+    return HarnessManifestSummary(
+        bundle_id=manifest.bundle_id,
+        bundle_digest=manifest.bundle_digest,
+        profile=manifest.profile,
+        agents_hash=manifest.agents_hash,
+        skill_routing_hash=manifest.skill_routing_hash,
+        adapter_source_hash=manifest.adapter_source_hash,
+        adapter_materialized_hash=manifest.adapter_materialized_hash,
+        common_role_hash=manifest.common_role_hash,
+        home_digest=manifest.home_digest,
+        adapter_count=manifest.adapter_count,
+        role_count=manifest.role_count,
+    )
+
+
+def _blocked_harness_result(
+    scenario_ids: Iterable[str], status: str, reason: str
+) -> HarnessDryRunResult:
+    return HarnessDryRunResult(
+        status=status,
+        materialization_result="blocked",
+        model_conformance="not_run",
+        model_calls=0,
+        scenario_ids=tuple(scenario_ids),
+        manifest=None,
+        retention="none",
+        manual_cleanup_required=False,
+        reason=reason,
+    )
+
+
+def _fixed_harness_reason(value: object) -> str:
+    reasons = frozenset(
+        {
+            "invalid_bundle",
+            "source_changed",
+            "skill_checkout_mismatch",
+            "materialized_harness_mismatch",
+            "home_seal_mismatch",
+            "cleanup_unverified",
+        }
+    )
+    return value if isinstance(value, str) and value in reasons else "invalid_bundle"
+
+
+def _harness_directory_identity(path: Path) -> Tuple[int, int, int]:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.getuid()
+    ):
+        raise ValueError("owned harness path is not a private directory")
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _cleanup_harness_temp_root(
+    temp_root: Path,
+    root_identity: Tuple[int, int, int],
+    codex_home: Path,
+    home_identity: Optional[Tuple[int, int, int]],
+) -> bool:
+    """Remove only the still-owned home/root identities and prove absence."""
+    try:
+        if _harness_directory_identity(temp_root) != root_identity:
+            return False
+        if home_identity is None:
+            if not _path_is_absent(codex_home):
+                return False
+        else:
+            if _harness_directory_identity(codex_home) != home_identity:
+                return False
+            _remove_harness_tree(codex_home)
+            if not _path_is_absent(codex_home):
+                return False
+        if _harness_directory_identity(temp_root) != root_identity:
+            return False
+        temp_root.rmdir()
+        return _path_is_absent(temp_root)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return False
+
+
+def _remove_harness_tree(path: Path) -> None:
+    metadata = path.lstat()
+    if stat.S_ISDIR(metadata.st_mode):
+        path.chmod(0o700)
+        names = tuple(entry.name for entry in os.scandir(str(path)))
+        for name in names:
+            _remove_harness_tree(path / name)
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _path_is_absent(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def run_eval(request: EvalRequest, codex: CodexProcess) -> EvalResult:
@@ -1086,6 +1341,10 @@ def _result_json(result: EvalResult) -> str:
     return json.dumps(convert(asdict(result)), sort_keys=True, separators=(",", ":"))
 
 
+def _harness_result_json(result: HarnessDryRunResult) -> str:
+    return json.dumps(asdict(result), sort_keys=True, separators=(",", ":"))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", action="append", default=[])
@@ -1094,7 +1353,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--approve-release-suite", action="store_true")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--harness-profile")
+    parser.add_argument("--harness-bundle")
+    parser.add_argument("--variant-repo")
     arguments = parser.parse_args(argv)
+    harness_values = (
+        arguments.harness_profile,
+        arguments.harness_bundle,
+        arguments.variant_repo,
+    )
+    if any(value is not None for value in harness_values):
+        if (
+            not all(value is not None for value in harness_values)
+            or not arguments.dry_run
+            or (
+                arguments.approve_release_suite
+                and not arguments.release_suite
+            )
+        ):
+            result = _blocked_harness_result((), "blocked_request", "invalid_request")
+        else:
+            try:
+                planning_request = EvalRequest.dry_run(
+                    scenario_ids=arguments.scenario,
+                    tags=arguments.tags,
+                    release_suite=arguments.release_suite,
+                    model=arguments.model,
+                )
+                result = run_harness_dry_run(
+                    HarnessDryRunRequest(
+                        planning_request=planning_request,
+                        profile=arguments.harness_profile,
+                        bundle_root=Path(arguments.harness_bundle),
+                        skill_repo=Path(arguments.variant_repo),
+                    )
+                )
+            except (TypeError, ValueError):
+                result = _blocked_harness_result(
+                    (), "blocked_request", "invalid_request"
+                )
+        print(_harness_result_json(result))
+        return 0 if result.materialization_result == "pass" else 2
     owned_temp_root = None
     if arguments.approve_release_suite and not arguments.release_suite:
         print(

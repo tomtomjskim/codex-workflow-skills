@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 import scripts.run_live_eval as live_runner
@@ -44,6 +44,25 @@ REQUIRED_FLAGS = frozenset(
         "--strict-config",
         "-c",
     }
+)
+
+EXPECTED_HARNESS_ROLES = (
+    "accessibility-reviewer",
+    "api-reviewer",
+    "architect",
+    "code-reviewer",
+    "dba",
+    "designer",
+    "developer",
+    "documenter",
+    "explorer",
+    "performance-reviewer",
+    "pm",
+    "publisher",
+    "qa-engineer",
+    "security-reviewer",
+    "test-coverage-reviewer",
+    "ux-reviewer",
 )
 
 
@@ -112,6 +131,13 @@ class FakeCodex:
                 self.mutate_on_failure(invocation)
             raise outcome
         return outcome
+
+
+class ApiKeyGuard(dict):
+    def get(self, key, default=None):
+        if key == "OPENAI_API_KEY":
+            raise AssertionError("credential lookup is forbidden")
+        return super().get(key, default)
 
 
 class FakePopen:
@@ -244,6 +270,64 @@ class RunnerTests(unittest.TestCase):
         self._git("config", "user.name", "Runner Test")
         self._git("add", ".")
         self._git("commit", "-qm", "fixture")
+
+    def _create_harness_bundle_fixture(self):
+        bundle = self.root / "harness-bundle"
+        (bundle / "profiles" / "current").mkdir(parents=True, mode=0o700)
+        (bundle / "profiles" / "lean").mkdir(mode=0o700)
+        (bundle / "shared" / "agents").mkdir(parents=True, mode=0o700)
+        (bundle / "shared" / "common-agents").mkdir(mode=0o700)
+        files = {
+            "harness.json": json.dumps(
+                {"bundle_id": "runner-fixture-v1", "schema_version": 1},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "profiles/current/AGENTS.md": "# Current\nUse the complete policy.\n",
+            "profiles/lean/AGENTS.md": "# Lean\nUse the compact policy.\n",
+        }
+        for role in EXPECTED_HARNESS_ROLES:
+            files["shared/agents/{}.toml".format(role)] = (
+                'name = "{}"\n'.format(role)
+                + 'description = "Common {} role. Uses '
+                '~/.agents/common-agents/{}.md."\n'.format(role, role)
+                + 'model_reasoning_effort = "medium"\n'
+                + 'developer_instructions = """\n'
+                + "# {} Adapter\n\n".format(role)
+                + "Before acting, read and follow "
+                + "`/private/runner-fixture/.agents/common-agents/{}.md`.\n\n".format(
+                    role
+                )
+                + "Project-local instructions override this adapter.\n"
+                + '"""\n'
+            )
+            files["shared/common-agents/{}.md".format(role)] = (
+                "# {}\nRole policy.\n".format(role)
+            )
+        for relative, content in files.items():
+            path = bundle / relative
+            path.write_text(content, encoding="utf-8")
+            path.chmod(0o600)
+        for path in (bundle,) + tuple(
+            item for item in bundle.rglob("*") if item.is_dir()
+        ):
+            path.chmod(0o700)
+        return bundle
+
+    def _harness_cli_arguments(self, profile, bundle):
+        return [
+            "--tags",
+            "workflow-intake",
+            "--model",
+            "gpt-5.6-sol",
+            "--dry-run",
+            "--harness-profile",
+            profile,
+            "--harness-bundle",
+            str(bundle),
+            "--variant-repo",
+            str(self.repo),
+        ]
 
     def request(self, *, scenario_ids=("WI-MISSING-REPO",), **overrides):
         values = {
@@ -1068,6 +1152,317 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn(secret, repr(self.request(api_key=secret)))
         self.assertNotIn(secret, repr(result))
 
+    def test_harness_request_is_immutable_and_requires_planning_dry_run(self):
+        bundle = self._create_harness_bundle_fixture()
+        planning = EvalRequest.dry_run(
+            tags=("workflow-intake",), scenario_path=self.scenarios
+        )
+
+        request = live_runner.HarnessDryRunRequest(
+            planning_request=planning,
+            profile="current",
+            bundle_root=bundle,
+            skill_repo=self.repo,
+        )
+
+        with self.assertRaises(AttributeError):
+            request.profile = "lean"
+        with self.assertRaisesRegex(ValueError, "dry-run"):
+            live_runner.HarnessDryRunRequest(
+                planning_request=self.request(),
+                profile="current",
+                bundle_root=bundle,
+                skill_repo=self.repo,
+            )
+
+    def test_harness_flags_are_all_or_none_and_require_dry_run(self):
+        bundle = self._create_harness_bundle_fixture()
+        base = ["--tags", "workflow-intake"]
+        invalid_argument_sets = (
+            base
+            + [
+                "--dry-run",
+                "--harness-profile",
+                "current",
+                "--harness-bundle",
+                str(bundle),
+            ],
+            base
+            + [
+                "--dry-run",
+                "--harness-profile",
+                "current",
+                "--variant-repo",
+                str(self.repo),
+            ],
+            base
+            + [
+                "--dry-run",
+                "--harness-bundle",
+                str(bundle),
+                "--variant-repo",
+                str(self.repo),
+            ],
+            [
+                value
+                for value in self._harness_cli_arguments("current", bundle)
+                if value != "--dry-run"
+            ],
+        )
+        expected_keys = {
+            "manifest",
+            "manual_cleanup_required",
+            "materialization_result",
+            "model_calls",
+            "model_conformance",
+            "reason",
+            "retention",
+            "scenario_ids",
+            "status",
+        }
+
+        for arguments in invalid_argument_sets:
+            with self.subTest(arguments=arguments):
+                output = io.StringIO()
+                errors = io.StringIO()
+                with mock.patch.object(
+                    live_runner.os, "environ", ApiKeyGuard(os.environ)
+                ), mock.patch(
+                    "scripts.run_live_eval.shutil.which",
+                    side_effect=AssertionError("Codex resolution is forbidden"),
+                ), redirect_stdout(output), redirect_stderr(errors):
+                    exit_code = main(arguments)
+
+                payload = json.loads(output.getvalue())
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(set(payload), expected_keys)
+                self.assertEqual(payload["status"], "blocked_request")
+                self.assertEqual(payload["materialization_result"], "blocked")
+                self.assertEqual(payload["reason"], "invalid_request")
+                self.assertEqual(payload["model_calls"], 0)
+                self.assertEqual(errors.getvalue(), "")
+
+    def test_harness_dry_run_materializes_both_profiles_without_codex_or_auth(self):
+        bundle = self._create_harness_bundle_fixture()
+        payloads = {}
+
+        for profile in ("current", "lean"):
+            with self.subTest(profile=profile):
+                output = io.StringIO()
+                with mock.patch.object(
+                    live_runner.os, "environ", ApiKeyGuard(os.environ)
+                ), mock.patch(
+                    "scripts.run_live_eval.shutil.which",
+                    side_effect=AssertionError("Codex resolution is forbidden"),
+                ), mock.patch(
+                    "scripts.run_live_eval.SubprocessCodex",
+                    side_effect=AssertionError("Codex process construction is forbidden"),
+                ), redirect_stdout(output):
+                    exit_code = main(self._harness_cli_arguments(profile, bundle))
+
+                payload = json.loads(output.getvalue())
+                payloads[profile] = payload
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(
+                    set(payload),
+                    {
+                        "manifest",
+                        "manual_cleanup_required",
+                        "materialization_result",
+                        "model_calls",
+                        "model_conformance",
+                        "reason",
+                        "retention",
+                        "scenario_ids",
+                        "status",
+                    },
+                )
+                self.assertEqual(payload["status"], "harness_preflight_only")
+                self.assertEqual(payload["materialization_result"], "pass")
+                self.assertEqual(payload["model_conformance"], "not_run")
+                self.assertEqual(payload["model_calls"], 0)
+                self.assertEqual(payload["reason"], "fixed_inventory_verified")
+                self.assertEqual(payload["retention"], "none")
+                self.assertFalse(payload["manual_cleanup_required"])
+                self.assertEqual(len(payload["scenario_ids"]), 3)
+                self.assertEqual(
+                    set(payload["manifest"]),
+                    {
+                        "adapter_count",
+                        "adapter_materialized_hash",
+                        "adapter_source_hash",
+                        "agents_hash",
+                        "bundle_digest",
+                        "bundle_id",
+                        "common_role_hash",
+                        "home_digest",
+                        "profile",
+                        "role_count",
+                        "skill_routing_hash",
+                    },
+                )
+                self.assertEqual(payload["manifest"]["profile"], profile)
+                for name, value in payload["manifest"].items():
+                    if name.endswith("_hash") or name == "bundle_digest":
+                        self.assertRegex(value, r"^sha256:[0-9a-f]{64}$")
+                rendered = json.dumps(payload, sort_keys=True)
+                self.assertNotIn(str(self.root), rendered)
+                self.assertNotIn(str(bundle), rendered)
+                self.assertNotIn(str(self.repo), rendered)
+
+        self.assertNotEqual(
+            payloads["current"]["manifest"]["agents_hash"],
+            payloads["lean"]["manifest"]["agents_hash"],
+        )
+        for name in (
+            "adapter_materialized_hash",
+            "adapter_source_hash",
+            "bundle_digest",
+            "common_role_hash",
+            "skill_routing_hash",
+        ):
+            self.assertEqual(
+                payloads["current"]["manifest"][name],
+                payloads["lean"]["manifest"][name],
+            )
+
+    def test_harness_tamper_is_blocked_and_never_serialized_as_pass(self):
+        bundle = self._create_harness_bundle_fixture()
+        materialize = live_runner.materialize_harness_home
+
+        def materialize_then_tamper(skill_repo, bundle_root, profile, codex_home):
+            manifest = materialize(skill_repo, bundle_root, profile, codex_home)
+            target = codex_home / "AGENTS.md"
+            target.chmod(0o600)
+            target.write_text("tampered\n", encoding="utf-8")
+            target.chmod(0o400)
+            return manifest
+
+        request = live_runner.HarnessDryRunRequest(
+            planning_request=EvalRequest.dry_run(
+                tags=("workflow-intake",), scenario_path=self.scenarios
+            ),
+            profile="current",
+            bundle_root=bundle,
+            skill_repo=self.repo,
+        )
+        with mock.patch(
+            "scripts.run_live_eval.materialize_harness_home",
+            side_effect=materialize_then_tamper,
+        ):
+            result = live_runner.run_harness_dry_run(request)
+
+        self.assertEqual(result.status, "blocked_isolation")
+        self.assertEqual(result.materialization_result, "blocked")
+        self.assertEqual(result.reason, "materialized_harness_mismatch")
+        self.assertEqual(result.model_conformance, "not_run")
+        self.assertEqual(result.model_calls, 0)
+        self.assertIsNone(result.manifest)
+        self.assertNotIn(str(self.root), repr(result))
+
+    def test_harness_cleanup_failure_is_blocked_and_preserves_replacement(self):
+        bundle = self._create_harness_bundle_fixture()
+        cleanup = live_runner._cleanup_harness_temp_root
+        replacements = []
+
+        def replace_before_cleanup(temp_root, root_identity, codex_home, home_identity):
+            moved = temp_root.with_name(temp_root.name + "-owned")
+            temp_root.rename(moved)
+            temp_root.mkdir(mode=0o700)
+            marker = temp_root / "replacement-marker"
+            marker.write_text("preserve\n", encoding="utf-8")
+            marker.chmod(0o600)
+            replacements.append((temp_root, moved, marker))
+            return cleanup(temp_root, root_identity, codex_home, home_identity)
+
+        request = live_runner.HarnessDryRunRequest(
+            planning_request=EvalRequest.dry_run(
+                tags=("workflow-intake",), scenario_path=self.scenarios
+            ),
+            profile="current",
+            bundle_root=bundle,
+            skill_repo=self.repo,
+        )
+        with mock.patch(
+            "scripts.run_live_eval._cleanup_harness_temp_root",
+            side_effect=replace_before_cleanup,
+        ):
+            result = live_runner.run_harness_dry_run(request)
+
+        self.assertEqual(result.status, "blocked_cleanup")
+        self.assertEqual(result.materialization_result, "blocked")
+        self.assertEqual(result.reason, "cleanup_unverified")
+        self.assertEqual(result.model_conformance, "not_run")
+        self.assertEqual(result.model_calls, 0)
+        self.assertEqual(result.retention, "cleanup_required")
+        self.assertTrue(result.manual_cleanup_required)
+        self.assertTrue(replacements[0][2].is_file())
+        self.assertTrue(replacements[0][1].is_dir())
+        self.assertNotIn(str(self.root), repr(result))
+
+    def test_legacy_request_result_and_json_contracts_are_golden(self):
+        self.assertEqual(
+            tuple(EvalRequest.__dataclass_fields__),
+            (
+                "scenario_ids",
+                "tags",
+                "release_suite",
+                "release_approved",
+                "model",
+                "dry_run_only",
+                "repo_root",
+                "scenario_path",
+                "temp_root",
+                "codex_executable",
+                "api_key",
+                "api_key_env_name",
+                "model_allowlist",
+                "max_stdin_bytes",
+                "max_stdout_bytes",
+                "max_stderr_bytes",
+            ),
+        )
+        self.assertEqual(
+            tuple(EvalResult.__dataclass_fields__),
+            (
+                "status",
+                "verification_result",
+                "attempts",
+                "model_calls",
+                "manifest",
+                "scenarios",
+                "retention",
+                "manual_cleanup_required",
+                "retained_paths",
+            ),
+        )
+        result = EvalResult(
+            "preflight_only",
+            "not_run",
+            0,
+            0,
+            RunManifest(("one",), "gpt-5.6-sol", True, None),
+        )
+        self.assertEqual(
+            json.loads(live_runner._result_json(result)),
+            {
+                "attempts": 0,
+                "manifest": {
+                    "checkout_tree_hash": None,
+                    "dry_run": True,
+                    "model": "gpt-5.6-sol",
+                    "scenario_ids": ["one"],
+                },
+                "manual_cleanup_required": False,
+                "model_calls": 0,
+                "retained_paths": [],
+                "retention": "none",
+                "scenarios": [],
+                "status": "preflight_only",
+                "verification_result": "not_run",
+            },
+        )
+
     def test_cli_dry_run_does_not_require_api_key_or_codex_process(self):
         output = io.StringIO()
         environment = dict(os.environ)
@@ -1235,9 +1630,15 @@ class RunnerTests(unittest.TestCase):
         report = (root / "docs" / "forward-test-report.md").read_text(encoding="utf-8")
 
         self.assertIn("require_file scripts/run_live_eval.py", validation)
+        self.assertIn("require_file scripts/live_eval/harness.py", validation)
         self.assertIn("unittest discover -s tests -v", validation)
+        self.assertIn("require_file tests/test_live_eval_harness.py", validation)
         self.assertIn("preflight_only", readme)
+        self.assertIn("harness_preflight_only", readme)
+        self.assertIn("--harness-profile", readme)
         self.assertIn("model_calls=0", readme)
+        self.assertIn("model_conformance=not_run", readme)
+        self.assertIn("harness materialization preflight", report)
         self.assertIn("live model execution: not_run", report)
 
 

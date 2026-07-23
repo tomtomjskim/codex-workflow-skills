@@ -1,6 +1,6 @@
 # Forward-Test Report
 
-Date: 2026-07-08
+Date: 2026-07-23
 
 This report records the latest validation evidence for the public `codex-workflow-skills` repository. It is intentionally scoped to repeatable checks and known limits, not private session notes.
 
@@ -8,6 +8,7 @@ This report records the latest validation evidence for the public `codex-workflo
 
 - `workflow-intake` guided-intake behavior for planning, design artifact decisions, validation level selection, and E2E recommendations.
 - `adversarial-review-loop` behavior for read-only review routing, evidence requirements, finding severity, disposition, and residual-risk reporting.
+- Fixed `current|lean` harness materialization preflight behavior, including path-free summaries and zero model calls.
 - Repository release hygiene for README links, changelog coverage, plugin manifest version alignment, and public-content scans.
 
 ## Fresh-Context Forward Tests
@@ -68,6 +69,8 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
 
 - Deterministic scenario, isolation, checkout, budget, artifact, and runner tests are part of the non-network repository release gate.
 - The runner dry-run verifies planning preflight only and reports `preflight_only` with zero model calls.
+- The separate harness materialization preflight verifies fixed `current|lean` bundle materialization, clean-HEAD skill routing hashes, and the sealed temporary home. A pass reports `harness_preflight_only`, while actual Codex loading and model conformance remain `not_run` with zero model calls.
+- Fixture-backed CLI smoke on 2026-07-23 passed for both profiles with `materialization_result=pass`, `model_conformance=not_run`, and `model_calls=0`; the profile `agents_hash` values differed while the bundle and shared routing hashes matched.
 - live model execution: not_run
 - No model-quality or production-network conclusion is inferred from deterministic tests or dry-run output.
 

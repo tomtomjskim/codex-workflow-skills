@@ -62,7 +62,9 @@ require_file tests/test_install_agent_adapters.py
 require_file skills/workflow-intake/references/parallel-coordination.md
 require_file skills/adversarial-review-loop/references/reviewer-routing.json
 require_file scripts/run_live_eval.py
+require_file scripts/live_eval/harness.py
 require_file tests/live-eval-scenarios.json
+require_file tests/test_live_eval_harness.py
 require_file tests/test_live_eval_runner.py
 
 if [ ! -x scripts/workflow ]; then
