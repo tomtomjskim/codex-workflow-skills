@@ -342,6 +342,14 @@ def _file_flags() -> int:
     return os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
+def _close_fd_once(descriptor: int) -> bool:
+    try:
+        os.close(descriptor)
+        return True
+    except OSError:
+        return False
+
+
 def _require_directory_metadata(
     metadata: os.stat_result,
     device: int,
@@ -415,17 +423,22 @@ def _open_root_descriptor(
                 opened = os.fstat(child_descriptor)
                 if not _same_identity(observed, opened):
                     _fail("task_source_changed")
-                if not _same_identity(parent_metadata, os.fstat(descriptor)):
+                if (
+                    _stable_ancestor_identity(parent_metadata)
+                    != _stable_ancestor_identity(os.fstat(descriptor))
+                ):
                     _fail("task_source_changed")
-                os.close(descriptor)
+                owned_parent = descriptor
+                descriptor = -1
+                if not _close_fd_once(owned_parent):
+                    _fail("task_source_root_invalid")
                 descriptor = child_descriptor
                 child_descriptor = -1
             finally:
                 if child_descriptor >= 0:
-                    try:
-                        os.close(child_descriptor)
-                    except OSError:
-                        pass
+                    owned_child = child_descriptor
+                    child_descriptor = -1
+                    _close_fd_once(owned_child)
             parent_metadata = opened
         if not components:
             _fail("task_source_root_invalid")
@@ -437,14 +450,15 @@ def _open_root_descriptor(
         return descriptor, parent_metadata, tuple(actual_ancestors)
     except TaskSnapshotError:
         if descriptor >= 0:
-            os.close(descriptor)
+            owned_descriptor = descriptor
+            descriptor = -1
+            _close_fd_once(owned_descriptor)
         raise
     except (OSError, TypeError, ValueError, OverflowError):
         if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+            owned_descriptor = descriptor
+            descriptor = -1
+            _close_fd_once(owned_descriptor)
         _fail("task_source_root_invalid")
 
 
@@ -471,10 +485,9 @@ def _open_child_directory(
         _fail(code)
     finally:
         if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+            owned_descriptor = descriptor
+            descriptor = -1
+            _close_fd_once(owned_descriptor)
 
 
 def _optional_metadata(parent_fd: int, name: str) -> Optional[os.stat_result]:
@@ -522,10 +535,9 @@ def _read_control_file(
         _fail(missing_code)
     finally:
         if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+            owned_descriptor = descriptor
+            descriptor = -1
+            _close_fd_once(owned_descriptor)
 
 
 def _require_absent(parent_fd: int, name: str) -> None:
@@ -556,7 +568,9 @@ def _scan_empty_directory(
     except (OSError, TypeError, ValueError, OverflowError):
         _fail("task_source_control_invalid")
     finally:
-        os.close(descriptor)
+        owned_descriptor = descriptor
+        descriptor = -1
+        _close_fd_once(owned_descriptor)
 
 
 def _scan_hooks(
@@ -607,7 +621,9 @@ def _scan_hooks(
     except (OSError, TypeError, ValueError, OverflowError):
         _fail("task_source_control_invalid")
     finally:
-        os.close(descriptor)
+        owned_descriptor = descriptor
+        descriptor = -1
+        _close_fd_once(owned_descriptor)
 
 
 def _check_refs(git_fd: int, device: int) -> None:
@@ -622,7 +638,9 @@ def _check_refs(git_fd: int, device: int) -> None:
         if not _same_identity(opened, os.fstat(descriptor)):
             _fail("task_source_changed")
     finally:
-        os.close(descriptor)
+        owned_descriptor = descriptor
+        descriptor = -1
+        _close_fd_once(owned_descriptor)
 
 
 def _check_object_controls(
@@ -641,7 +659,9 @@ def _check_object_controls(
             if not _same_identity(info_opened, os.fstat(info_fd)):
                 _fail("task_source_changed")
         finally:
-            os.close(info_fd)
+            owned_info_fd = info_fd
+            info_fd = -1
+            _close_fd_once(owned_info_fd)
     pack_metadata = _optional_metadata(objects_fd, "pack")
     if pack_metadata is not None:
         pack_fd, pack_opened = _open_child_directory(
@@ -659,7 +679,9 @@ def _check_object_controls(
             if not _same_identity(pack_opened, os.fstat(pack_fd)):
                 _fail("task_source_changed")
         finally:
-            os.close(pack_fd)
+            owned_pack_fd = pack_fd
+            pack_fd = -1
+            _close_fd_once(owned_pack_fd)
 
 
 _REF_FORBIDDEN = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
@@ -837,12 +859,11 @@ def _capture_filesystem(
     except (OSError, TypeError, ValueError, OverflowError):
         _fail("task_source_control_invalid")
     finally:
-        for descriptor in (objects_fd, git_fd, root_fd):
+        owned_descriptors = (objects_fd, git_fd, root_fd)
+        objects_fd = git_fd = root_fd = -1
+        for descriptor in owned_descriptors:
             if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+                _close_fd_once(descriptor)
 
 
 _CONFIG_NAME = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
@@ -1087,8 +1108,11 @@ def _capture_object_topology(
                     frame["metadata"], os.fstat(frame["fd"])
                 ):
                     _fail("task_source_changed")
-                os.close(frame["fd"])
                 frames.pop()
+                owned_frame_fd = frame["fd"]
+                frame["fd"] = -1
+                if not _close_fd_once(owned_frame_fd):
+                    _fail("task_source_topology_invalid")
                 continue
 
             name = entry.name
@@ -1167,10 +1191,9 @@ def _capture_object_topology(
                         except OSError:
                             pass
                     if child_fd >= 0:
-                        try:
-                            os.close(child_fd)
-                        except OSError:
-                            pass
+                        owned_child_fd = child_fd
+                        child_fd = -1
+                        _close_fd_once(owned_child_fd)
                 continue
             _require_file_metadata(
                 observed, device, "task_source_topology_invalid"
@@ -1222,16 +1245,15 @@ def _capture_object_topology(
                 frame["iterator"].close()
             except (OSError, AttributeError):
                 pass
-            try:
-                os.close(frame["fd"])
-            except OSError:
-                pass
-        for descriptor in (objects_fd, git_fd, root_fd):
+            owned_frame_fd = frame["fd"]
+            frame["fd"] = -1
+            if owned_frame_fd >= 0:
+                _close_fd_once(owned_frame_fd)
+        owned_descriptors = (objects_fd, git_fd, root_fd)
+        objects_fd = git_fd = root_fd = -1
+        for descriptor in owned_descriptors:
             if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+                _close_fd_once(descriptor)
 
 
 _OPERATION_TEMPLATES = [
@@ -1494,10 +1516,18 @@ def _cleanup_process(
     grace_seconds: float,
 ) -> bool:
     success = True
-    termination_deadline = time.monotonic() + grace_seconds
+    poll_failed = False
+    pre_kill_wait_timed_out = False
+    killed = False
+    try:
+        termination_deadline = time.monotonic() + grace_seconds
+    except Exception:
+        termination_deadline = 0.0
+        success = False
     try:
         process.poll()
     except Exception:
+        poll_failed = True
         success = False
     if _group_exists(process_group):
         try:
@@ -1509,7 +1539,7 @@ def _cleanup_process(
     try:
         process.wait(timeout=max(grace_seconds, 0.001))
     except subprocess.TimeoutExpired:
-        pass
+        pre_kill_wait_timed_out = True
     except Exception:
         success = False
     while (
@@ -1522,31 +1552,32 @@ def _cleanup_process(
     if _group_exists(process_group):
         try:
             os.killpg(process_group, signal.SIGKILL)
+            killed = True
         except ProcessLookupError:
             pass
         except OSError:
             success = False
-    if process.poll() is None:
+    if killed or pre_kill_wait_timed_out or poll_failed:
         try:
             process.wait(timeout=max(grace_seconds, 0.001))
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process_group, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                success = False
-            try:
-                process.wait(timeout=max(grace_seconds, 0.001))
-            except Exception:
-                success = False
+            success = False
         except Exception:
             success = False
-    absence_deadline = time.monotonic() + grace_seconds
-    while _group_exists(process_group) and time.monotonic() < absence_deadline:
-        time.sleep(
-            min(0.005, max(0.0, absence_deadline - time.monotonic()))
-        )
+    try:
+        absence_deadline = time.monotonic() + grace_seconds
+        while (
+            _group_exists(process_group)
+            and time.monotonic() < absence_deadline
+        ):
+            time.sleep(
+                min(
+                    0.005,
+                    max(0.0, absence_deadline - time.monotonic()),
+                )
+            )
+    except Exception:
+        success = False
     return success and not _group_exists(process_group)
 
 
@@ -1602,6 +1633,13 @@ def _cleanup_git_failure(
         and _started_threads_stopped(started_threads)
         and group_absent
     )
+
+
+def _deadline_remaining(deadline: float) -> Optional[float]:
+    try:
+        return deadline - time.monotonic()
+    except Exception:
+        return None
 
 
 def _run_git(
@@ -1680,6 +1718,15 @@ def _run_git(
         if not cleanup_ok:
             _fail("task_git_failed")
         _fail("task_git_spawn_failed")
+    grace = policy.git_termination_grace_milliseconds / 1000.0
+    remaining = _deadline_remaining(deadline)
+    if remaining is None:
+        _cleanup_git_failure(process, (), grace)
+        _fail("task_git_failed")
+    if remaining <= 0:
+        if not _cleanup_git_failure(process, (), grace):
+            _fail("task_git_failed")
+        _fail("task_git_timeout")
 
     stdout_state = _DrainState()
     stderr_state = _DrainState()
@@ -1687,22 +1734,49 @@ def _run_git(
         (process.stdout, policy.max_git_stdout_bytes, stdout_state),
         (process.stderr, policy.max_git_stderr_bytes, stderr_state),
     )
-    threads = []
     started_threads = []
-    try:
-        for stream, limit, state in reader_specs:
+    reader_setup_failure = None
+    for stream, limit, state in reader_specs:
+        remaining = _deadline_remaining(deadline)
+        if remaining is None:
+            reader_setup_failure = "task_git_failed"
+            break
+        if remaining <= 0:
+            reader_setup_failure = "task_git_timeout"
+            break
+        try:
             thread = threading.Thread(
                 target=_drain_stream,
                 args=(stream, limit, state),
                 daemon=True,
             )
-            threads.append(thread)
+        except Exception:
+            reader_setup_failure = "task_git_failed"
+            break
+        remaining = _deadline_remaining(deadline)
+        if remaining is None:
+            reader_setup_failure = "task_git_failed"
+            break
+        if remaining <= 0:
+            reader_setup_failure = "task_git_timeout"
+            break
+        try:
             thread.start()
-            started_threads.append(thread)
-    except Exception:
-        grace = policy.git_termination_grace_milliseconds / 1000.0
-        _cleanup_git_failure(process, started_threads, grace)
-        _fail("task_git_failed")
+        except Exception:
+            reader_setup_failure = "task_git_failed"
+            break
+        started_threads.append(thread)
+        remaining = _deadline_remaining(deadline)
+        if remaining is None:
+            reader_setup_failure = "task_git_failed"
+            break
+        if remaining <= 0:
+            reader_setup_failure = "task_git_timeout"
+            break
+    if reader_setup_failure is not None:
+        if not _cleanup_git_failure(process, started_threads, grace):
+            _fail("task_git_failed")
+        _fail(reader_setup_failure)
 
     failure = None
     while True:
@@ -1725,19 +1799,21 @@ def _run_git(
         except Exception:
             failure = "task_git_failed"
             break
-        if (
-            stdout_state.done.is_set()
-            and stderr_state.done.is_set()
-            and process_status is not None
-        ):
-            break
+        if process_status is not None:
+            if process_status != 0:
+                failure = "task_git_failed"
+                break
+            if (
+                stdout_state.done.is_set()
+                and stderr_state.done.is_set()
+            ):
+                break
         try:
             time.sleep(min(0.005, remaining))
         except Exception:
             failure = "task_git_failed"
             break
 
-    grace = policy.git_termination_grace_milliseconds / 1000.0
     if failure is not None:
         cleanup_ok = _cleanup_git_failure(
             process, started_threads, grace
@@ -1766,7 +1842,29 @@ def _run_git(
     except Exception:
         _cleanup_git_failure(process, started_threads, grace)
         _fail("task_git_failed")
-    _join_started_threads(started_threads, grace)
+    remaining = _deadline_remaining(deadline)
+    if remaining is None:
+        _cleanup_git_failure(process, started_threads, grace)
+        _fail("task_git_failed")
+    if remaining <= 0:
+        if not _cleanup_git_failure(
+            process, started_threads, grace
+        ):
+            _fail("task_git_failed")
+        _fail("task_git_timeout")
+    join_ok = _join_started_threads(
+        started_threads, min(grace, remaining)
+    )
+    remaining = _deadline_remaining(deadline)
+    if not join_ok or remaining is None:
+        _cleanup_git_failure(process, started_threads, grace)
+        _fail("task_git_failed")
+    if remaining <= 0:
+        if not _cleanup_git_failure(
+            process, started_threads, grace
+        ):
+            _fail("task_git_failed")
+        _fail("task_git_timeout")
     nominal_ok = (
         _started_threads_stopped(started_threads)
         and not stdout_state.failed

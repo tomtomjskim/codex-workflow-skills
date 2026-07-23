@@ -18,6 +18,8 @@ from scripts.live_eval.task_snapshot import (
     TaskSourceSpec,
     _capture_filesystem,
     _capture_object_topology,
+    _cleanup_process,
+    _open_root_descriptor,
     _parse_config_output,
     _parse_packed_refs,
     _process_policy_digest,
@@ -525,6 +527,99 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
             real_fstat(failed_fd[0])
         self.assertEqual(caught.exception.errno, errno.EBADF)
 
+    def test_root_transfer_close_error_preserves_reused_descriptor(self):
+        repo, oid = self.make_repository()
+        real_close = os.close
+        real_open = os.open
+        real_fstat = os.fstat
+        replacement = []
+        triggered = {"value": False}
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+        def close_then_reuse(descriptor):
+            if not triggered["value"]:
+                triggered["value"] = True
+                real_close(descriptor)
+                reused = real_open(str(repo.parent), flags)
+                self.assertEqual(reused, descriptor)
+                replacement.append(reused)
+                raise OSError(errno.EINTR, "close-reuse-sentinel")
+            return real_close(descriptor)
+
+        with patch(
+            "scripts.live_eval.task_snapshot.os.close",
+            side_effect=close_then_reuse,
+        ), self.assertRaises(TaskSnapshotError):
+            _open_root_descriptor(repo)
+
+        self.assertEqual(len(replacement), 1)
+        real_fstat(replacement[0])
+        real_close(replacement[0])
+
+    def test_frame_close_error_preserves_reused_descriptor(self):
+        repo, oid = self.make_repository()
+        real_close = os.close
+        real_open = os.open
+        real_fstat = os.fstat
+        real_scandir = os.scandir
+        scanned = set()
+        replacement = []
+        triggered = {"value": False}
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+        def tracking_scandir(descriptor):
+            scanned.add(descriptor)
+            return real_scandir(descriptor)
+
+        def close_then_reuse(descriptor):
+            if descriptor in scanned and not triggered["value"]:
+                triggered["value"] = True
+                real_close(descriptor)
+                reused = real_open(str(repo.parent), flags)
+                self.assertEqual(reused, descriptor)
+                replacement.append(reused)
+                raise OSError(errno.EINTR, "frame-close-reuse-sentinel")
+            return real_close(descriptor)
+
+        with patch(
+            "scripts.live_eval.task_snapshot.os.scandir",
+            side_effect=tracking_scandir,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.close",
+            side_effect=close_then_reuse,
+        ), self.assertRaises(TaskSnapshotError):
+            _capture_object_topology(
+                self.source_for(repo, oid), TaskSnapshotPolicy(), "sha1"
+            )
+
+        self.assertEqual(len(replacement), 1)
+        real_fstat(replacement[0])
+        real_close(replacement[0])
+
+    def test_sibling_churn_inside_descriptor_window_is_stable(self):
+        repo, oid = self.make_repository()
+        real_open = os.open
+        churned = {"value": False}
+
+        def opening_with_sibling_churn(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if path == repo.name and not churned["value"]:
+                (repo.parent / "descriptor-window-sibling").write_bytes(b"x")
+                churned["value"] = True
+            return descriptor
+
+        with patch(
+            "scripts.live_eval.task_snapshot.os.open",
+            side_effect=opening_with_sibling_churn,
+        ):
+            descriptor, metadata, ancestors = _open_root_descriptor(repo)
+        try:
+            self.assertTrue(churned["value"])
+            self.assertEqual(metadata.st_ino, os.stat(repo).st_ino)
+            self.assertTrue(ancestors)
+        finally:
+            os.close(descriptor)
+
 
 class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
     def test_real_config_and_storage_operations_are_bounded(self):
@@ -637,6 +732,7 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
                     value,
                 )
             self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
 
     def test_timeout_cleans_up_and_preserves_fixed_classification(self):
         repo, oid = self.make_repository()
@@ -690,9 +786,9 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
                 repo / ".git" / "config",
                 TaskSnapshotPolicy(),
                 "storage-format",
-                )
-            self.assertIsNone(caught.exception.__context__)
-            self.assertIsNone(caught.exception.__cause__)
+            )
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
 
         class RaisingConfigPath:
             def __fspath__(self):
@@ -708,7 +804,6 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
                 "config",
             )
         self.assertIsNone(caught.exception.__context__)
-        self.assertIsNone(caught.exception.__cause__)
         self.assertIsNone(caught.exception.__cause__)
 
     def test_partial_reader_start_failure_cleans_only_started_thread(self):
@@ -847,6 +942,7 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
 
     def test_deadline_starts_before_popen(self):
         repo, oid = self.make_repository()
+        reader_constructions = []
 
         class Clock:
             value = 0.0
@@ -874,11 +970,18 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
             clock.value = 2.0
             return FakeProcess()
 
+        def unexpected_reader(*args, **kwargs):
+            reader_constructions.append((args, kwargs))
+            raise AssertionError("reader-started-after-expired-spawn")
+
         with patch(
             "scripts.live_eval.task_snapshot.time.monotonic", clock
         ), patch(
             "scripts.live_eval.task_snapshot.subprocess.Popen",
             side_effect=delayed_spawn,
+        ), patch(
+            "scripts.live_eval.task_snapshot.threading.Thread",
+            side_effect=unexpected_reader,
         ), patch(
             "scripts.live_eval.task_snapshot.os.killpg",
             side_effect=ProcessLookupError,
@@ -891,6 +994,252 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
                 TaskSnapshotPolicy(git_timeout_seconds=1),
                 "storage-format",
             )
+        self.assertEqual(reader_constructions, [])
+
+    def test_deadline_is_checked_after_each_reader_start(self):
+        repo, oid = self.make_repository()
+        threads = []
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        clock = Clock()
+
+        class FakeThread:
+            def __init__(self, target, args, daemon):
+                self.started = False
+                self.joined = False
+                threads.append(self)
+
+            def start(self):
+                self.started = True
+                clock.value = 2.0
+
+            def join(self, timeout=None):
+                if not self.started:
+                    raise RuntimeError("joined-unstarted-reader")
+                self.joined = True
+
+            def is_alive(self):
+                return False
+
+        with patch(
+            "scripts.live_eval.task_snapshot.time.monotonic", clock
+        ), patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=FakeProcess(),
+        ), patch(
+            "scripts.live_eval.task_snapshot.threading.Thread",
+            side_effect=FakeThread,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=ProcessLookupError,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_timeout$"
+        ):
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(git_timeout_seconds=1),
+                "storage-format",
+            )
+
+        self.assertEqual(len(threads), 1)
+        self.assertTrue(threads[0].joined)
+
+    def test_cleanup_reaps_after_kill_despite_poll_and_wait_failures(self):
+        signals = []
+
+        class AdvancingClock:
+            value = 0.0
+
+            def __call__(self):
+                self.value += 1.0
+                return self.value
+
+        class BrokenProcess:
+            pid = 987654
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+                self.wait_calls = 0
+
+            def poll(self):
+                raise RuntimeError("persistent-poll-sentinel")
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("git", timeout)
+                return -9
+
+        process = BrokenProcess()
+        group_alive = {"value": True}
+
+        def kill_group(process_group, selected_signal):
+            signals.append(selected_signal)
+            if selected_signal == 0:
+                if group_alive["value"]:
+                    return None
+                raise ProcessLookupError
+            if selected_signal == task_snapshot_module.signal.SIGKILL:
+                group_alive["value"] = False
+
+        with patch(
+            "scripts.live_eval.task_snapshot.time.monotonic",
+            AdvancingClock(),
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=kill_group,
+        ):
+            result = _cleanup_process(process, process.pid, 0.01)
+
+        self.assertFalse(result)
+        self.assertIn(task_snapshot_module.signal.SIGKILL, signals)
+        self.assertEqual(process.wait_calls, 2)
+
+    def test_nominal_join_failure_triggers_cleanup_and_fixed_error(self):
+        repo, oid = self.make_repository()
+        process_waits = []
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                process_waits.append(timeout)
+                return self.returncode
+
+        class JoinFailingThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+            def join(self, timeout=None):
+                raise RuntimeError("join-private-sentinel")
+
+            def is_alive(self):
+                return False
+
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=FakeProcess(),
+        ), patch(
+            "scripts.live_eval.task_snapshot.threading.Thread",
+            side_effect=JoinFailingThread,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=ProcessLookupError,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ) as caught:
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(),
+                "storage-format",
+            )
+
+        self.assertGreaterEqual(len(process_waits), 2)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_nonzero_leader_cleans_open_pipe_descendants_immediately(self):
+        repo, oid = self.make_repository()
+        signals = []
+        threads = []
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 7
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"still-open")
+                self.stderr = io.BytesIO(b"still-open")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        class StalledReader:
+            def __init__(self, target, args, daemon):
+                self.started = False
+                self.joined = False
+                threads.append(self)
+
+            def start(self):
+                self.started = True
+
+            def join(self, timeout=None):
+                self.joined = True
+
+            def is_alive(self):
+                return False
+
+        group_alive = {"value": True}
+
+        def kill_group(process_group, selected_signal):
+            signals.append(selected_signal)
+            if selected_signal == 0:
+                if group_alive["value"]:
+                    return None
+                raise ProcessLookupError
+            group_alive["value"] = False
+
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=FakeProcess(),
+        ) as popen, patch(
+            "scripts.live_eval.task_snapshot.threading.Thread",
+            side_effect=StalledReader,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=kill_group,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ):
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(git_timeout_seconds=1),
+                "storage-format",
+            )
+
+        process = popen.return_value
+        self.assertIn(task_snapshot_module.signal.SIGTERM, signals)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        self.assertTrue(all(thread.joined for thread in threads))
 
     def test_simultaneous_pipe_caps_and_residual_group_fail_closed(self):
         repo, oid = self.make_repository()
