@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping as ABCMapping
 from pathlib import Path
 import subprocess
 import tempfile
@@ -6,6 +7,7 @@ import errno
 import hashlib
 import io
 import socket
+import threading
 from types import MappingProxyType
 import unittest
 from dataclasses import fields, replace
@@ -13,10 +15,12 @@ from unittest.mock import patch
 
 import scripts.live_eval.task_snapshot as task_snapshot_module
 from scripts.live_eval.task_snapshot import (
+    CapturedTaskObjects,
     ObjectTopologySeal,
     PreparedTaskSource,
     TaskTreeEntry,
     TaskSnapshotError,
+    TaskSnapshotMaterializer,
     TaskSnapshotPolicy,
     TaskSourceSpec,
     _capture_filesystem,
@@ -1977,12 +1981,15 @@ class TaskSnapshotTreeEvidenceTests(RepositoryFixture, unittest.TestCase):
                     "scripts.live_eval.task_snapshot._run_git",
                     side_effect=run_git,
                 ):
+                    capture_deadline = (
+                        task_snapshot_module.time.monotonic() + 10.0
+                    )
                     entries, blobs = _load_task_blobs(
                         Path("/repo/.git"),
                         Path("/repo/.git/config"),
                         parsed,
                         policy,
-                        capture_deadline=10.0,
+                        capture_deadline=capture_deadline,
                     )
 
                 self.assertEqual(
@@ -2201,6 +2208,23 @@ class TaskSnapshotTreeEvidenceTests(RepositoryFixture, unittest.TestCase):
                 size=1,
                 content_digest="sha256:" + "b" * 64,
             )
+
+    def test_public_tree_entry_caps_characters_before_utf8_encoding(self):
+        policy = TaskSnapshotPolicy()
+        with patch(
+            "scripts.live_eval.task_snapshot._encode_task_path",
+            side_effect=AssertionError("oversized path reached UTF-8 encoding"),
+        ) as encode_path, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_limit$"
+        ):
+            TaskTreeEntry(
+                path="a" * (policy.max_relative_path_bytes + 1),
+                git_mode="100644",
+                blob_oid="a" * 40,
+                size=1,
+                content_digest="sha256:" + "b" * 64,
+            )
+        encode_path.assert_not_called()
 
     def test_complete_tree_limits_are_decided_before_blob_loading(self):
         accepted = b"".join(
@@ -2459,14 +2483,1158 @@ class TaskSnapshotTreeEvidenceTests(RepositoryFixture, unittest.TestCase):
         self.assertEqual(type(blobs), MappingProxyType)
 
 
+class TaskSnapshotCaptureTests(RepositoryFixture, unittest.TestCase):
+    def prepared_source(self, object_format="sha1"):
+        repo, oid = self.make_repository(object_format)
+        policy = TaskSnapshotPolicy()
+        prepared = prepare_task_source(self.source_for(repo, oid), policy)
+        return repo, policy, prepared
+
+    def test_capture_returns_exact_detached_immutable_public_evidence(self):
+        for object_format in ("sha1", "sha256"):
+            with self.subTest(object_format=object_format):
+                repo, policy, prepared = self.prepared_source(object_format)
+                materializer = TaskSnapshotMaterializer(policy)
+
+                captured = materializer.capture(prepared)
+
+                self.assertIs(type(captured), CapturedTaskObjects)
+                self.assertEqual(
+                    tuple(item.name for item in fields(captured)),
+                    (
+                        "source_trust_receipt",
+                        "source",
+                        "policy",
+                        "object_format",
+                        "commit_oid",
+                        "tree_oid",
+                        "entry_digest",
+                        "entries",
+                        "blobs",
+                        "file_count",
+                        "total_bytes",
+                        "unique_blob_count",
+                        "unique_blob_bytes",
+                    ),
+                )
+                self.assertEqual(captured.object_format, object_format)
+                self.assertEqual(captured.commit_oid, prepared.source.commit_oid)
+                self.assertEqual(captured.file_count, 1)
+                self.assertEqual(captured.total_bytes, len(b"fixture\n"))
+                self.assertEqual(captured.unique_blob_count, 1)
+                self.assertEqual(captured.unique_blob_bytes, len(b"fixture\n"))
+                self.assertIs(type(captured.entries), tuple)
+                self.assertIs(type(captured.blobs), MappingProxyType)
+                self.assertIsNot(captured.source, prepared.source)
+                self.assertIsNot(captured.policy, prepared.policy)
+                self.assertNotIn(str(repo), repr(captured))
+                self.assertEqual(
+                    dict(captured.source_trust_receipt.payload),
+                    {
+                        "git_process_policy_digest": (
+                            prepared.git_process_policy_digest
+                        ),
+                        "inventory_file_count": (
+                            prepared.object_topology.file_count
+                        ),
+                        "inventory_total_bytes": (
+                            prepared.object_topology.total_bytes
+                        ),
+                        "local_clone_policy": (
+                            prepared.source.local_clone_policy
+                        ),
+                        "object_format": prepared.object_format,
+                        "object_topology_after_digest": (
+                            prepared.object_topology.object_topology_digest
+                        ),
+                        "object_topology_before_digest": (
+                            prepared.object_topology.object_topology_digest
+                        ),
+                        "operator_attested": (
+                            prepared.source.operator_attested
+                        ),
+                        "provisioning_class": (
+                            prepared.source.provisioning_class
+                        ),
+                        "source_identity_after_digest": (
+                            prepared.source_identity_digest
+                        ),
+                        "source_identity_before_digest": (
+                            prepared.source_identity_digest
+                        ),
+                        "task_id": prepared.source.task_id,
+                    },
+                )
+                self.assertNotEqual(
+                    prepared.object_topology.file_count,
+                    captured.file_count,
+                )
+                with self.assertRaises(TypeError):
+                    captured.blobs["a" * len(captured.commit_oid)] = b"x"
+
+                mutable_blobs = dict(captured.blobs)
+                copied = CapturedTaskObjects(
+                    source_trust_receipt=captured.source_trust_receipt,
+                    source=captured.source,
+                    policy=captured.policy,
+                    object_format=captured.object_format,
+                    commit_oid=captured.commit_oid,
+                    tree_oid=captured.tree_oid,
+                    entry_digest=captured.entry_digest,
+                    entries=captured.entries,
+                    blobs=mutable_blobs,
+                    file_count=captured.file_count,
+                    total_bytes=captured.total_bytes,
+                    unique_blob_count=captured.unique_blob_count,
+                    unique_blob_bytes=captured.unique_blob_bytes,
+                )
+                mutable_blobs.clear()
+                self.assertEqual(dict(copied.blobs), dict(captured.blobs))
+                materializer.close()
+
+    def test_capture_uses_exact_transaction_order_and_receipt_is_last(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        events = []
+        git_calls = []
+        original_filesystem = task_snapshot_module._capture_filesystem
+        original_topology = task_snapshot_module._capture_object_topology
+        original_git = task_snapshot_module._run_git
+        original_receipt = task_snapshot_module.make_receipt
+
+        def record_filesystem(*args, **kwargs):
+            events.append("filesystem")
+            return original_filesystem(*args, **kwargs)
+
+        def record_topology(*args, **kwargs):
+            events.append("topology")
+            return original_topology(*args, **kwargs)
+
+        def record_git(
+            git_dir,
+            config_path,
+            active_policy,
+            operation,
+            value=None,
+            **kwargs
+        ):
+            events.append("git:" + operation)
+            git_calls.append(
+                (
+                    operation,
+                    value,
+                    kwargs.get("capture_deadline"),
+                    kwargs.get("stdout_limit"),
+                )
+            )
+            return original_git(
+                git_dir,
+                config_path,
+                active_policy,
+                operation,
+                value,
+                **kwargs
+            )
+
+        def record_receipt(*args, **kwargs):
+            events.append("receipt")
+            return original_receipt(*args, **kwargs)
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=record_filesystem,
+        ), patch(
+            "scripts.live_eval.task_snapshot._capture_object_topology",
+            side_effect=record_topology,
+        ), patch(
+            "scripts.live_eval.task_snapshot._run_git",
+            side_effect=record_git,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt",
+            side_effect=record_receipt,
+        ):
+            captured = TaskSnapshotMaterializer(policy).capture(prepared)
+
+        self.assertEqual(
+            events,
+            [
+                "filesystem",
+                "topology",
+                "git:config",
+                "git:storage-format",
+                "git:verify-commit",
+                "git:verify-tree",
+                "git:ls-tree",
+                "git:cat-blob",
+                "git:config",
+                "filesystem",
+                "topology",
+                "receipt",
+                "receipt",
+            ],
+        )
+        self.assertEqual(
+            [(operation, value, limit) for operation, value, _, limit in git_calls],
+            [
+                ("config", None, None),
+                ("storage-format", None, None),
+                ("verify-commit", captured.commit_oid, None),
+                ("verify-tree", captured.commit_oid, None),
+                ("ls-tree", captured.tree_oid, None),
+                (
+                    "cat-blob",
+                    next(iter(captured.blobs)),
+                    len(next(iter(captured.blobs.values()))),
+                ),
+                ("config", None, None),
+            ],
+        )
+        deadlines = {deadline for _, _, deadline, _ in git_calls}
+        self.assertEqual(len(deadlines), 1)
+        self.assertIs(type(next(iter(deadlines))), float)
+
+    def test_capture_fetches_repeated_blob_once_and_empty_tree_not_at_all(self):
+        repo, initial_oid = self.make_repository()
+        (repo / "repeat.txt").write_bytes(b"fixture\n")
+        subprocess.run(
+            ("git", "add", "repeat.txt"),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Task Snapshot",
+                "-c",
+                "user.email=snapshot@example.invalid",
+                "commit",
+                "-qm",
+                "repeat blob",
+            ),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        repeated_oid = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=str(repo),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+        self.assertNotEqual(initial_oid, repeated_oid)
+
+        policy = TaskSnapshotPolicy()
+        repeated_prepared = prepare_task_source(
+            self.source_for(repo, repeated_oid),
+            policy,
+        )
+        repeated_operations = []
+        original_git = task_snapshot_module._run_git
+
+        def record_repeated(*args, **kwargs):
+            repeated_operations.append(args[3])
+            return original_git(*args, **kwargs)
+
+        repeated_materializer = TaskSnapshotMaterializer(policy)
+        with patch(
+            "scripts.live_eval.task_snapshot._run_git",
+            side_effect=record_repeated,
+        ):
+            repeated = repeated_materializer.capture(repeated_prepared)
+        self.assertEqual(repeated.file_count, 2)
+        self.assertEqual(repeated.unique_blob_count, 1)
+        self.assertEqual(repeated_operations.count("cat-blob"), 1)
+        repeated_materializer.close()
+
+        subprocess.run(
+            ("git", "rm", "-q", "tracked.txt", "repeat.txt"),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Task Snapshot",
+                "-c",
+                "user.email=snapshot@example.invalid",
+                "commit",
+                "-qm",
+                "empty tree",
+            ),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        empty_oid = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=str(repo),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+        empty_prepared = prepare_task_source(
+            self.source_for(repo, empty_oid),
+            policy,
+        )
+        empty_operations = []
+
+        def record_empty(*args, **kwargs):
+            empty_operations.append(args[3])
+            return original_git(*args, **kwargs)
+
+        empty_materializer = TaskSnapshotMaterializer(policy)
+        with patch(
+            "scripts.live_eval.task_snapshot._run_git",
+            side_effect=record_empty,
+        ):
+            empty = empty_materializer.capture(empty_prepared)
+        self.assertEqual(empty.file_count, 0)
+        self.assertEqual(empty.unique_blob_count, 0)
+        self.assertNotIn("cat-blob", empty_operations)
+        empty_materializer.close()
+
+    def test_capture_failure_closes_without_constructing_a_receipt(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        first_filesystem = _capture_filesystem(
+            prepared.source,
+            policy,
+            prepared.object_format,
+        )
+        changed_filesystem = replace(
+            first_filesystem,
+            filesystem_digest="sha256:" + "f" * 64,
+        )
+        materializer = TaskSnapshotMaterializer(policy)
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=(first_filesystem, changed_filesystem),
+        ), patch(
+            "scripts.live_eval.task_snapshot._capture_object_topology",
+            return_value=prepared.object_topology,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_changed$"
+        ) as caught:
+            materializer.capture(prepared)
+
+        make_receipt.assert_not_called()
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+
+    def test_capture_rejects_each_final_source_seal_mismatch(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        cases = (
+            "_parse_config_output",
+            "_capture_object_topology",
+            "_capture_filesystem",
+        )
+        for target_name in cases:
+            original = getattr(task_snapshot_module, target_name)
+            calls = {"value": 0}
+
+            def mutate_second_result(*args, **kwargs):
+                result = original(*args, **kwargs)
+                calls["value"] += 1
+                if calls["value"] != 2:
+                    return result
+                if target_name == "_parse_config_output":
+                    return "sha256:" + "f" * 64
+                if target_name == "_capture_object_topology":
+                    return replace(
+                        result,
+                        object_topology_digest="sha256:" + "f" * 64,
+                    )
+                return replace(
+                    result,
+                    repository_identity_key=(
+                        result.repository_identity_key[0],
+                        result.repository_identity_key[1] + 1,
+                        "directory",
+                    ),
+                )
+
+            materializer = TaskSnapshotMaterializer(policy)
+            with self.subTest(target_name=target_name), patch(
+                "scripts.live_eval.task_snapshot." + target_name,
+                side_effect=mutate_second_result,
+            ), patch(
+                "scripts.live_eval.task_snapshot.make_receipt"
+            ) as make_receipt, self.assertRaisesRegex(
+                TaskSnapshotError, "^task_source_changed$"
+            ):
+                materializer.capture(prepared)
+            make_receipt.assert_not_called()
+            self.assertEqual(calls["value"], 2)
+            self.assertEqual(materializer._state, "closed")
+            self.assertIsNone(materializer._captured)
+
+    def test_capture_deadline_covers_the_first_synchronous_seal(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+
+        with patch(
+            "scripts.live_eval.task_snapshot.time.monotonic",
+            side_effect=(0.0, 0.0, 61.0),
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_capture_timeout$"
+        ) as caught:
+            materializer.capture(prepared)
+
+        make_receipt.assert_not_called()
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(materializer._state, "closed")
+
+    def test_capture_deadline_covers_late_bounded_phases(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        targets = (
+            "_parse_task_tree",
+            "_load_task_blobs",
+            "_make_source_trust_receipt",
+            "_make_operational_seal",
+        )
+        for target_name in targets:
+            clock = {"now": 0.0}
+            original = getattr(task_snapshot_module, target_name)
+
+            def expire_after_phase(*args, **kwargs):
+                result = original(*args, **kwargs)
+                clock["now"] = 61.0
+                return result
+
+            materializer = TaskSnapshotMaterializer(policy)
+            with self.subTest(target_name=target_name), patch(
+                "scripts.live_eval.task_snapshot.time.monotonic",
+                side_effect=lambda: clock["now"],
+            ), patch(
+                "scripts.live_eval.task_snapshot." + target_name,
+                side_effect=expire_after_phase,
+            ), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_capture_timeout$"
+            ):
+                materializer.capture(prepared)
+            self.assertEqual(materializer._state, "closed")
+            self.assertIsNone(materializer._captured)
+            self.assertIsNone(materializer._operational_seal)
+
+    def test_capture_receipt_factory_failure_is_sanitized_and_closes(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+
+        with patch(
+            "scripts.live_eval.task_snapshot.make_receipt",
+            side_effect=RuntimeError("private receipt detail"),
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ) as caught:
+            materializer.capture(prepared)
+
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    def test_capture_rejects_wrong_policy_before_source_access(self):
+        unused_repo, unused_policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(
+            TaskSnapshotPolicy(max_files=9999)
+        )
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem"
+        ) as capture_filesystem, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_changed$"
+        ):
+            materializer.capture(prepared)
+
+        capture_filesystem.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+
+    def test_capture_uses_a_detached_transaction_policy(self):
+        repo, oid = self.make_repository()
+        policy = TaskSnapshotPolicy(max_tree_entries=1)
+        prepared = prepare_task_source(
+            self.source_for(repo, oid),
+            policy,
+        )
+        materializer = TaskSnapshotMaterializer(policy)
+        original_filesystem = task_snapshot_module._capture_filesystem
+        mutated = {"value": False}
+
+        def mutate_live_policy(*args, **kwargs):
+            result = original_filesystem(*args, **kwargs)
+            if not mutated["value"]:
+                object.__setattr__(
+                    materializer._policy,
+                    "max_tree_entries",
+                    2,
+                )
+                mutated["value"] = True
+            return result
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=mutate_live_policy,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_limit$"
+        ):
+            materializer.capture(prepared)
+
+        self.assertTrue(mutated["value"])
+        self.assertEqual(prepared.policy.max_tree_entries, 1)
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+
+    def test_capture_rejects_live_policy_drift_before_receipt(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        original_filesystem = task_snapshot_module._capture_filesystem
+        mutated = {"value": False}
+
+        def mutate_nonbinding_cap(*args, **kwargs):
+            result = original_filesystem(*args, **kwargs)
+            if not mutated["value"]:
+                object.__setattr__(
+                    materializer._policy,
+                    "max_files",
+                    policy.max_files - 1,
+                )
+                mutated["value"] = True
+            return result
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=mutate_nonbinding_cap,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_changed$"
+        ):
+            materializer.capture(prepared)
+
+        make_receipt.assert_not_called()
+        self.assertTrue(mutated["value"])
+        self.assertEqual(materializer._state, "closed")
+
+    def test_capture_interrupt_closes_and_releases_transaction_state(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=KeyboardInterrupt("sentinel"),
+        ), self.assertRaises(KeyboardInterrupt):
+            materializer.capture(prepared)
+
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._operational_seal)
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            materializer.capture(prepared)
+
+    def test_capture_lifecycle_retains_exact_object_and_physical_keys(self):
+        repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+        sealed_path = materializer._operational_seal.entries[0].path
+        sealed_receipt_digest = (
+            materializer._operational_seal.source_trust_receipt.receipt_digest
+        )
+
+        self.assertIs(materializer._captured, captured)
+        self.assertEqual(materializer._state, "captured")
+        self.assertEqual(materializer._source_root, repo)
+        self.assertEqual(materializer._git_dir, repo / ".git")
+        expected_keys = {
+            (
+                os.lstat(path).st_dev,
+                os.lstat(path).st_ino,
+                "directory",
+            )
+            for path in (repo, repo / ".git")
+        }
+        self.assertEqual(set(materializer._protected_identity_keys), expected_keys)
+        object.__setattr__(captured.entries[0], "path", "coherent-mutation")
+        object.__setattr__(
+            captured.source_trust_receipt,
+            "receipt_digest",
+            "sha256:" + "f" * 64,
+        )
+        self.assertEqual(
+            materializer._operational_seal.entries[0].path,
+            sealed_path,
+        )
+        self.assertEqual(
+            materializer._operational_seal.source_trust_receipt.receipt_digest,
+            sealed_receipt_digest,
+        )
+
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            materializer.capture(prepared)
+        self.assertIs(materializer._captured, captured)
+        self.assertEqual(materializer._state, "captured")
+
+        materializer.close()
+        materializer.close()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+        self.assertIsNone(materializer._source_root)
+        self.assertIsNone(materializer._git_dir)
+        self.assertEqual(materializer._protected_identity_keys, ())
+        self.assertIsNone(materializer._operational_seal)
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            materializer.capture(prepared)
+
+    def test_capture_preserves_descriptor_observed_identity_keys(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        original_filesystem = task_snapshot_module._capture_filesystem
+        protected_keys = (
+            (111, 222, "directory"),
+            (333, 444, "directory"),
+        )
+
+        def sentinel_filesystem(*args, **kwargs):
+            observed = original_filesystem(*args, **kwargs)
+            return replace(
+                observed,
+                repository_identity_key=protected_keys[0],
+                git_dir_identity_key=protected_keys[1],
+            )
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=sentinel_filesystem,
+        ):
+            materializer.capture(prepared)
+
+        self.assertEqual(
+            materializer._protected_identity_keys,
+            protected_keys,
+        )
+        self.assertEqual(
+            materializer._operational_seal.protected_identity_keys,
+            protected_keys,
+        )
+        materializer.close()
+
+    def test_concurrent_capture_preserves_the_single_success(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        original_filesystem = task_snapshot_module._capture_filesystem
+        entered = threading.Event()
+        release = threading.Event()
+        first_call = {"value": True}
+        results = []
+
+        def blocked_first_filesystem(*args, **kwargs):
+            if first_call["value"]:
+                first_call["value"] = False
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("capture release timed out")
+            return original_filesystem(*args, **kwargs)
+
+        def invoke_capture():
+            try:
+                results.append(("success", materializer.capture(prepared)))
+            except BaseException as error:
+                results.append(("error", error))
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=blocked_first_filesystem,
+        ):
+            first = threading.Thread(target=invoke_capture)
+            second = threading.Thread(target=invoke_capture)
+            first.start()
+            self.assertTrue(entered.wait(timeout=5))
+            second.start()
+            release.set()
+            first.join(timeout=10)
+            second.join(timeout=10)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        successes = [value for status, value in results if status == "success"]
+        errors = [value for status, value in results if status == "error"]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIs(type(errors[0]), TaskSnapshotError)
+        self.assertEqual(str(errors[0]), "task_snapshot_receipt_invalid")
+        self.assertIs(materializer._captured, successes[0])
+        self.assertIsNotNone(materializer._operational_seal)
+        self.assertEqual(materializer._state, "captured")
+        materializer.close()
+
+    def test_captured_objects_reconstruct_and_reject_forged_receipts(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+        forged_receipt = replace(
+            captured.source_trust_receipt,
+            canonical_bytes=b"forged",
+        )
+        values = dict(vars(captured))
+        values["source_trust_receipt"] = forged_receipt
+
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ) as caught:
+            CapturedTaskObjects(**values)
+
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        materializer.close()
+
+    def test_captured_receipt_payload_snapshot_is_schema_bounded(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+
+        class FloodMapping(ABCMapping):
+            def __init__(self, payload):
+                self.reads = 0
+                self.payload = payload
+                self.keys = tuple(payload)
+
+            def __getitem__(self, key):
+                return self.payload.get(key, "x")
+
+            def __iter__(self):
+                while True:
+                    self.reads += 1
+                    if self.reads > 13:
+                        raise AssertionError(
+                            "receipt payload read exceeded schema plus one"
+                        )
+                    if self.reads <= len(self.keys):
+                        yield self.keys[self.reads - 1]
+                    else:
+                        yield "extra"
+
+            def __len__(self):
+                return 1000
+
+        flood = FloodMapping(dict(captured.source_trust_receipt.payload))
+        forged_receipt = replace(captured.source_trust_receipt)
+        object.__setattr__(
+            forged_receipt,
+            "payload",
+            MappingProxyType(flood),
+        )
+        captured_values = dict(vars(captured))
+        captured_values["source_trust_receipt"] = forged_receipt
+
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            CapturedTaskObjects(**captured_values)
+
+        self.assertEqual(flood.reads, 13)
+        materializer.close()
+
+    def test_captured_receipt_rejects_giant_key_before_factory(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+
+        class GiantKeyMapping(ABCMapping):
+            def __init__(self):
+                self.reads = 0
+                self.key = "x" * 100000
+
+            def __getitem__(self, key):
+                return "x"
+
+            def __iter__(self):
+                self.reads += 1
+                yield self.key
+                raise AssertionError("giant receipt key was not rejected")
+
+            def __len__(self):
+                return 1
+
+        giant = GiantKeyMapping()
+        forged_receipt = replace(captured.source_trust_receipt)
+        object.__setattr__(
+            forged_receipt,
+            "payload",
+            MappingProxyType(giant),
+        )
+        captured_values = dict(vars(captured))
+        captured_values["source_trust_receipt"] = forged_receipt
+
+        with patch(
+            "scripts.live_eval.task_snapshot.make_receipt",
+            side_effect=AssertionError(
+                "invalid receipt key reached canonicalization"
+            ),
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            CapturedTaskObjects(**captured_values)
+
+        make_receipt.assert_not_called()
+        self.assertEqual(giant.reads, 1)
+        materializer.close()
+
+    def test_captured_objects_reject_nested_extra_fields(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+
+        forged_source = replace(captured.source)
+        object.__setattr__(forged_source, "unexpected_field", "x")
+        forged_policy = replace(captured.policy)
+        object.__setattr__(forged_policy, "unexpected_field", "x")
+        forged_entry = replace(captured.entries[0])
+        object.__setattr__(forged_entry, "unexpected_field", "x")
+        attacks = (
+            ("source", forged_source),
+            ("policy", forged_policy),
+            ("entries", (forged_entry,)),
+        )
+        for field_name, value in attacks:
+            captured_values = dict(vars(captured))
+            captured_values[field_name] = value
+            with self.subTest(field_name=field_name), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+            ):
+                CapturedTaskObjects(**captured_values)
+        materializer.close()
+
+    def test_captured_receipt_inventory_respects_source_policy_caps(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+        attacks = (
+            ("inventory_file_count", policy.max_files + 1),
+            (
+                "inventory_total_bytes",
+                policy.max_object_store_bytes + 1,
+            ),
+            (
+                "source_identity_before_digest",
+                "sha256:" + "a" * 100000,
+            ),
+        )
+        for field_name, value in attacks:
+            payload = dict(captured.source_trust_receipt.payload)
+            payload[field_name] = value
+            forged_receipt = replace(captured.source_trust_receipt)
+            object.__setattr__(
+                forged_receipt,
+                "payload",
+                MappingProxyType(payload),
+            )
+            captured_values = dict(vars(captured))
+            captured_values["source_trust_receipt"] = forged_receipt
+            with self.subTest(field_name=field_name), patch(
+                "scripts.live_eval.task_snapshot.make_receipt",
+                side_effect=AssertionError(
+                    "invalid payload reached receipt canonicalization"
+                ),
+            ) as make_receipt, self.assertRaisesRegex(
+                TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+            ):
+                CapturedTaskObjects(**captured_values)
+            make_receipt.assert_not_called()
+        materializer.close()
+
+    def test_captured_blob_mapping_snapshot_is_policy_bounded(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+
+        class FloodMapping(ABCMapping):
+            def __init__(self):
+                self.reads = 0
+
+            def __getitem__(self, key):
+                return b""
+
+            def __iter__(self):
+                while True:
+                    self.reads += 1
+                    if self.reads > 3:
+                        raise AssertionError("mapping read exceeded cap plus one")
+                    yield "{:040x}".format(self.reads)
+
+            def __len__(self):
+                return 4
+
+        flood = FloodMapping()
+        captured_values = dict(vars(captured))
+        captured_values["policy"] = replace(
+            captured.policy,
+            max_unique_blobs=2,
+        )
+        captured_values["blobs"] = flood
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            CapturedTaskObjects(**captured_values)
+        self.assertEqual(flood.reads, 3)
+        materializer.close()
+
+    def test_captured_blob_oid_is_validated_before_sorting(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+        captured_values = dict(vars(captured))
+        captured_values["blobs"] = {"a" * 100000: b""}
+
+        with patch(
+            "builtins.sorted",
+            side_effect=AssertionError("invalid OID reached sorting"),
+        ) as sorted_values, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            CapturedTaskObjects(**captured_values)
+
+        sorted_values.assert_not_called()
+        materializer.close()
+
+    def test_low_level_capture_revalidation_applies_caps_before_expansion(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        materializer = TaskSnapshotMaterializer(policy)
+        captured = materializer.capture(prepared)
+        original_entries = captured.entries
+        original_blobs = captured.blobs
+
+        object.__setattr__(
+            captured,
+            "entries",
+            (captured.entries[0],) * (policy.max_files + 1),
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot._TaskTreeRecord",
+            side_effect=AssertionError("over-cap entries were expanded"),
+        ) as record_type, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            task_snapshot_module._validate_captured_objects(captured)
+        record_type.assert_not_called()
+        object.__setattr__(captured, "entries", original_entries)
+
+        class FloodMapping(ABCMapping):
+            def __init__(self):
+                self.reads = 0
+
+            def __getitem__(self, key):
+                return b""
+
+            def __iter__(self):
+                while True:
+                    self.reads += 1
+                    if self.reads > policy.max_unique_blobs + 1:
+                        raise AssertionError("blob mapping exceeded cap plus one")
+                    yield "{:040x}".format(self.reads)
+
+            def __len__(self):
+                return 50000
+
+        flood = FloodMapping()
+        object.__setattr__(
+            captured,
+            "blobs",
+            MappingProxyType(flood),
+        )
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_snapshot_receipt_invalid$"
+        ):
+            task_snapshot_module._validate_captured_objects(captured)
+        self.assertEqual(flood.reads, policy.max_unique_blobs + 1)
+        object.__setattr__(captured, "blobs", original_blobs)
+        materializer.close()
+
+    def test_capture_detects_prepared_mutation_after_detaching_it(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        original_commit_oid = prepared.source.commit_oid
+        original_filesystem = task_snapshot_module._capture_filesystem
+        mutated = {"value": False}
+
+        def mutate_caller_after_detach(*args, **kwargs):
+            result = original_filesystem(*args, **kwargs)
+            if not mutated["value"]:
+                object.__setattr__(
+                    prepared.source,
+                    "commit_oid",
+                    "f" * len(original_commit_oid),
+                )
+                mutated["value"] = True
+            return result
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_filesystem",
+            side_effect=mutate_caller_after_detach,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_changed$"
+        ):
+            materializer = TaskSnapshotMaterializer(policy)
+            materializer.capture(prepared)
+
+        make_receipt.assert_not_called()
+        self.assertEqual(materializer._state, "closed")
+        self.assertIsNone(materializer._captured)
+
+    def test_capture_rejects_peeled_commit_and_malformed_tree_output(self):
+        repo, oid = self.make_repository()
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Task Snapshot",
+                "-c",
+                "user.email=snapshot@example.invalid",
+                "tag",
+                "-a",
+                "snapshot-tag",
+                "-m",
+                "snapshot tag",
+            ),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        tag_oid = subprocess.run(
+            ("git", "rev-parse", "snapshot-tag"),
+            cwd=str(repo),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+        policy = TaskSnapshotPolicy()
+        tagged = prepare_task_source(
+            self.source_for(repo, tag_oid),
+            policy,
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_changed$"
+        ):
+            TaskSnapshotMaterializer(policy).capture(tagged)
+        make_receipt.assert_not_called()
+
+        normal = prepare_task_source(self.source_for(repo, oid), policy)
+        original_git = task_snapshot_module._run_git
+
+        def malformed_tree(
+            git_dir,
+            config_path,
+            active_policy,
+            operation,
+            value=None,
+            **kwargs
+        ):
+            if operation == "verify-tree":
+                return b"a" * 40 + b" \n"
+            return original_git(
+                git_dir,
+                config_path,
+                active_policy,
+                operation,
+                value,
+                **kwargs
+            )
+
+        with patch(
+            "scripts.live_eval.task_snapshot._run_git",
+            side_effect=malformed_tree,
+        ), patch(
+            "scripts.live_eval.task_snapshot.make_receipt"
+        ) as make_receipt, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_tree_invalid$"
+        ):
+            TaskSnapshotMaterializer(policy).capture(normal)
+        make_receipt.assert_not_called()
+
+    def test_capture_retains_storage_format_failure_classification(self):
+        unused_repo, policy, prepared = self.prepared_source()
+        original_git = task_snapshot_module._run_git
+        attacks = (
+            (b"sha1 \n", "task_git_failed"),
+            (b"sha256\n", "task_source_config_invalid"),
+        )
+        for storage_output, expected in attacks:
+            def replace_storage(
+                git_dir,
+                config_path,
+                active_policy,
+                operation,
+                value=None,
+                **kwargs
+            ):
+                if operation == "storage-format":
+                    return storage_output
+                return original_git(
+                    git_dir,
+                    config_path,
+                    active_policy,
+                    operation,
+                    value,
+                    **kwargs
+                )
+
+            with self.subTest(expected=expected), patch(
+                "scripts.live_eval.task_snapshot._run_git",
+                side_effect=replace_storage,
+            ), patch(
+                "scripts.live_eval.task_snapshot.make_receipt"
+            ) as make_receipt, self.assertRaisesRegex(
+                TaskSnapshotError, "^" + expected + "$"
+            ):
+                TaskSnapshotMaterializer(policy).capture(prepared)
+            make_receipt.assert_not_called()
+
+
 class TaskSnapshotPreparationTests(RepositoryFixture, unittest.TestCase):
     def test_prepares_immutable_path_private_source_without_receipt(self):
         for object_format in ("sha1", "sha256"):
             with self.subTest(object_format=object_format):
                 repo, oid = self.make_repository(object_format)
-                prepared = prepare_task_source(
-                    self.source_for(repo, oid), TaskSnapshotPolicy()
-                )
+                with patch(
+                    "scripts.live_eval.task_snapshot.make_receipt"
+                ) as make_receipt:
+                    prepared = prepare_task_source(
+                        self.source_for(repo, oid), TaskSnapshotPolicy()
+                    )
+                make_receipt.assert_not_called()
 
                 self.assertIs(type(prepared), PreparedTaskSource)
                 self.assertEqual(prepared.git_dir, repo / ".git")
@@ -2481,10 +3649,17 @@ class TaskSnapshotPreparationTests(RepositoryFixture, unittest.TestCase):
                 self.assertIs(
                     type(prepared.object_topology), ObjectTopologySeal
                 )
-        self.assertNotIn(
-            "experiment_receipt",
-            Path(task_snapshot_module.__file__).read_text(encoding="utf-8"),
+        module_text = Path(task_snapshot_module.__file__).read_text(
+            encoding="utf-8"
         )
+        self.assertIn(
+            "from scripts.live_eval.experiment_receipts import (\n"
+            "    CanonicalReceipt,\n"
+            "    make_receipt,\n"
+            ")",
+            module_text,
+        )
+        self.assertNotIn("_validate_canonical_receipt", module_text)
 
     def test_preparation_uses_only_config_storage_config_order(self):
         repo, oid = self.make_repository()

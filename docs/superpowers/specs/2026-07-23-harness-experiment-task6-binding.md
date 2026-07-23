@@ -554,8 +554,11 @@ before the first Git subprocess.
 
 The root record `.` has depth zero and is included in
 `max_object_entries`. The cap counts every directory and file record.
-`file_count` counts files only, and `total_bytes` sums file sizes only. All
-caps are inclusive; cap plus one fails.
+`file_count` counts files only and is at most `max_files`; `total_bytes`
+sums file sizes only and is at most `max_object_store_bytes`. Thus
+`entry_count <= max_object_entries`, `file_count <= max_files`, and
+`total_bytes <= max_object_store_bytes` are independent inclusive caps; cap
+plus one fails.
 
 Each component is NFC, within `max_component_bytes` UTF-8 bytes, and unique
 under exact, NFC, and casefold keys in its directory. Each relative path is

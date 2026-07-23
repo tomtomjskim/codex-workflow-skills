@@ -1907,6 +1907,15 @@ release captured/snapshot references before processing the next task. The pair
 operation already performs independent full verification of both roots, so
 Task 8 does not immediately duplicate `verify()` calls.
 
+Retain both the exact returned capture instance and a private detached
+operational seal of its complete validated entries, OID-sorted blob bytes,
+receipt projection, aggregates, and protected source identities.
+`materialize_pair()` rejects a coherent in-place mutation of the public
+capture even when object identity is unchanged, and consumes only the sealed
+values after validation. Clear both authorities after pair success, rollback,
+or `close()`; the seal is never serialized and does not establish durable
+provenance.
+
 ### Step 5: Enforce first-pilot repository exclusions
 
 - [ ] Reject only the binding's exact enumerated path/basename denylist. Do

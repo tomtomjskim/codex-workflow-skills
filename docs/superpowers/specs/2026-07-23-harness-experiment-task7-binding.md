@@ -184,6 +184,17 @@ Semantic recomputation alone cannot distinguish a caller-constructed,
 internally consistent capture from one returned by Git capture. The
 materializer therefore retains one strong reference to the exact
 `CapturedTaskObjects` instance returned by its successful `capture()`.
+Exact object identity alone also cannot detect a coherent in-place mutation
+performed with Python's low-level `object.__setattr__`. At successful capture,
+the materializer therefore retains one private detached operational seal
+containing the complete validated scalar, entry, OID-sorted blob-byte,
+receipt-projection, and protected-source-identity values. `materialize_pair()`
+requires both exact public object identity and exact equality with this seal
+before any target mutation, then uses only the detached seal as its byte and
+metadata authority and never rereads the caller-owned public capture. This
+seal is process-local mutation defense, is never serialized or exposed,
+confers no durable provenance, and is cleared after pair success, rollback,
+or `close()`.
 Its complete lifecycle is:
 
 ```text
@@ -201,7 +212,9 @@ the complete semantic and receipt revalidation above. A different, copied,
 serialized, or merely equal object is `task_snapshot_receipt_invalid`.
 The retained reference is consumed and cleared after pair success or rollback.
 A failed capture or pair closes the materializer after its required cleanup.
-A wrong-state call fails without authorizing another transition.
+A wrong-state or closed-state call fails as
+`task_snapshot_receipt_invalid` without authorizing another transition or
+closing a valid capture retained by another serialized call.
 
 `close()` is public, exact, path-free, and idempotent. From every state it
 closes any currently owned top-level descriptor, clears the captured strong
@@ -219,7 +232,9 @@ future Phase B launcher, but Task 8 does not call it immediately after
 `materialize_pair()` because that operation already performs two independent
 full verifications. Task 8 closes the materializer after extracting path-free
 content evidence. There is no capture fingerprint, snapshot registry, one-shot
-verification token, or durable in-process provenance claim.
+verification token, or durable in-process provenance claim. In particular,
+the private operational seal is not a digest-only substitute for exact object
+identity and cannot be used after its owning materializer is closed.
 
 ## 3. Amended Git process policy
 
@@ -348,6 +363,8 @@ an annotated-tag OID that peels to a commit. Tree-resolution stdout is exactly
 one full lowercase OID of the selected format followed by one LF and no other
 byte. Storage-format stdout retains the exact Task 6 grammar. No output is
 trimmed, decoded with replacement, or accepted with extra whitespace.
+An exact commit-output mismatch is `task_source_changed`; malformed
+tree-resolution output is `task_tree_invalid`.
 
 The capture deadline is established with `time.monotonic()` immediately
 before F0 and expires after `capture_timeout_seconds`. It covers source seals,
@@ -637,6 +654,11 @@ git_process_policy_digest     = amended P
 inventory_file_count          = O0.file_count
 inventory_total_bytes         = O0.total_bytes
 ```
+
+Public reconstruction validates these topology aggregates against the same
+Task 6 policy caps before receipt canonicalization:
+`inventory_file_count <= max_files` and
+`inventory_total_bytes <= max_object_store_bytes`.
 
 The pair's sole snapshot receipt uses the unchanged Task 4 payload:
 
@@ -1152,9 +1174,11 @@ Use table-driven tests for:
   cleanup; peak open descriptors no greater than `max_tree_depth + 8`; and no
   double close. Do not freeze every syscall position as a test contract;
 - simple `new -> captured -> paired -> closed` transitions, exact captured
-  object identity, full semantic mutation detection, repeatable stateless
-  `verify()`, no immediate Task 8 duplicate verification, idempotent close
-  from every state, and strong-reference release;
+  object identity, coherent in-place mutation and validation-to-use race
+  detection through the private detached operational seal, full semantic
+  mutation detection, repeatable stateless `verify()`, no immediate Task 8
+  duplicate verification, idempotent close from every state, and
+  strong-reference/seal release;
 - allowed-write existing-file, missing-leaf, empty-list, directory,
   missing-intermediate, exclusion, alias, pair-equality, reverse digest/task
   uniqueness, digest mutation, authoritative relative paths retained once in

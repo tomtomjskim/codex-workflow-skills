@@ -17,6 +17,10 @@ from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 import unicodedata
 
+from scripts.live_eval.experiment_receipts import (
+    CanonicalReceipt,
+    make_receipt,
+)
 from scripts.workflow_coordination.canonical_json import canonical_bytes
 
 
@@ -47,6 +51,42 @@ _POLICY_CEILINGS = {
     "max_file_bytes": 4 * 1024 * 1024,
     "max_total_bytes": 64 * 1024 * 1024,
 }
+_TASK_SOURCE_TRUST_RECEIPT_KEYS = frozenset(
+    {
+        "task_id",
+        "provisioning_class",
+        "operator_attested",
+        "local_clone_policy",
+        "object_format",
+        "source_identity_before_digest",
+        "object_topology_before_digest",
+        "source_identity_after_digest",
+        "object_topology_after_digest",
+        "git_process_policy_digest",
+        "inventory_file_count",
+        "inventory_total_bytes",
+    }
+)
+_TASK_SNAPSHOT_RECEIPT_KEYS = frozenset(
+    {
+        "task_id",
+        "object_format",
+        "commit_oid",
+        "tree_oid",
+        "entry_digest",
+        "materialized_tree_digest",
+        "materializer_policy_version",
+        "file_count",
+        "total_bytes",
+        "source_trust_receipt_digest",
+    }
+)
+_TASK_RECEIPT_PAYLOAD_KEYS = MappingProxyType(
+    {
+        "task_source_trust": _TASK_SOURCE_TRUST_RECEIPT_KEYS,
+        "task_snapshot": _TASK_SNAPSHOT_RECEIPT_KEYS,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -109,6 +149,26 @@ class TaskTreeEntry:
 
 
 @dataclass(frozen=True)
+class CapturedTaskObjects:
+    source_trust_receipt: CanonicalReceipt
+    source: TaskSourceSpec = field(repr=False)
+    policy: TaskSnapshotPolicy = field(repr=False)
+    object_format: str
+    commit_oid: str
+    tree_oid: str
+    entry_digest: str
+    entries: Tuple[TaskTreeEntry, ...] = field(repr=False)
+    blobs: Mapping[str, bytes] = field(repr=False)
+    file_count: int
+    total_bytes: int
+    unique_blob_count: int
+    unique_blob_bytes: int
+
+    def __post_init__(self) -> None:
+        _detach_and_validate_captured_objects(self)
+
+
+@dataclass(frozen=True)
 class ObjectTopologySeal:
     object_topology_digest: str
     entry_count: int
@@ -147,6 +207,8 @@ class _FilesystemSeal:
     raw_config_digest: str
     git_dir: Path = field(repr=False)
     config_path: Path = field(repr=False)
+    repository_identity_key: Tuple[int, int, str]
+    git_dir_identity_key: Tuple[int, int, str]
 
 
 @dataclass(frozen=True)
@@ -171,6 +233,24 @@ class _ParsedTaskTree:
     unique_blob_bytes: int
 
 
+@dataclass(frozen=True)
+class _CapturedOperationalSeal:
+    source_trust_receipt: CanonicalReceipt
+    source: TaskSourceSpec = field(repr=False)
+    policy: TaskSnapshotPolicy = field(repr=False)
+    object_format: str
+    commit_oid: str
+    tree_oid: str
+    entry_digest: str
+    entries: Tuple[TaskTreeEntry, ...] = field(repr=False)
+    blobs: Mapping[str, bytes] = field(repr=False)
+    file_count: int
+    total_bytes: int
+    unique_blob_count: int
+    unique_blob_bytes: int
+    protected_identity_keys: Tuple[Tuple[int, int, str], ...]
+
+
 def _fail(code: str) -> None:
     try:
         raise TaskSnapshotError(code) from None
@@ -181,9 +261,12 @@ def _fail(code: str) -> None:
 
 
 def _exact_fields(value: object, expected_type: type) -> bool:
-    return (
-        type(value) is expected_type
-        and set(vars(value)) == {item.name for item in fields(expected_type)}
+    if type(value) is not expected_type:
+        return False
+    actual = vars(value)
+    expected = fields(expected_type)
+    return len(actual) == len(expected) and all(
+        item.name in actual for item in expected
     )
 
 
@@ -266,12 +349,12 @@ def _task_path_components(
 ) -> Tuple[str, ...]:
     if type(path) is not str:
         _fail("task_tree_invalid")
-    try:
-        encoded = path.encode("utf-8")
-    except UnicodeError:
-        _fail("task_tree_invalid")
+    if len(path) > policy.max_relative_path_bytes:
+        _fail("task_tree_limit")
+    encoded = _encode_task_path(path)
     if len(encoded) > policy.max_relative_path_bytes:
         _fail("task_tree_limit")
+    encoded_components = encoded.split(b"/")
     if (
         not path
         or path.startswith("/")
@@ -294,14 +377,21 @@ def _task_path_components(
     ):
         _fail("task_tree_invalid")
     if (
-        len(components) > policy.max_tree_depth
+        len(encoded_components) > policy.max_tree_depth
         or any(
-            len(component.encode("utf-8")) > policy.max_component_bytes
-            for component in components
+            len(component) > policy.max_component_bytes
+            for component in encoded_components
         )
     ):
         _fail("task_tree_limit")
     return components
+
+
+def _encode_task_path(path: str) -> bytes:
+    try:
+        return path.encode("utf-8")
+    except UnicodeError:
+        _fail("task_tree_invalid")
 
 
 def _task_name_key(value: str) -> str:
@@ -471,77 +561,44 @@ def _validate_parsed_task_tree(
             _fail("task_blob_limit")
 
 
-def _parse_task_tree(
-    output: bytes,
+def _build_parsed_task_tree(
+    records: Tuple[_TaskTreeRecord, ...],
     object_format: str,
     policy: TaskSnapshotPolicy,
 ) -> _ParsedTaskTree:
     _validate_policy(policy)
     if (
-        type(output) is not bytes
+        type(records) is not tuple
         or type(object_format) is not str
         or object_format not in ("sha1", "sha256")
     ):
         _fail("task_tree_invalid")
-    if output == b"":
-        parsed = _ParsedTaskTree(
-            object_format=object_format,
-            records=(),
-            directories=(".",),
-            blob_sizes=(),
-            file_count=0,
-            directory_count=1,
-            tree_entry_count=1,
-            total_bytes=0,
-            unique_blob_count=0,
-            unique_blob_bytes=0,
-        )
-        _validate_parsed_task_tree(parsed, policy)
-        return parsed
-    if not output.endswith(b"\0"):
-        _fail("task_tree_invalid")
-    raw_records = output[:-1].split(b"\0", policy.max_files)
-    if (
-        len(raw_records) == policy.max_files + 1
-        and b"\0" in raw_records[-1]
-    ):
-        raw_records[-1] = raw_records[-1].split(b"\0", 1)[0]
-    if not raw_records or any(record == b"" for record in raw_records):
-        _fail("task_tree_invalid")
 
     oid_length = 40 if object_format == "sha1" else 64
-    records = []
     directories = {"."}
     files = set()
     sibling_aliases = {}
     blob_sizes = {}
     total_bytes = 0
     unique_blob_bytes = 0
-    for raw_record in raw_records:
-        fields_bytes = raw_record.split(b"\t", 4)
-        if len(fields_bytes) != 5 or any(
-            field == b"" for field in fields_bytes[:4]
-        ):
-            _fail("task_tree_invalid")
-        raw_path = fields_bytes[4]
-        _validate_raw_task_path_limits(raw_path, policy)
-        try:
-            git_mode, object_type, blob_oid = (
-                field.decode("ascii") for field in fields_bytes[:3]
-            )
-            path = raw_path.decode("utf-8", errors="strict")
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            _fail("task_tree_invalid")
+    for record in records:
         if (
-            git_mode not in ("100644", "100755")
-            or object_type != "blob"
-            or len(blob_oid) != oid_length
-            or _OID_PATTERN.fullmatch(blob_oid) is None
+            type(record) is not _TaskTreeRecord
+            or not _exact_fields(record, _TaskTreeRecord)
+            or type(record.path) is not str
+            or type(record.git_mode) is not str
+            or record.git_mode not in ("100644", "100755")
+            or type(record.blob_oid) is not str
+            or len(record.blob_oid) != oid_length
+            or _OID_PATTERN.fullmatch(record.blob_oid) is None
+            or type(record.size) is not int
+            or record.size < 0
         ):
             _fail("task_tree_invalid")
-        size = _parse_task_blob_size(fields_bytes[3], policy)
-        components = _task_path_components(path, policy)
+        components = _task_path_components(record.path, policy)
         _validate_task_path_exclusions(components)
+        if record.size > policy.max_file_bytes:
+            _fail("task_blob_limit")
 
         parent_components = []
         for index, component in enumerate(components):
@@ -575,27 +632,19 @@ def _parse_task_tree(
             if len(files) + len(directories) > policy.max_tree_entries:
                 _fail("task_tree_limit")
 
-        previous_size = blob_sizes.get(blob_oid)
-        if previous_size is not None and previous_size != size:
+        previous_size = blob_sizes.get(record.blob_oid)
+        if previous_size is not None and previous_size != record.size:
             _fail("task_tree_invalid")
         if previous_size is None:
-            blob_sizes[blob_oid] = size
-            unique_blob_bytes += size
+            blob_sizes[record.blob_oid] = record.size
+            unique_blob_bytes += record.size
             if len(blob_sizes) > policy.max_unique_blobs:
                 _fail("task_blob_limit")
             if unique_blob_bytes > policy.max_total_bytes:
                 _fail("task_blob_limit")
-        total_bytes += size
+        total_bytes += record.size
         if total_bytes > policy.max_total_bytes:
             _fail("task_blob_limit")
-        records.append(
-            _TaskTreeRecord(
-                path=path,
-                git_mode=git_mode,
-                blob_oid=blob_oid,
-                size=size,
-            )
-        )
 
     sorted_records = tuple(
         sorted(records, key=lambda item: item.path.encode("utf-8"))
@@ -625,6 +674,70 @@ def _parse_task_tree(
     return parsed
 
 
+def _parse_task_tree(
+    output: bytes,
+    object_format: str,
+    policy: TaskSnapshotPolicy,
+) -> _ParsedTaskTree:
+    _validate_policy(policy)
+    if (
+        type(output) is not bytes
+        or type(object_format) is not str
+        or object_format not in ("sha1", "sha256")
+    ):
+        _fail("task_tree_invalid")
+    if output == b"":
+        return _build_parsed_task_tree((), object_format, policy)
+    if not output.endswith(b"\0"):
+        _fail("task_tree_invalid")
+    raw_records = output[:-1].split(b"\0", policy.max_files)
+    if (
+        len(raw_records) == policy.max_files + 1
+        and b"\0" in raw_records[-1]
+    ):
+        raw_records[-1] = raw_records[-1].split(b"\0", 1)[0]
+    if not raw_records or any(record == b"" for record in raw_records):
+        _fail("task_tree_invalid")
+
+    oid_length = 40 if object_format == "sha1" else 64
+    records = []
+    for raw_record in raw_records:
+        fields_bytes = raw_record.split(b"\t", 4)
+        if len(fields_bytes) != 5 or any(
+            field == b"" for field in fields_bytes[:4]
+        ):
+            _fail("task_tree_invalid")
+        raw_path = fields_bytes[4]
+        _validate_raw_task_path_limits(raw_path, policy)
+        try:
+            git_mode, object_type, blob_oid = (
+                field.decode("ascii") for field in fields_bytes[:3]
+            )
+            path = raw_path.decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            _fail("task_tree_invalid")
+        if (
+            git_mode not in ("100644", "100755")
+            or object_type != "blob"
+            or len(blob_oid) != oid_length
+            or _OID_PATTERN.fullmatch(blob_oid) is None
+        ):
+            _fail("task_tree_invalid")
+        records.append(
+            _TaskTreeRecord(
+                path=path,
+                git_mode=git_mode,
+                blob_oid=blob_oid,
+                size=_parse_task_blob_size(fields_bytes[3], policy),
+            )
+        )
+    return _build_parsed_task_tree(
+        tuple(records),
+        object_format,
+        policy,
+    )
+
+
 def _load_task_blobs(
     git_dir: Path,
     config_path: Path,
@@ -638,6 +751,8 @@ def _load_task_blobs(
     content_digests = {}
     algorithm = hashlib.sha1 if parsed.object_format == "sha1" else hashlib.sha256
     for blob_oid, declared_size in parsed.blob_sizes:
+        if capture_deadline is not None:
+            _check_capture_deadline(capture_deadline)
         content = _run_git(
             git_dir,
             config_path,
@@ -661,6 +776,8 @@ def _load_task_blobs(
         content_digests[blob_oid] = (
             "sha256:" + hashlib.sha256(content).hexdigest()
         )
+        if capture_deadline is not None:
+            _check_capture_deadline(capture_deadline)
     entries = tuple(
         TaskTreeEntry(
             path=record.path,
@@ -754,6 +871,456 @@ def _task_entry_digest(
     )
 
 
+def _valid_digest(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 71
+        and _DIGEST_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _receipt_payload_snapshot(
+    value: object,
+    expected_keys: frozenset,
+) -> Dict[str, object]:
+    if type(value) is not MappingProxyType:
+        _fail("task_snapshot_receipt_invalid")
+    try:
+        iterator = iter(value.items())
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+    result = {}
+    max_key_length = max(len(key) for key in expected_keys)
+    for unused_index in range(len(expected_keys) + 1):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        except Exception:
+            _fail("task_snapshot_receipt_invalid")
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or len(item[0]) > max_key_length
+            or item[0] not in expected_keys
+            or item[0] in result
+            or (
+                item[1] is not None
+                and type(item[1]) not in (bool, int, str)
+            )
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        result[item[0]] = item[1]
+        if len(result) > len(expected_keys):
+            _fail("task_snapshot_receipt_invalid")
+    if frozenset(result) != expected_keys:
+        _fail("task_snapshot_receipt_invalid")
+    return result
+
+
+def _validate_receipt_payload_bounds(
+    payload: Mapping[str, object],
+    expected_type: str,
+    policy: TaskSnapshotPolicy,
+) -> None:
+    if expected_type == "task_source_trust":
+        digest_names = (
+            "source_identity_before_digest",
+            "object_topology_before_digest",
+            "source_identity_after_digest",
+            "object_topology_after_digest",
+            "git_process_policy_digest",
+        )
+        if (
+            type(payload["task_id"]) is not str
+            or len(payload["task_id"]) > 64
+            or _TASK_ID_PATTERN.fullmatch(payload["task_id"]) is None
+            or payload["provisioning_class"]
+            != "operator_owned_trusted_git_local_clone"
+            or type(payload["provisioning_class"]) is not str
+            or payload["operator_attested"] is not True
+            or type(payload["operator_attested"]) is not bool
+            or payload["local_clone_policy"]
+            != "remote_or_no_local_or_no_hardlinks"
+            or type(payload["local_clone_policy"]) is not str
+            or type(payload["object_format"]) is not str
+            or payload["object_format"] not in ("sha1", "sha256")
+            or any(
+                not _valid_digest(payload[name])
+                for name in digest_names
+            )
+            or payload["source_identity_before_digest"]
+            != payload["source_identity_after_digest"]
+            or payload["object_topology_before_digest"]
+            != payload["object_topology_after_digest"]
+            or type(payload["inventory_file_count"]) is not int
+            or payload["inventory_file_count"] < 0
+            or payload["inventory_file_count"]
+            > policy.max_files
+            or type(payload["inventory_total_bytes"]) is not int
+            or payload["inventory_total_bytes"] < 0
+            or payload["inventory_total_bytes"]
+            > policy.max_object_store_bytes
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        return
+    if expected_type == "task_snapshot":
+        object_format = payload["object_format"]
+        oid_length = 40 if object_format == "sha1" else 64
+        if (
+            type(payload["task_id"]) is not str
+            or len(payload["task_id"]) > 64
+            or _TASK_ID_PATTERN.fullmatch(payload["task_id"]) is None
+            or type(object_format) is not str
+            or object_format not in ("sha1", "sha256")
+            or any(
+                type(payload[name]) is not str
+                or len(payload[name]) != oid_length
+                or _OID_PATTERN.fullmatch(payload[name]) is None
+                for name in ("commit_oid", "tree_oid")
+            )
+            or any(
+                not _valid_digest(payload[name])
+                for name in (
+                    "entry_digest",
+                    "materialized_tree_digest",
+                    "source_trust_receipt_digest",
+                )
+            )
+            or type(payload["materializer_policy_version"]) is not str
+            or payload["materializer_policy_version"]
+            != "task-object-materializer-v1"
+            or type(payload["file_count"]) is not int
+            or payload["file_count"] < 0
+            or payload["file_count"] > policy.max_files
+            or type(payload["total_bytes"]) is not int
+            or payload["total_bytes"] < 0
+            or payload["total_bytes"] > policy.max_total_bytes
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        return
+    _fail("task_snapshot_receipt_invalid")
+
+
+def _reconstruct_receipt(
+    receipt: object,
+    expected_type: str,
+    policy: TaskSnapshotPolicy,
+) -> CanonicalReceipt:
+    try:
+        expected_keys = _TASK_RECEIPT_PAYLOAD_KEYS.get(expected_type)
+        if (
+            not _exact_fields(receipt, CanonicalReceipt)
+            or type(expected_type) is not str
+            or type(expected_keys) is not frozenset
+            or receipt.receipt_type != expected_type
+            or type(receipt.receipt_type) is not str
+            or not _valid_digest(receipt.input_digest)
+            or (
+                receipt.plan_digest is not None
+                and not _valid_digest(receipt.plan_digest)
+            )
+            or (
+                receipt.previous_record_hash is not None
+                and not _valid_digest(receipt.previous_record_hash)
+            )
+            or type(receipt.canonical_bytes) is not bytes
+            or not _valid_digest(receipt.receipt_digest)
+            or type(receipt.payload) is not MappingProxyType
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        payload = _receipt_payload_snapshot(receipt.payload, expected_keys)
+        _validate_receipt_payload_bounds(payload, expected_type, policy)
+        reconstructed = make_receipt(
+            receipt.receipt_type,
+            receipt.input_digest,
+            receipt.plan_digest,
+            receipt.previous_record_hash,
+            payload,
+        )
+        reconstructed_payload = _receipt_payload_snapshot(
+            reconstructed.payload,
+            expected_keys,
+        )
+        _validate_receipt_payload_bounds(
+            reconstructed_payload,
+            expected_type,
+            policy,
+        )
+        if (
+            not _exact_fields(reconstructed, CanonicalReceipt)
+            or reconstructed.receipt_type != receipt.receipt_type
+            or reconstructed.input_digest != receipt.input_digest
+            or reconstructed.plan_digest != receipt.plan_digest
+            or reconstructed.previous_record_hash
+            != receipt.previous_record_hash
+            or reconstructed.canonical_bytes != receipt.canonical_bytes
+            or reconstructed.receipt_digest != receipt.receipt_digest
+            or reconstructed_payload != payload
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        return reconstructed
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+
+
+def _captured_tree_from_entries(
+    captured: CapturedTaskObjects,
+) -> _ParsedTaskTree:
+    if (
+        type(captured.entries) is not tuple
+        or len(captured.entries) > captured.policy.max_files
+        or any(
+            not _exact_fields(entry, TaskTreeEntry)
+            for entry in captured.entries
+        )
+    ):
+        _fail("task_snapshot_receipt_invalid")
+    expected_records = tuple(
+        _TaskTreeRecord(
+            path=entry.path,
+            git_mode=entry.git_mode,
+            blob_oid=entry.blob_oid,
+            size=entry.size,
+        )
+        for entry in captured.entries
+    )
+    parsed = _build_parsed_task_tree(
+        expected_records,
+        captured.object_format,
+        captured.policy,
+    )
+    if parsed.records != expected_records:
+        _fail("task_snapshot_receipt_invalid")
+    return parsed
+
+
+def _validate_captured_objects(
+    captured: CapturedTaskObjects,
+) -> CanonicalReceipt:
+    if not _exact_fields(captured, CapturedTaskObjects):
+        _fail("task_snapshot_receipt_invalid")
+    _validate_source(captured.source)
+    _validate_policy(captured.policy)
+    if (
+        type(captured.entries) is not tuple
+        or len(captured.entries) > captured.policy.max_files
+    ):
+        _fail("task_snapshot_receipt_invalid")
+    receipt = _reconstruct_receipt(
+        captured.source_trust_receipt,
+        "task_source_trust",
+        captured.policy,
+    )
+    oid_length = 40 if captured.object_format == "sha1" else 64
+    if (
+        type(captured.object_format) is not str
+        or captured.object_format not in ("sha1", "sha256")
+        or type(captured.commit_oid) is not str
+        or len(captured.commit_oid) != oid_length
+        or _OID_PATTERN.fullmatch(captured.commit_oid) is None
+        or captured.commit_oid != captured.source.commit_oid
+        or type(captured.tree_oid) is not str
+        or len(captured.tree_oid) != oid_length
+        or _OID_PATTERN.fullmatch(captured.tree_oid) is None
+        or type(captured.entry_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(captured.entry_digest) is None
+        or type(captured.entries) is not tuple
+        or type(captured.blobs) is not MappingProxyType
+        or type(captured.file_count) is not int
+        or captured.file_count < 0
+        or type(captured.total_bytes) is not int
+        or captured.total_bytes < 0
+        or type(captured.unique_blob_count) is not int
+        or captured.unique_blob_count < 0
+        or type(captured.unique_blob_bytes) is not int
+        or captured.unique_blob_bytes < 0
+    ):
+        _fail("task_snapshot_receipt_invalid")
+    parsed = _captured_tree_from_entries(captured)
+    blob_snapshot = _snapshot_captured_blobs(
+        captured.blobs,
+        captured.policy,
+        captured.object_format,
+    )
+    blob_items = tuple(blob_snapshot.items())
+    if (
+        tuple(key for key, unused_value in blob_items)
+        != tuple(key for key, unused_size in parsed.blob_sizes)
+        or any(type(key) is not str for key, unused_value in blob_items)
+        or any(type(value) is not bytes for unused_key, value in blob_items)
+    ):
+        _fail("task_snapshot_receipt_invalid")
+    expected_sizes = dict(parsed.blob_sizes)
+    content_digests = {}
+    git_algorithm = (
+        hashlib.sha1
+        if captured.object_format == "sha1"
+        else hashlib.sha256
+    )
+    for blob_oid, content in blob_items:
+        if len(content) != expected_sizes[blob_oid]:
+            _fail("task_snapshot_receipt_invalid")
+        framed = (
+            b"blob "
+            + str(len(content)).encode("ascii")
+            + b"\0"
+            + content
+        )
+        if git_algorithm(framed).hexdigest() != blob_oid:
+            _fail("task_snapshot_receipt_invalid")
+        content_digests[blob_oid] = (
+            "sha256:" + hashlib.sha256(content).hexdigest()
+        )
+    if any(
+        entry.content_digest != content_digests.get(entry.blob_oid)
+        for entry in captured.entries
+    ):
+        _fail("task_snapshot_receipt_invalid")
+    if (
+        captured.file_count != parsed.file_count
+        or captured.total_bytes != parsed.total_bytes
+        or captured.unique_blob_count != parsed.unique_blob_count
+        or captured.unique_blob_bytes != parsed.unique_blob_bytes
+        or captured.entry_digest
+        != _task_entry_digest(
+            captured.commit_oid,
+            captured.tree_oid,
+            parsed,
+            captured.entries,
+        )
+    ):
+        _fail("task_snapshot_receipt_invalid")
+    payload = receipt.payload
+    expected_payload = {
+        "git_process_policy_digest": _process_policy_digest(captured.policy),
+        "local_clone_policy": captured.source.local_clone_policy,
+        "object_format": captured.object_format,
+        "operator_attested": captured.source.operator_attested,
+        "provisioning_class": captured.source.provisioning_class,
+        "task_id": captured.source.task_id,
+    }
+    if (
+        receipt.input_digest != captured.source.input_digest
+        or receipt.plan_digest is not None
+        or receipt.previous_record_hash is not None
+        or any(
+            payload.get(key) != value
+            for key, value in expected_payload.items()
+        )
+        or payload["inventory_file_count"]
+        > captured.policy.max_files
+        or payload["inventory_total_bytes"]
+        > captured.policy.max_object_store_bytes
+    ):
+        _fail("task_snapshot_receipt_invalid")
+    return receipt
+
+
+def _snapshot_captured_blobs(
+    value: object,
+    policy: TaskSnapshotPolicy,
+    object_format: str,
+) -> Mapping[str, bytes]:
+    if not isinstance(value, Mapping):
+        _fail("task_snapshot_receipt_invalid")
+    oid_length = 40 if object_format == "sha1" else 64
+    try:
+        iterator = iter(value.items())
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+    snapshot = {}
+    for unused_index in range(policy.max_unique_blobs + 1):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        except Exception:
+            _fail("task_snapshot_receipt_invalid")
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or len(item[0]) != oid_length
+            or _OID_PATTERN.fullmatch(item[0]) is None
+            or type(item[1]) is not bytes
+            or item[0] in snapshot
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        snapshot[item[0]] = bytes(item[1])
+        if len(snapshot) > policy.max_unique_blobs:
+            _fail("task_snapshot_receipt_invalid")
+    return MappingProxyType(
+        {
+            key: snapshot[key]
+            for key in sorted(snapshot)
+        }
+    )
+
+
+def _detach_and_validate_captured_objects(
+    captured: CapturedTaskObjects,
+) -> None:
+    try:
+        if not _exact_fields(captured, CapturedTaskObjects):
+            _fail("task_snapshot_receipt_invalid")
+        if not _exact_fields(captured.source, TaskSourceSpec):
+            _fail("task_snapshot_receipt_invalid")
+        source = TaskSourceSpec(
+            input_digest=captured.source.input_digest,
+            task_id=captured.source.task_id,
+            repository_root=Path(os.fspath(captured.source.repository_root)),
+            commit_oid=captured.source.commit_oid,
+            provisioning_class=captured.source.provisioning_class,
+            operator_attested=captured.source.operator_attested,
+            local_clone_policy=captured.source.local_clone_policy,
+        )
+        if not _exact_fields(captured.policy, TaskSnapshotPolicy):
+            _fail("task_snapshot_receipt_invalid")
+        policy = TaskSnapshotPolicy(
+            **{
+                item.name: getattr(captured.policy, item.name)
+                for item in fields(TaskSnapshotPolicy)
+            }
+        )
+        if type(captured.entries) is not tuple:
+            _fail("task_snapshot_receipt_invalid")
+        if len(captured.entries) > policy.max_files:
+            _fail("task_snapshot_receipt_invalid")
+        entries = tuple(
+            TaskTreeEntry(
+                path=entry.path,
+                git_mode=entry.git_mode,
+                blob_oid=entry.blob_oid,
+                size=entry.size,
+                content_digest=entry.content_digest,
+            )
+            for entry in captured.entries
+            if _exact_fields(entry, TaskTreeEntry)
+        )
+        if len(entries) != len(captured.entries):
+            _fail("task_snapshot_receipt_invalid")
+        if (
+            type(captured.object_format) is not str
+            or captured.object_format not in ("sha1", "sha256")
+        ):
+            _fail("task_snapshot_receipt_invalid")
+        blobs = _snapshot_captured_blobs(
+            captured.blobs,
+            policy,
+            captured.object_format,
+        )
+        object.__setattr__(captured, "source", source)
+        object.__setattr__(captured, "policy", policy)
+        object.__setattr__(captured, "entries", entries)
+        object.__setattr__(captured, "blobs", blobs)
+        receipt = _validate_captured_objects(captured)
+        object.__setattr__(captured, "source_trust_receipt", receipt)
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+
+
 def _require_supported_platform() -> None:
     try:
         popen_parameters = inspect.signature(subprocess.Popen).parameters
@@ -812,6 +1379,22 @@ def _identity(metadata: os.stat_result, kind: str) -> Dict[str, object]:
            if key != "kind"):
         _fail("task_source_root_invalid")
     return values
+
+
+def _physical_identity_key(
+    metadata: os.stat_result,
+    kind: str,
+) -> Tuple[int, int, str]:
+    if (
+        type(metadata.st_dev) is not int
+        or metadata.st_dev < 0
+        or type(metadata.st_ino) is not int
+        or metadata.st_ino < 0
+        or type(kind) is not str
+        or kind not in ("directory", "file")
+    ):
+        _fail("task_source_root_invalid")
+    return (metadata.st_dev, metadata.st_ino, kind)
 
 
 def _stable_ancestor_identity(
@@ -1422,6 +2005,14 @@ def _capture_filesystem(
             raw_config_digest=raw_config_digest,
             git_dir=source.repository_root / ".git",
             config_path=source.repository_root / ".git" / "config",
+            repository_identity_key=_physical_identity_key(
+                root_metadata,
+                "directory",
+            ),
+            git_dir_identity_key=_physical_identity_key(
+                git_metadata,
+                "directory",
+            ),
         )
     except TaskSnapshotError:
         raise
@@ -2561,6 +3152,651 @@ def _run_git(
     return bytes(stdout_state.data)
 
 
+def _copy_task_snapshot_policy(
+    policy: TaskSnapshotPolicy,
+) -> TaskSnapshotPolicy:
+    _validate_policy(policy)
+    return TaskSnapshotPolicy(
+        **{
+            item.name: getattr(policy, item.name)
+            for item in fields(TaskSnapshotPolicy)
+        }
+    )
+
+
+def _copy_task_source(source: TaskSourceSpec) -> TaskSourceSpec:
+    _validate_source(source)
+    return TaskSourceSpec(
+        input_digest=source.input_digest,
+        task_id=source.task_id,
+        repository_root=Path(os.fspath(source.repository_root)),
+        commit_oid=source.commit_oid,
+        provisioning_class=source.provisioning_class,
+        operator_attested=source.operator_attested,
+        local_clone_policy=source.local_clone_policy,
+    )
+
+
+def _detach_prepared_source(
+    prepared: PreparedTaskSource,
+) -> PreparedTaskSource:
+    try:
+        _validate_prepared_source(prepared)
+        detached = PreparedTaskSource(
+            source=_copy_task_source(prepared.source),
+            policy=_copy_task_snapshot_policy(prepared.policy),
+            git_dir=Path(os.fspath(prepared.git_dir)),
+            object_format=prepared.object_format,
+            source_identity_digest=prepared.source_identity_digest,
+            local_config_digest=prepared.local_config_digest,
+            object_topology=ObjectTopologySeal(
+                object_topology_digest=(
+                    prepared.object_topology.object_topology_digest
+                ),
+                entry_count=prepared.object_topology.entry_count,
+                file_count=prepared.object_topology.file_count,
+                total_bytes=prepared.object_topology.total_bytes,
+            ),
+            git_process_policy_digest=prepared.git_process_policy_digest,
+        )
+        _validate_prepared_source(detached)
+        return detached
+    except TaskSnapshotError:
+        raise
+    except Exception:
+        _fail("task_source_changed")
+
+
+def _require_prepared_unchanged(
+    prepared: PreparedTaskSource,
+    detached: PreparedTaskSource,
+) -> None:
+    try:
+        current = _detach_prepared_source(prepared)
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        _fail("task_source_changed")
+    if current != detached:
+        _fail("task_source_changed")
+
+
+def _validate_identity_key(
+    value: object,
+    code: str,
+) -> None:
+    if (
+        type(value) is not tuple
+        or len(value) != 3
+        or type(value[0]) is not int
+        or value[0] < 0
+        or type(value[1]) is not int
+        or value[1] < 0
+        or type(value[2]) is not str
+        or value[2] != "directory"
+    ):
+        _fail(code)
+
+
+def _validate_filesystem_seal(seal: _FilesystemSeal) -> None:
+    if (
+        not _exact_fields(seal, _FilesystemSeal)
+        or type(seal.filesystem_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(seal.filesystem_digest) is None
+        or type(seal.raw_config_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(seal.raw_config_digest) is None
+        or type(seal.git_dir) is not type(Path())
+        or type(seal.config_path) is not type(Path())
+    ):
+        _fail("task_source_changed")
+    _validate_identity_key(
+        seal.repository_identity_key,
+        "task_source_changed",
+    )
+    _validate_identity_key(
+        seal.git_dir_identity_key,
+        "task_source_changed",
+    )
+    if seal.repository_identity_key == seal.git_dir_identity_key:
+        _fail("task_source_changed")
+
+
+def _capture_clock_value() -> float:
+    try:
+        value = time.monotonic()
+    except Exception:
+        _fail("task_capture_timeout")
+    if (
+        type(value) not in (int, float)
+        or type(value) is bool
+        or not math.isfinite(value)
+    ):
+        _fail("task_capture_timeout")
+    return float(value)
+
+
+def _capture_deadline(policy: TaskSnapshotPolicy) -> float:
+    started = _capture_clock_value()
+    deadline = started + policy.capture_timeout_seconds
+    if not math.isfinite(deadline):
+        _fail("task_capture_timeout")
+    return deadline
+
+
+def _check_capture_deadline(deadline: float) -> None:
+    if (
+        type(deadline) is not float
+        or not math.isfinite(deadline)
+        or _capture_clock_value() >= deadline
+    ):
+        _fail("task_capture_timeout")
+
+
+def _capture_phase(deadline: float, function: object, *args, **kwargs):
+    _check_capture_deadline(deadline)
+    result = function(*args, **kwargs)
+    _check_capture_deadline(deadline)
+    return result
+
+
+def _validate_commit_output(
+    output: bytes,
+    commit_oid: str,
+) -> None:
+    if (
+        type(output) is not bytes
+        or output != (commit_oid + "\n").encode("ascii")
+    ):
+        _fail("task_source_changed")
+
+
+def _validate_storage_format_output(
+    output: bytes,
+    expected_format: str,
+) -> None:
+    if (
+        type(output) is not bytes
+        or output not in (b"sha1\n", b"sha256\n")
+    ):
+        _fail("task_git_failed")
+    if output != (expected_format + "\n").encode("ascii"):
+        _fail("task_source_config_invalid")
+
+
+def _parse_tree_output(
+    output: bytes,
+    object_format: str,
+) -> str:
+    oid_length = 40 if object_format == "sha1" else 64
+    if (
+        type(output) is not bytes
+        or len(output) != oid_length + 1
+        or not output.endswith(b"\n")
+    ):
+        _fail("task_tree_invalid")
+    try:
+        tree_oid = output[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        _fail("task_tree_invalid")
+    if (
+        len(tree_oid) != oid_length
+        or _OID_PATTERN.fullmatch(tree_oid) is None
+    ):
+        _fail("task_tree_invalid")
+    return tree_oid
+
+
+def _require_capture_matches_prepared(
+    filesystem: _FilesystemSeal,
+    config_digest: str,
+    topology: ObjectTopologySeal,
+    prepared: PreparedTaskSource,
+    process_policy_digest: str,
+) -> str:
+    _validate_filesystem_seal(filesystem)
+    _validate_topology_seal(topology)
+    source_identity_digest = _source_identity_digest(
+        filesystem.filesystem_digest,
+        config_digest,
+    )
+    if (
+        filesystem.git_dir != prepared.git_dir
+        or filesystem.config_path != prepared.git_dir / "config"
+        or config_digest != prepared.local_config_digest
+        or topology != prepared.object_topology
+        or source_identity_digest != prepared.source_identity_digest
+        or process_policy_digest != prepared.git_process_policy_digest
+    ):
+        _fail("task_source_changed")
+    return source_identity_digest
+
+
+def _make_source_trust_receipt(
+    prepared: PreparedTaskSource,
+    source_identity_before_digest: str,
+    topology_before: ObjectTopologySeal,
+    source_identity_after_digest: str,
+    topology_after: ObjectTopologySeal,
+    process_policy_digest: str,
+) -> CanonicalReceipt:
+    try:
+        return make_receipt(
+            "task_source_trust",
+            prepared.source.input_digest,
+            None,
+            None,
+            {
+                "task_id": prepared.source.task_id,
+                "provisioning_class": prepared.source.provisioning_class,
+                "operator_attested": prepared.source.operator_attested,
+                "local_clone_policy": prepared.source.local_clone_policy,
+                "object_format": prepared.object_format,
+                "source_identity_before_digest": (
+                    source_identity_before_digest
+                ),
+                "object_topology_before_digest": (
+                    topology_before.object_topology_digest
+                ),
+                "source_identity_after_digest": (
+                    source_identity_after_digest
+                ),
+                "object_topology_after_digest": (
+                    topology_after.object_topology_digest
+                ),
+                "git_process_policy_digest": process_policy_digest,
+                "inventory_file_count": topology_before.file_count,
+                "inventory_total_bytes": topology_before.total_bytes,
+            },
+        )
+    except Exception:
+        _fail("task_snapshot_receipt_invalid")
+
+
+def _copy_validated_receipt_projection(
+    receipt: CanonicalReceipt,
+    expected_type: str,
+    policy: TaskSnapshotPolicy,
+) -> CanonicalReceipt:
+    expected_keys = _TASK_RECEIPT_PAYLOAD_KEYS.get(expected_type)
+    if type(expected_keys) is not frozenset:
+        _fail("task_snapshot_receipt_invalid")
+    payload = _receipt_payload_snapshot(receipt.payload, expected_keys)
+    _validate_receipt_payload_bounds(payload, expected_type, policy)
+    return CanonicalReceipt(
+        receipt_type=receipt.receipt_type,
+        input_digest=receipt.input_digest,
+        plan_digest=receipt.plan_digest,
+        previous_record_hash=receipt.previous_record_hash,
+        payload=payload,
+        canonical_bytes=bytes(receipt.canonical_bytes),
+        receipt_digest=receipt.receipt_digest,
+    )
+
+
+def _make_operational_seal(
+    captured: CapturedTaskObjects,
+    protected_identity_keys: Tuple[Tuple[int, int, str], ...],
+) -> _CapturedOperationalSeal:
+    if type(captured) is not CapturedTaskObjects:
+        _fail("task_snapshot_receipt_invalid")
+    if type(protected_identity_keys) is not tuple or len(
+        protected_identity_keys
+    ) != 2:
+        _fail("task_snapshot_receipt_invalid")
+    for identity_key in protected_identity_keys:
+        _validate_identity_key(
+            identity_key,
+            "task_snapshot_receipt_invalid",
+        )
+    return _CapturedOperationalSeal(
+        source_trust_receipt=_copy_validated_receipt_projection(
+            captured.source_trust_receipt,
+            "task_source_trust",
+            captured.policy,
+        ),
+        source=_copy_task_source(captured.source),
+        policy=_copy_task_snapshot_policy(captured.policy),
+        object_format=captured.object_format,
+        commit_oid=captured.commit_oid,
+        tree_oid=captured.tree_oid,
+        entry_digest=captured.entry_digest,
+        entries=tuple(
+            TaskTreeEntry(
+                path=entry.path,
+                git_mode=entry.git_mode,
+                blob_oid=entry.blob_oid,
+                size=entry.size,
+                content_digest=entry.content_digest,
+            )
+            for entry in captured.entries
+        ),
+        blobs=MappingProxyType(
+            {
+                oid: bytes(content)
+                for oid, content in captured.blobs.items()
+            }
+        ),
+        file_count=captured.file_count,
+        total_bytes=captured.total_bytes,
+        unique_blob_count=captured.unique_blob_count,
+        unique_blob_bytes=captured.unique_blob_bytes,
+        protected_identity_keys=tuple(protected_identity_keys),
+    )
+
+
+class TaskSnapshotMaterializer:
+    def __init__(self, policy: TaskSnapshotPolicy) -> None:
+        self._policy = _copy_task_snapshot_policy(policy)
+        self._lock = threading.Lock()
+        self._state = "new"
+        self._captured = None
+        self._operational_seal = None
+        self._source_root = None
+        self._git_dir = None
+        self._protected_identity_keys = ()
+        self._owned_top_level_descriptor = -1
+
+    def _clear_locked(self) -> bool:
+        descriptor = self._owned_top_level_descriptor
+        self._owned_top_level_descriptor = -1
+        self._captured = None
+        self._operational_seal = None
+        self._source_root = None
+        self._git_dir = None
+        self._protected_identity_keys = ()
+        self._state = "closed"
+        if descriptor < 0:
+            return True
+        return _close_fd_once(descriptor)
+
+    def capture(
+        self,
+        prepared: PreparedTaskSource,
+    ) -> CapturedTaskObjects:
+        with self._lock:
+            if self._state != "new":
+                _fail("task_snapshot_receipt_invalid")
+            try:
+                detached = _detach_prepared_source(prepared)
+                transaction_policy = _copy_task_snapshot_policy(
+                    self._policy
+                )
+                if detached.policy != transaction_policy:
+                    _fail("task_source_changed")
+                process_policy_digest = _process_policy_digest(
+                    transaction_policy
+                )
+                if (
+                    process_policy_digest
+                    != detached.git_process_policy_digest
+                ):
+                    _fail("task_source_changed")
+
+                deadline = _capture_deadline(transaction_policy)
+                first_filesystem = _capture_phase(
+                    deadline,
+                    _capture_filesystem,
+                    detached.source,
+                    transaction_policy,
+                    detached.object_format,
+                )
+                first_topology = _capture_phase(
+                    deadline,
+                    _capture_object_topology,
+                    detached.source,
+                    transaction_policy,
+                    detached.object_format,
+                )
+                first_config_output = _capture_phase(
+                    deadline,
+                    _run_git,
+                    first_filesystem.git_dir,
+                    first_filesystem.config_path,
+                    transaction_policy,
+                    "config",
+                    capture_deadline=deadline,
+                )
+                first_config_digest = _capture_phase(
+                    deadline,
+                    _parse_config_output,
+                    first_config_output,
+                    first_filesystem.raw_config_digest,
+                    detached.object_format,
+                )
+                storage_output = _capture_phase(
+                    deadline,
+                    _run_git,
+                    first_filesystem.git_dir,
+                    first_filesystem.config_path,
+                    transaction_policy,
+                    "storage-format",
+                    capture_deadline=deadline,
+                )
+                _capture_phase(
+                    deadline,
+                    _validate_storage_format_output,
+                    storage_output,
+                    detached.object_format,
+                )
+                first_source_identity = _capture_phase(
+                    deadline,
+                    _require_capture_matches_prepared,
+                    first_filesystem,
+                    first_config_digest,
+                    first_topology,
+                    detached,
+                    process_policy_digest,
+                )
+
+                commit_output = _capture_phase(
+                    deadline,
+                    _run_git,
+                    first_filesystem.git_dir,
+                    first_filesystem.config_path,
+                    transaction_policy,
+                    "verify-commit",
+                    detached.source.commit_oid,
+                    capture_deadline=deadline,
+                )
+                _capture_phase(
+                    deadline,
+                    _validate_commit_output,
+                    commit_output,
+                    detached.source.commit_oid,
+                )
+                tree_output = _capture_phase(
+                    deadline,
+                    _run_git,
+                    first_filesystem.git_dir,
+                    first_filesystem.config_path,
+                    transaction_policy,
+                    "verify-tree",
+                    detached.source.commit_oid,
+                    capture_deadline=deadline,
+                )
+                tree_oid = _capture_phase(
+                    deadline,
+                    _parse_tree_output,
+                    tree_output,
+                    detached.object_format,
+                )
+                tree_bytes = _capture_phase(
+                    deadline,
+                    _run_git,
+                    first_filesystem.git_dir,
+                    first_filesystem.config_path,
+                    transaction_policy,
+                    "ls-tree",
+                    tree_oid,
+                    capture_deadline=deadline,
+                )
+                parsed = _capture_phase(
+                    deadline,
+                    _parse_task_tree,
+                    tree_bytes,
+                    detached.object_format,
+                    transaction_policy,
+                )
+                entries, blobs = _capture_phase(
+                    deadline,
+                    _load_task_blobs,
+                    first_filesystem.git_dir,
+                    first_filesystem.config_path,
+                    parsed,
+                    transaction_policy,
+                    capture_deadline=deadline,
+                )
+                entry_digest = _capture_phase(
+                    deadline,
+                    _task_entry_digest,
+                    detached.source.commit_oid,
+                    tree_oid,
+                    parsed,
+                    entries,
+                )
+
+                second_config_output = _capture_phase(
+                    deadline,
+                    _run_git,
+                    first_filesystem.git_dir,
+                    first_filesystem.config_path,
+                    transaction_policy,
+                    "config",
+                    capture_deadline=deadline,
+                )
+                second_config_digest = _capture_phase(
+                    deadline,
+                    _parse_config_output,
+                    second_config_output,
+                    first_filesystem.raw_config_digest,
+                    detached.object_format,
+                )
+                second_filesystem = _capture_phase(
+                    deadline,
+                    _capture_filesystem,
+                    detached.source,
+                    transaction_policy,
+                    detached.object_format,
+                )
+                second_topology = _capture_phase(
+                    deadline,
+                    _capture_object_topology,
+                    detached.source,
+                    transaction_policy,
+                    detached.object_format,
+                )
+                second_source_identity = _capture_phase(
+                    deadline,
+                    _require_capture_matches_prepared,
+                    second_filesystem,
+                    second_config_digest,
+                    second_topology,
+                    detached,
+                    process_policy_digest,
+                )
+                if (
+                    second_filesystem != first_filesystem
+                    or second_config_digest != first_config_digest
+                    or second_topology != first_topology
+                    or second_source_identity != first_source_identity
+                ):
+                    _fail("task_source_changed")
+                try:
+                    current_policy = _copy_task_snapshot_policy(
+                        self._policy
+                    )
+                except Exception:
+                    _fail("task_source_changed")
+                if (
+                    current_policy != transaction_policy
+                    or transaction_policy != detached.policy
+                    or _process_policy_digest(transaction_policy)
+                    != process_policy_digest
+                    or process_policy_digest
+                    != detached.git_process_policy_digest
+                ):
+                    _fail("task_source_changed")
+                _capture_phase(
+                    deadline,
+                    _require_prepared_unchanged,
+                    prepared,
+                    detached,
+                )
+                _check_capture_deadline(deadline)
+
+                source_receipt = _capture_phase(
+                    deadline,
+                    _make_source_trust_receipt,
+                    detached,
+                    first_source_identity,
+                    first_topology,
+                    second_source_identity,
+                    second_topology,
+                    process_policy_digest,
+                )
+                captured = _capture_phase(
+                    deadline,
+                    CapturedTaskObjects,
+                    source_trust_receipt=source_receipt,
+                    source=detached.source,
+                    policy=transaction_policy,
+                    object_format=detached.object_format,
+                    commit_oid=detached.source.commit_oid,
+                    tree_oid=tree_oid,
+                    entry_digest=entry_digest,
+                    entries=entries,
+                    blobs=blobs,
+                    file_count=parsed.file_count,
+                    total_bytes=parsed.total_bytes,
+                    unique_blob_count=parsed.unique_blob_count,
+                    unique_blob_bytes=parsed.unique_blob_bytes,
+                )
+                protected_keys = (
+                    second_filesystem.repository_identity_key,
+                    second_filesystem.git_dir_identity_key,
+                )
+                operational_seal = _capture_phase(
+                    deadline,
+                    _make_operational_seal,
+                    captured,
+                    protected_keys,
+                )
+                self._captured = captured
+                self._operational_seal = operational_seal
+                self._source_root = Path(
+                    os.fspath(detached.source.repository_root)
+                )
+                self._git_dir = Path(os.fspath(detached.git_dir))
+                self._protected_identity_keys = tuple(protected_keys)
+                _check_capture_deadline(deadline)
+                self._state = "captured"
+                return captured
+            except TaskSnapshotError as error:
+                cleanup_ok = self._clear_locked()
+                if not cleanup_ok:
+                    _fail("task_snapshot_cleanup_required")
+                error.__context__ = None
+                error.__cause__ = None
+                raise
+            except Exception:
+                cleanup_ok = self._clear_locked()
+                if not cleanup_ok:
+                    _fail("task_snapshot_cleanup_required")
+                _fail("task_snapshot_receipt_invalid")
+            except BaseException:
+                cleanup_ok = self._clear_locked()
+                if not cleanup_ok:
+                    _fail("task_snapshot_cleanup_required")
+                raise
+
+    def close(self) -> None:
+        with self._lock:
+            if self._state == "closed":
+                return
+            if not self._clear_locked():
+                _fail("task_snapshot_cleanup_required")
+
+
 def prepare_task_source(
     source: TaskSourceSpec,
     policy: TaskSnapshotPolicy,
@@ -2589,10 +3825,7 @@ def prepare_task_source(
         policy,
         "storage-format",
     )
-    if storage_output not in (b"sha1\n", b"sha256\n"):
-        _fail("task_git_failed")
-    if storage_output != (expected_format + "\n").encode("ascii"):
-        _fail("task_source_config_invalid")
+    _validate_storage_format_output(storage_output, expected_format)
     second_config_output = _run_git(
         first_filesystem.git_dir,
         first_filesystem.config_path,
