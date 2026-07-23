@@ -604,9 +604,12 @@ ls-tree -r -l -z --full-tree <full-tree-oid>
 cat-file blob <full-blob-oid>
 ```
 
-Task 6 calls only the first two. Task 7 may call the remaining four with
-already validated in-memory full OIDs. No repository discovery, ref name,
-pathspec, abbreviated OID, extra option, or caller-selected argv is accepted.
+Task 6 calls only config and storage-format metadata. Task 7 calls config
+exactly twice, storage-format metadata exactly once before its first
+fixed-object operation, and the remaining four templates as required by the
+fixed tree. All OIDs are already validated in memory. No repository discovery,
+ref name, pathspec, abbreviated OID, extra option, or caller-selected argv is
+accepted.
 
 Replace the environment rather than extending it:
 
@@ -681,6 +684,8 @@ operation, perform in order:
 - a recomputed `P` equals `prepared.git_process_policy_digest`;
 - capture fresh F0 and O0 without spawning Git;
 - run the bounded config operation to derive C0;
+- run storage-format metadata and require it to equal
+  `prepared.object_format`;
 - require F0 plus C0 to derive exactly `prepared.source_identity_digest`;
 - `C0 == prepared.local_config_digest`;
 - fresh `O0` equals every field of `prepared.object_topology`;
