@@ -1,0 +1,620 @@
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import io
+import socket
+import unittest
+from dataclasses import replace
+from unittest.mock import patch
+
+import scripts.live_eval.task_snapshot as task_snapshot_module
+from scripts.live_eval.task_snapshot import (
+    ObjectTopologySeal,
+    PreparedTaskSource,
+    TaskSnapshotError,
+    TaskSnapshotPolicy,
+    TaskSourceSpec,
+    _capture_filesystem,
+    _capture_object_topology,
+    _parse_config_output,
+    _parse_packed_refs,
+    _process_policy_digest,
+    _require_supported_platform,
+    _run_git,
+    _source_identity_digest,
+    _validate_physical_root,
+    prepare_task_source,
+)
+
+
+class RepositoryFixture:
+    def make_repository(self, object_format="sha1"):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name).resolve()
+        repo = root / "repo"
+        repo.mkdir(mode=0o700)
+        subprocess.run(
+            ("git", "init", "-q", "--object-format=" + object_format),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        (repo / "tracked.txt").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Task Snapshot",
+                "-c",
+                "user.email=snapshot@example.invalid",
+                "add",
+                "tracked.txt",
+            ),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-c",
+                "user.name=Task Snapshot",
+                "-c",
+                "user.email=snapshot@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ),
+            cwd=str(repo),
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        oid = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=str(repo),
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.strip()
+        return repo, oid
+
+    def source_for(self, repo, oid):
+        return TaskSourceSpec(
+            input_digest="sha256:" + "1" * 64,
+            task_id="task-1",
+            repository_root=repo,
+            commit_oid=oid,
+            provisioning_class="operator_owned_trusted_git_local_clone",
+            operator_attested=True,
+            local_clone_policy="remote_or_no_local_or_no_hardlinks",
+        )
+
+
+class TaskSnapshotSurfaceTests(unittest.TestCase):
+    def test_exact_source_and_policy_defaults(self):
+        source = TaskSourceSpec(
+            input_digest="sha256:" + "1" * 64,
+            task_id="task-1",
+            repository_root=Path("/tmp/repo"),
+            commit_oid="a" * 40,
+            provisioning_class="operator_owned_trusted_git_local_clone",
+            operator_attested=True,
+            local_clone_policy="remote_or_no_local_or_no_hardlinks",
+        )
+
+        self.assertEqual(source.repository_root, Path("/tmp/repo"))
+        self.assertEqual(
+            TaskSnapshotPolicy().policy_version, "task-object-materializer-v1"
+        )
+
+    def test_source_scalars_and_policy_are_exact_and_bounded(self):
+        base = {
+            "input_digest": "sha256:" + "1" * 64,
+            "task_id": "task-1",
+            "repository_root": Path("/tmp/repo"),
+            "commit_oid": "a" * 40,
+            "provisioning_class": "operator_owned_trusted_git_local_clone",
+            "operator_attested": True,
+            "local_clone_policy": "remote_or_no_local_or_no_hardlinks",
+        }
+        attacks = (
+            ("input_digest", "sha256:" + "A" * 64),
+            ("task_id", "Task 1"),
+            ("repository_root", b"/tmp/repo"),
+            ("commit_oid", "a" * 39),
+            ("provisioning_class", "local"),
+            ("operator_attested", 1),
+            ("local_clone_policy", "hardlinks"),
+        )
+        for field_name, value in attacks:
+            with self.subTest(field_name=field_name), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_source_spec_invalid$"
+            ):
+                TaskSourceSpec(**dict(base, **{field_name: value}))
+
+        policy_attacks = (
+            {"git_timeout_seconds": True},
+            {"git_timeout_seconds": 0},
+            {"git_timeout_seconds": 16},
+            {"max_git_stderr_bytes": 70000, "max_git_stdout_bytes": 65536},
+            {"max_file_bytes": 1024, "max_total_bytes": 512},
+        )
+        for values in policy_attacks:
+            with self.subTest(values=values), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_snapshot_policy_invalid$"
+            ):
+                TaskSnapshotPolicy(**values)
+
+    def test_platform_and_physical_root_fail_closed(self):
+        with patch("scripts.live_eval.task_snapshot.sys.platform", "win32"):
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_source_platform_unsupported$"
+            ):
+                _require_supported_platform()
+
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name).resolve()
+        repo = root / "repo"
+        repo.mkdir(mode=0o700)
+        link = root / "repo-link"
+        link.symlink_to(repo)
+        for candidate in (Path("relative"), link):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_source_root_invalid$"
+            ):
+                _validate_physical_root(candidate)
+
+
+class TaskSnapshotControlTests(RepositoryFixture, unittest.TestCase):
+    def test_config_parser_accepts_closed_sha1_profile(self):
+        raw_digest = "sha256:" + "a" * 64
+        output = (
+            b"core.repositoryformatversion\n0\0"
+            b"core.filemode\ntrue\0"
+            b"core.bare\nfalse\0"
+            b"core.logallrefupdates\ntrue\0"
+            b"remote.origin.url\nhttps://example.invalid/repo.git\0"
+            b"remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*\0"
+        )
+
+        digest = _parse_config_output(output, raw_digest, "sha1")
+
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        _parse_packed_refs(
+            (
+                "# pack-refs with: peeled sorted \n"
+                + "a" * 40
+                + " refs/heads/main\n"
+                + "^"
+                + "b" * 40
+                + "\n"
+            ).encode("ascii"),
+            40,
+        )
+        for packed in (
+            b"# pack-refs with: peeled\n",
+            ("a" * 40 + " refs/replace/sentinel\n").encode("ascii"),
+            ("a" * 40 + " refs/heads/main").encode("ascii"),
+        ):
+            with self.subTest(packed=packed), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_source_control_invalid$"
+            ):
+                _parse_packed_refs(packed, 40)
+
+    def test_config_parser_rejects_authority_and_framing_attacks(self):
+        raw_digest = "sha256:" + "a" * 64
+        base = (
+            b"core.repositoryformatversion\n0\0"
+            b"core.bare\nfalse\0"
+        )
+        attacks = (
+            base[:-1],
+            base + b"core.bare\nfalse\0",
+            base + b"include.path\n/tmp/sentinel\0",
+            base + b"core.fsmonitor\n/tmp/sentinel\0",
+            base + b"filter.lfs.clean\nsentinel\0",
+            base + b"remote.origin.promisor\ntrue\0",
+            b"core.repositoryformatversion\n1\0core.bare\nfalse\0",
+            base + b"bad\nvalue\nextra\0",
+        )
+        for payload in attacks:
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_source_config_invalid$"
+            ):
+                _parse_config_output(payload, raw_digest, "sha1")
+
+    def test_controls_bind_config_and_reject_indirection(self):
+        policy = TaskSnapshotPolicy()
+        attacks = (
+            (".git/commondir", b"../outside\n"),
+            (".git/config.worktree", b"[core]\n"),
+            (".git/objects/info/alternates", b"/tmp/sentinel\n"),
+            (".git/hooks/post-checkout", b"#!/bin/sh\nexit 1\n"),
+        )
+        for relative_path, payload in attacks:
+            with self.subTest(relative_path=relative_path):
+                repo, oid = self.make_repository()
+                target = repo / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+                with self.assertRaisesRegex(
+                    TaskSnapshotError, "^task_source_control_invalid$"
+                ):
+                    _capture_filesystem(
+                        self.source_for(repo, oid), policy, "sha1"
+                    )
+
+
+class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
+    def test_valid_object_topology_is_canonical_and_bounded(self):
+        repo, oid = self.make_repository()
+        objects = repo / ".git" / "objects"
+        info = objects / "info"
+        graphs = info / "commit-graphs"
+        pack = objects / "pack"
+        graphs.mkdir(exist_ok=True)
+        for relative in (
+            "info/packs",
+            "info/commit-graph",
+            "info/commit-graphs/commit-graph-chain",
+            "info/commit-graphs/graph-" + "b" * 40 + ".graph",
+            "pack/pack-" + "a" * 40 + ".pack",
+            "pack/pack-" + "a" * 40 + ".idx",
+            "pack/pack-" + "a" * 40 + ".rev",
+            "pack/pack-" + "a" * 40 + ".bitmap",
+            "pack/pack-" + "a" * 40 + ".mtimes",
+            "pack/pack-" + "a" * 40 + ".keep",
+            "pack/multi-pack-index",
+            "pack/multi-pack-index-" + "c" * 40 + ".bitmap",
+        ):
+            target = objects / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"x")
+        source = self.source_for(repo, oid)
+        policy = TaskSnapshotPolicy()
+
+        seal = _capture_object_topology(source, policy, "sha1")
+
+        self.assertRegex(
+            seal.object_topology_digest, r"^sha256:[0-9a-f]{64}$"
+        )
+        self.assertGreaterEqual(seal.entry_count, seal.file_count + 1)
+        self.assertGreater(seal.file_count, 0)
+        self.assertGreater(seal.total_bytes, 0)
+        exact_policy = TaskSnapshotPolicy(
+            max_object_entries=seal.entry_count,
+            max_files=seal.file_count,
+            max_object_store_bytes=seal.total_bytes,
+        )
+        self.assertEqual(
+            _capture_object_topology(source, exact_policy, "sha1"), seal
+        )
+        for values in (
+            {"max_object_entries": seal.entry_count - 1},
+            {"max_files": seal.file_count - 1},
+            {"max_object_store_bytes": seal.total_bytes - 1},
+        ):
+            with self.subTest(values=values), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_source_topology_invalid$"
+            ):
+                _capture_object_topology(
+                    source, TaskSnapshotPolicy(**values), "sha1"
+                )
+
+    def test_object_topology_rejects_unknown_pairing_and_file_attacks(self):
+        attacks = (
+            "unknown",
+            "unpaired",
+            "symlink",
+            "hardlink",
+            "fifo",
+            "socket",
+            "uppercase",
+            "promisor",
+        )
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                repo, oid = self.make_repository()
+                objects = repo / ".git" / "objects"
+                pack = objects / "pack"
+                pack.mkdir(exist_ok=True)
+                if attack == "unknown":
+                    (objects / "unknown").write_bytes(b"x")
+                elif attack == "unpaired":
+                    (pack / ("pack-" + "a" * 40 + ".pack")).write_bytes(b"x")
+                elif attack == "symlink":
+                    (pack / "sentinel").symlink_to(repo / "tracked.txt")
+                elif attack == "hardlink":
+                    original = next(
+                        item
+                        for directory in objects.iterdir()
+                        if len(directory.name) == 2
+                        for item in directory.iterdir()
+                    )
+                    os.link(original, pack / "sentinel")
+                elif attack == "fifo":
+                    os.mkfifo(pack / "sentinel")
+                elif attack == "socket":
+                    unix_socket = socket.socket(socket.AF_UNIX)
+                    self.addCleanup(unix_socket.close)
+                    unix_socket.bind(str(pack / "sentinel"))
+                elif attack == "uppercase":
+                    (objects / "AA").mkdir()
+                else:
+                    (pack / ("pack-" + "a" * 40 + ".promisor")).write_bytes(
+                        b"sentinel"
+                    )
+                with self.assertRaisesRegex(
+                    TaskSnapshotError, "^task_source_topology_invalid$"
+                ):
+                    _capture_object_topology(
+                        self.source_for(repo, oid),
+                        TaskSnapshotPolicy(),
+                        "sha1",
+                    )
+
+    def test_versioned_evidence_digests_are_path_private(self):
+        policy = TaskSnapshotPolicy()
+        first = _process_policy_digest(policy)
+        second = _process_policy_digest(TaskSnapshotPolicy())
+        source_identity = _source_identity_digest(
+            "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        )
+
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"^sha256:[0-9a-f]{64}$")
+        self.assertRegex(source_identity, r"^sha256:[0-9a-f]{64}$")
+
+
+class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
+    def test_real_config_and_storage_operations_are_bounded(self):
+        repo, oid = self.make_repository()
+        policy = TaskSnapshotPolicy()
+        git_dir = repo / ".git"
+        config = git_dir / "config"
+
+        config_output = _run_git(
+            git_dir, config, policy, "config"
+        )
+        storage_output = _run_git(
+            git_dir, config, policy, "storage-format"
+        )
+
+        self.assertTrue(config_output.endswith(b"\0"))
+        self.assertEqual(storage_output, b"sha1\n")
+        exact = TaskSnapshotPolicy(
+            max_git_stdout_bytes=len(config_output),
+            max_git_stderr_bytes=min(64, len(config_output)),
+            max_config_bytes=len(config_output),
+        )
+        self.assertEqual(
+            _run_git(git_dir, config, exact, "config"), config_output
+        )
+        over = TaskSnapshotPolicy(
+            max_git_stdout_bytes=len(config_output) - 1,
+            max_git_stderr_bytes=min(64, len(config_output) - 1),
+            max_config_bytes=len(config_output) - 1,
+        )
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_output_limit$"
+        ):
+            _run_git(git_dir, config, over, "config")
+
+    def test_exact_process_contract_and_replacement_environment(self):
+        repo, oid = self.make_repository()
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"sha1\n")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+        fake = FakeProcess()
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=fake,
+        ) as popen, patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=ProcessLookupError,
+        ):
+            output = _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(),
+                "storage-format",
+            )
+
+        self.assertEqual(output, b"sha1\n")
+        argv = popen.call_args.args[0]
+        options = popen.call_args.kwargs
+        self.assertEqual(argv[0], "git")
+        self.assertEqual(argv[-2:], ("rev-parse", "--show-object-format=storage"))
+        self.assertEqual(options["cwd"], "/")
+        self.assertFalse(options["shell"])
+        self.assertTrue(options["close_fds"])
+        self.assertTrue(options["start_new_session"])
+        self.assertEqual(
+            set(options["env"]),
+            {
+                "GIT_ATTR_NOSYSTEM",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+                "GIT_NO_LAZY_FETCH",
+                "GIT_NO_REPLACE_OBJECTS",
+                "GIT_OPTIONAL_LOCKS",
+                "GIT_TERMINAL_PROMPT",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+            },
+        )
+
+    def test_operation_allowlist_and_errors_are_sanitized(self):
+        repo, oid = self.make_repository()
+        attacks = (
+            ("status", None),
+            ("verify-commit", "HEAD"),
+            ("cat-blob", "../sentinel"),
+        )
+        for operation, value in attacks:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                TaskSnapshotError, "^task_git_operation_invalid$"
+            ) as caught:
+                _run_git(
+                    repo / ".git",
+                    repo / ".git" / "config",
+                    TaskSnapshotPolicy(),
+                    operation,
+                    value,
+                )
+            self.assertIsNone(caught.exception.__context__)
+
+    def test_timeout_cleans_up_and_preserves_fixed_classification(self):
+        repo, oid = self.make_repository()
+
+        class FakeProcess:
+            pid = 987654
+            returncode = None
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                self.returncode = -15
+                return self.returncode
+
+        fake = FakeProcess()
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=fake,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=ProcessLookupError,
+        ), patch(
+            "scripts.live_eval.task_snapshot.time.monotonic",
+            side_effect=(0.0, 2.0, 2.0, 2.0),
+        ):
+            with self.assertRaisesRegex(
+                TaskSnapshotError, "^task_git_timeout$"
+            ):
+                _run_git(
+                    repo / ".git",
+                    repo / ".git" / "config",
+                    TaskSnapshotPolicy(git_timeout_seconds=1),
+                    "storage-format",
+                )
+
+
+class TaskSnapshotPreparationTests(RepositoryFixture, unittest.TestCase):
+    def test_prepares_immutable_path_private_source_without_receipt(self):
+        for object_format in ("sha1", "sha256"):
+            with self.subTest(object_format=object_format):
+                repo, oid = self.make_repository(object_format)
+                prepared = prepare_task_source(
+                    self.source_for(repo, oid), TaskSnapshotPolicy()
+                )
+
+                self.assertIs(type(prepared), PreparedTaskSource)
+                self.assertEqual(prepared.git_dir, repo / ".git")
+                self.assertEqual(prepared.object_format, object_format)
+                self.assertRegex(
+                    prepared.source_identity_digest,
+                    r"^sha256:[0-9a-f]{64}$",
+                )
+                self.assertRegex(
+                    prepared.local_config_digest, r"^sha256:[0-9a-f]{64}$"
+                )
+                self.assertIs(
+                    type(prepared.object_topology), ObjectTopologySeal
+                )
+        self.assertNotIn(
+            "experiment_receipt",
+            Path(task_snapshot_module.__file__).read_text(encoding="utf-8"),
+        )
+
+    def test_preparation_uses_only_config_storage_config_order(self):
+        repo, oid = self.make_repository()
+        operations = []
+        original = task_snapshot_module._run_git
+
+        def recording_run(git_dir, config_path, policy, operation, value=None):
+            operations.append((operation, value))
+            return original(
+                git_dir, config_path, policy, operation, value
+            )
+
+        with patch(
+            "scripts.live_eval.task_snapshot._run_git",
+            side_effect=recording_run,
+        ):
+            prepare_task_source(
+                self.source_for(repo, oid), TaskSnapshotPolicy()
+            )
+
+        self.assertEqual(
+            operations,
+            [("config", None), ("storage-format", None), ("config", None)],
+        )
+
+    def test_seal_change_is_rejected_after_second_capture(self):
+        repo, oid = self.make_repository()
+        original = task_snapshot_module._capture_object_topology
+        calls = []
+
+        def changing_capture(source, policy, object_format):
+            seal = original(source, policy, object_format)
+            calls.append(seal)
+            if len(calls) == 2:
+                return replace(
+                    seal,
+                    object_topology_digest="sha256:" + "f" * 64,
+                )
+            return seal
+
+        with patch(
+            "scripts.live_eval.task_snapshot._capture_object_topology",
+            side_effect=changing_capture,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_changed$"
+        ):
+            prepare_task_source(
+                self.source_for(repo, oid), TaskSnapshotPolicy()
+            )
+
+    def test_forged_prepared_and_topology_values_fail_closed(self):
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_topology_invalid$"
+        ):
+            ObjectTopologySeal(
+                object_topology_digest="sha256:" + "a" * 64,
+                entry_count=True,
+                file_count=0,
+                total_bytes=0,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
