@@ -37,6 +37,14 @@ _MANIFEST_FIELDS = {
 }
 _REGULAR_MODES = {"100644", "100755"}
 _OID_LENGTHS = {"sha1": 40, "sha256": 64}
+_GIT_CONFIG_ARGUMENTS = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "submodule.recurse=false",
+)
 _PathToken = Tuple[int, int, int]
 
 
@@ -149,10 +157,19 @@ def install_checkout_skills(repo: Path, codex_home: Path) -> CheckoutManifest:
 
 def verify_loaded_checkout(repo: Path, codex_home: Path) -> PreflightResult:
     """Fail closed unless the read-only materialization matches current HEAD."""
+    return _verify_loaded_checkout_inventory(
+        repo, codex_home, frozenset({"skills", _MANIFEST_NAME})
+    )
+
+
+def _verify_loaded_checkout_inventory(
+    repo: Path, codex_home: Path, expected_home_entries: frozenset
+) -> PreflightResult:
+    """Verify a checkout within an internally supplied exact home inventory."""
     try:
         root = _plain_directory(repo, "repository")
         home = _private_home(codex_home)
-        _require_exact_names(home, {"skills", _MANIFEST_NAME}, "CODEX_HOME")
+        _require_exact_names(home, set(expected_home_entries), "CODEX_HOME")
         manifest_path = home / _MANIFEST_NAME
         if stat.S_IMODE(manifest_path.lstat().st_mode) != 0o400:
             raise ValueError("checkout manifest must remain read-only")
@@ -178,7 +195,11 @@ def verify_loaded_checkout(repo: Path, codex_home: Path) -> PreflightResult:
 def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
     _require_git_root(repo)
     if require_clean and _git_text(
-        repo, "status", "--porcelain=v1", "--untracked-files=all"
+        repo,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
     ):
         raise ValueError("repository checkout must be clean")
     object_format = _git_text(repo, "rev-parse", "--show-object-format")
@@ -216,7 +237,11 @@ def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
     if _git_text(repo, "rev-parse", "--verify", "HEAD^{tree}") != tree_oid:
         raise ValueError("HEAD changed while capturing checkout snapshot")
     if require_clean and _git_text(
-        repo, "status", "--porcelain=v1", "--untracked-files=all"
+        repo,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
     ):
         raise ValueError("repository checkout changed while capturing snapshot")
 
@@ -482,7 +507,7 @@ def _write_exclusive(
 
 def _read_regular_file(path: Path) -> bytes:
     before = path.lstat()
-    if not stat.S_ISREG(before.st_mode):
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise ValueError("expected a regular file: {}".format(path))
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -490,7 +515,10 @@ def _read_regular_file(path: Path) -> bytes:
     descriptor = os.open(str(path), flags)
     try:
         opened = os.fstat(descriptor)
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        if (
+            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_nlink != 1
+        ):
             raise ValueError("file identity changed while hashing: {}".format(path))
         chunks = []
         while True:
@@ -504,6 +532,7 @@ def _read_regular_file(path: Path) -> bytes:
     if (
         (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
         != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        or after.st_nlink != 1
     ):
         raise ValueError("file changed while hashing: {}".format(path))
     return b"".join(chunks)
@@ -693,7 +722,13 @@ def _require_install_identity(repo: Path, manifest: CheckoutManifest) -> None:
     tree_oid = _git_text(repo, "rev-parse", "--verify", "HEAD^{tree}")
     if _domain_oid(manifest.object_format, tree_oid) != manifest.tree_hash:
         raise ValueError("HEAD changed before checkout publication")
-    if _git_text(repo, "status", "--porcelain=v1", "--untracked-files=all"):
+    if _git_text(
+        repo,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
+    ):
         raise ValueError("repository checkout changed before publication")
 
 
@@ -738,10 +773,20 @@ def _git_text(repo: Path, *arguments: str) -> str:
 
 
 def _git_bytes(repo: Path, *arguments: str) -> bytes:
+    environment = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.defpath,
+    }
     result = subprocess.run(
-        ("git",) + arguments,
+        ("git",) + _GIT_CONFIG_ARGUMENTS + arguments,
         cwd=str(repo),
         check=False,
+        env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )

@@ -1,5 +1,7 @@
 import hashlib
+import inspect
 import json
+import os
 import stat
 import subprocess
 import tempfile
@@ -429,6 +431,69 @@ class CheckoutTests(unittest.TestCase):
 
         after = self.git("status", "--porcelain=v1", "--untracked-files=all")
         self.assertEqual(after, before)
+
+    def test_public_legacy_verifier_rejects_harness_only_entries(self):
+        install_checkout_skills(self.repo, self.codex_home)
+        agents = self.codex_home / "AGENTS.md"
+        agents.write_text("harness only\n", encoding="utf-8")
+
+        result = verify_loaded_checkout(self.repo, self.codex_home)
+
+        self.assertEqual(result.classification, "blocked_isolation")
+        self.assertEqual(result.result, "blocked")
+
+    def test_public_api_and_manifest_schema_remain_legacy(self):
+        self.assertEqual(
+            tuple(inspect.signature(verify_loaded_checkout).parameters),
+            ("repo", "codex_home"),
+        )
+        self.assertEqual(
+            tuple(checkout_module.CheckoutManifest.__dataclass_fields__),
+            (
+                "object_format",
+                "tree_hash",
+                "plugin_blob_oid",
+                "plugin_manifest_hash",
+                "skill_hashes",
+                "materialized_hashes",
+                "skill_names",
+            ),
+        )
+        install_checkout_skills(self.repo, self.codex_home)
+        value = json.loads(
+            (self.codex_home / ".live-eval-checkout.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(set(value), checkout_module._MANIFEST_FIELDS)
+
+    def test_materialized_hardlink_blocks_preflight(self):
+        install_checkout_skills(self.repo, self.codex_home)
+        target = self.codex_home / "skills/workflow/SKILL.md"
+        outside = self.root / "outside-hardlink"
+        os.link(target, outside)
+
+        result = verify_loaded_checkout(self.repo, self.codex_home)
+
+        self.assertEqual(result.classification, "blocked_isolation")
+
+    def test_git_snapshot_disables_malicious_fsmonitor_and_filters_environment(self):
+        sentinel = self.root / "fsmonitor-ran"
+        leaked = self.root / "fsmonitor-env"
+        hook = self.root / "fsmonitor-hook.sh"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "touch '{}'\n"
+            "env > '{}'\n"
+            "exit 0\n".format(sentinel, leaked),
+            encoding="utf-8",
+        )
+        hook.chmod(0o700)
+        self.git("config", "core.fsmonitor", str(hook))
+
+        with patch.dict(os.environ, {"HARNESS_TEST_SECRET": "do-not-leak"}):
+            install_checkout_skills(self.repo, self.codex_home)
+
+        self.assertFalse(sentinel.exists())
+        self.assertFalse(leaked.exists())
 
 
 if __name__ == "__main__":
