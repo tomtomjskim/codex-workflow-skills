@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, fields
 import hashlib
 import inspect
+import math
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,7 @@ _POLICY_CEILINGS = {
     "git_termination_grace_milliseconds": 250,
     "max_git_stdout_bytes": 16 * 1024 * 1024,
     "max_git_stderr_bytes": 64 * 1024,
+    "capture_timeout_seconds": 60,
     "max_config_bytes": 256 * 1024,
     "max_packed_refs_bytes": 4 * 1024 * 1024,
     "max_object_entries": 200000,
@@ -37,7 +39,10 @@ _POLICY_CEILINGS = {
     "max_object_depth": 3,
     "max_component_bytes": 255,
     "max_relative_path_bytes": 4096,
+    "max_tree_entries": 100000,
+    "max_tree_depth": 64,
     "max_files": 10000,
+    "max_unique_blobs": 256,
     "max_file_bytes": 4 * 1024 * 1024,
     "max_total_bytes": 64 * 1024 * 1024,
 }
@@ -71,6 +76,7 @@ class TaskSnapshotPolicy:
     git_termination_grace_milliseconds: int = 250
     max_git_stdout_bytes: int = 16 * 1024 * 1024
     max_git_stderr_bytes: int = 64 * 1024
+    capture_timeout_seconds: int = 60
     max_config_bytes: int = 256 * 1024
     max_packed_refs_bytes: int = 4 * 1024 * 1024
     max_object_entries: int = 200000
@@ -78,7 +84,10 @@ class TaskSnapshotPolicy:
     max_object_depth: int = 3
     max_component_bytes: int = 255
     max_relative_path_bytes: int = 4096
+    max_tree_entries: int = 100000
+    max_tree_depth: int = 64
     max_files: int = 10000
+    max_unique_blobs: int = 256
     max_file_bytes: int = 4 * 1024 * 1024
     max_total_bytes: int = 64 * 1024 * 1024
 
@@ -1269,16 +1278,24 @@ _OPERATION_TEMPLATES = [
         "rev-parse",
         "--verify",
         "--end-of-options",
-        "<validated-full-oid>^{commit}",
+        "<validated-full-commit-oid>^{commit}",
     ],
     [
         "rev-parse",
         "--verify",
         "--end-of-options",
-        "<validated-full-oid>^{tree}",
+        "<validated-full-commit-oid>^{tree}",
     ],
-    ["ls-tree", "-r", "-l", "-z", "--full-tree", "<validated-tree-oid>"],
-    ["cat-file", "blob", "<validated-full-oid>"],
+    [
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        "--format=%(objectmode)%x09%(objecttype)%x09"
+        "%(objectname)%x09%(objectsize)%x09%(path)",
+        "<validated-full-tree-oid>",
+    ],
+    ["cat-file", "blob", "<validated-full-blob-oid>"],
 ]
 
 
@@ -1299,6 +1316,14 @@ def _process_policy_digest(policy: TaskSnapshotPolicy) -> str:
             "submodule.recurse=false",
             "--git-dir=<verified-git-dir>",
         ],
+        "capture_deadline": {
+            "capture_timeout_seconds": policy.capture_timeout_seconds,
+            "clock": "time.monotonic",
+            "effective_process_deadline":
+                "earliest-of-capture-and-operation",
+            "equal_expiry_classification": "task_capture_timeout",
+            "scope": "fresh-F0-through-source-trust-receipt",
+        },
         "close_fds": True,
         "cwd": "/",
         "document_type": "task-git-process-policy-v1",
@@ -1322,6 +1347,13 @@ def _process_policy_digest(policy: TaskSnapshotPolicy) -> str:
             "max_git_stdout_bytes": policy.max_git_stdout_bytes,
         },
         "operation_templates": _OPERATION_TEMPLATES,
+        "output_policy": {
+            "cap_is_inclusive": True,
+            "cap_plus_one_action": "terminate-process-group",
+            "cat_file_blob_stdout_cap": "validated-declared-blob-size",
+            "generic_stdout_cap": "max_git_stdout_bytes",
+            "successful_stderr": "empty",
+        },
         "schema_version": 1,
         "shell": False,
         "start_new_session": True,
@@ -1489,7 +1521,15 @@ def _git_operation_tail(
     if operation == "verify-tree":
         return ("rev-parse", "--verify", "--end-of-options", value + "^{tree}")
     if operation == "ls-tree":
-        return ("ls-tree", "-r", "-l", "-z", "--full-tree", value)
+        return (
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            "--format=%(objectmode)%x09%(objecttype)%x09"
+            "%(objectname)%x09%(objectsize)%x09%(path)",
+            value,
+        )
     if operation == "cat-blob":
         return ("cat-file", "blob", value)
     _fail("task_git_operation_invalid")
@@ -1641,11 +1681,22 @@ def _cleanup_git_failure(
     )
 
 
-def _deadline_remaining(deadline: float) -> Optional[float]:
+def _git_deadline_status(
+    operation_deadline: float,
+    capture_deadline: Optional[float],
+) -> Tuple[Optional[float], str]:
     try:
-        return deadline - time.monotonic()
+        now = time.monotonic()
     except Exception:
-        return None
+        return None, "task_git_failed"
+    operation_remaining = operation_deadline - now
+    if capture_deadline is None:
+        return operation_remaining, "task_git_timeout"
+    capture_remaining = capture_deadline - now
+    remaining = min(operation_remaining, capture_remaining)
+    if capture_remaining <= 0:
+        return remaining, "task_capture_timeout"
+    return remaining, "task_git_timeout"
 
 
 def _run_git(
@@ -1654,6 +1705,9 @@ def _run_git(
     policy: TaskSnapshotPolicy,
     operation: str,
     value: Optional[str] = None,
+    *,
+    capture_deadline: Optional[float] = None,
+    stdout_limit: Optional[int] = None,
 ) -> bytes:
     _validate_policy(policy)
     try:
@@ -1668,6 +1722,26 @@ def _run_git(
     ):
         _fail("task_git_operation_invalid")
     tail = _git_operation_tail(operation, config_path, value)
+    if operation == "cat-blob":
+        if (
+            type(stdout_limit) is not int
+            or stdout_limit < 0
+            or stdout_limit > policy.max_file_bytes
+        ):
+            _fail("task_git_operation_invalid")
+        effective_stdout_limit = stdout_limit
+        stdout_overflow_failure = "task_blob_invalid"
+    else:
+        if stdout_limit is not None:
+            _fail("task_git_operation_invalid")
+        effective_stdout_limit = policy.max_git_stdout_bytes
+        stdout_overflow_failure = "task_git_output_limit"
+    if capture_deadline is not None and (
+        type(capture_deadline) is not float
+        or not math.isfinite(capture_deadline)
+        or capture_deadline < 0.0
+    ):
+        _fail("task_git_operation_invalid")
     argv = (
         "git",
         "-c",
@@ -1683,9 +1757,18 @@ def _run_git(
         "--git-dir=" + raw_git_dir,
     ) + tail
     try:
-        deadline = time.monotonic() + policy.git_timeout_seconds
+        operation_deadline = (
+            time.monotonic() + policy.git_timeout_seconds
+        )
     except Exception:
         _fail("task_git_failed")
+    remaining, timeout_failure = _git_deadline_status(
+        operation_deadline, capture_deadline
+    )
+    if remaining is None:
+        _fail("task_git_failed")
+    if remaining <= 0:
+        _fail(timeout_failure)
     try:
         process = subprocess.Popen(
             argv,
@@ -1699,6 +1782,13 @@ def _run_git(
             start_new_session=True,
         )
     except Exception:
+        remaining, timeout_failure = _git_deadline_status(
+            operation_deadline, capture_deadline
+        )
+        if remaining is None:
+            _fail("task_git_failed")
+        if remaining <= 0:
+            _fail(timeout_failure)
         _fail("task_git_spawn_failed")
     if (
         type(getattr(process, "pid", None)) is not int
@@ -1725,30 +1815,34 @@ def _run_git(
             _fail("task_git_failed")
         _fail("task_git_spawn_failed")
     grace = policy.git_termination_grace_milliseconds / 1000.0
-    remaining = _deadline_remaining(deadline)
+    remaining, timeout_failure = _git_deadline_status(
+        operation_deadline, capture_deadline
+    )
     if remaining is None:
         _cleanup_git_failure(process, (), grace)
         _fail("task_git_failed")
     if remaining <= 0:
         if not _cleanup_git_failure(process, (), grace):
             _fail("task_git_failed")
-        _fail("task_git_timeout")
+        _fail(timeout_failure)
 
     stdout_state = _DrainState()
     stderr_state = _DrainState()
     reader_specs = (
-        (process.stdout, policy.max_git_stdout_bytes, stdout_state),
+        (process.stdout, effective_stdout_limit, stdout_state),
         (process.stderr, policy.max_git_stderr_bytes, stderr_state),
     )
     started_threads = []
     reader_setup_failure = None
     for stream, limit, state in reader_specs:
-        remaining = _deadline_remaining(deadline)
+        remaining, timeout_failure = _git_deadline_status(
+            operation_deadline, capture_deadline
+        )
         if remaining is None:
             reader_setup_failure = "task_git_failed"
             break
         if remaining <= 0:
-            reader_setup_failure = "task_git_timeout"
+            reader_setup_failure = timeout_failure
             break
         try:
             thread = threading.Thread(
@@ -1759,12 +1853,14 @@ def _run_git(
         except Exception:
             reader_setup_failure = "task_git_failed"
             break
-        remaining = _deadline_remaining(deadline)
+        remaining, timeout_failure = _git_deadline_status(
+            operation_deadline, capture_deadline
+        )
         if remaining is None:
             reader_setup_failure = "task_git_failed"
             break
         if remaining <= 0:
-            reader_setup_failure = "task_git_timeout"
+            reader_setup_failure = timeout_failure
             break
         try:
             thread.start()
@@ -1772,12 +1868,14 @@ def _run_git(
             reader_setup_failure = "task_git_failed"
             break
         started_threads.append(thread)
-        remaining = _deadline_remaining(deadline)
+        remaining, timeout_failure = _git_deadline_status(
+            operation_deadline, capture_deadline
+        )
         if remaining is None:
             reader_setup_failure = "task_git_failed"
             break
         if remaining <= 0:
-            reader_setup_failure = "task_git_timeout"
+            reader_setup_failure = timeout_failure
             break
     if reader_setup_failure is not None:
         if not _cleanup_git_failure(process, started_threads, grace):
@@ -1787,17 +1885,25 @@ def _run_git(
     failure = None
     while True:
         try:
-            remaining = deadline - time.monotonic()
+            remaining, timeout_failure = _git_deadline_status(
+                operation_deadline, capture_deadline
+            )
         except Exception:
             failure = "task_git_failed"
             break
+        if remaining is None:
+            failure = "task_git_failed"
+            break
         if remaining <= 0:
-            failure = "task_git_timeout"
+            failure = timeout_failure
             break
         if stdout_state.failed or stderr_state.failed:
             failure = "task_git_failed"
             break
-        if stdout_state.overflow or stderr_state.overflow:
+        if stdout_state.overflow:
+            failure = stdout_overflow_failure
+            break
+        if stderr_state.overflow:
             failure = "task_git_output_limit"
             break
         try:
@@ -1833,22 +1939,12 @@ def _run_git(
         _fail(failure)
 
     try:
-        remaining = deadline - time.monotonic()
+        remaining, timeout_failure = _git_deadline_status(
+            operation_deadline, capture_deadline
+        )
     except Exception:
         _cleanup_git_failure(process, started_threads, grace)
         _fail("task_git_failed")
-    if remaining <= 0:
-        if not _cleanup_git_failure(
-            process, started_threads, grace
-        ):
-            _fail("task_git_failed")
-        _fail("task_git_timeout")
-    try:
-        return_code = process.wait(timeout=max(remaining, 0.001))
-    except Exception:
-        _cleanup_git_failure(process, started_threads, grace)
-        _fail("task_git_failed")
-    remaining = _deadline_remaining(deadline)
     if remaining is None:
         _cleanup_git_failure(process, started_threads, grace)
         _fail("task_git_failed")
@@ -1857,11 +1953,30 @@ def _run_git(
             process, started_threads, grace
         ):
             _fail("task_git_failed")
-        _fail("task_git_timeout")
+        _fail(timeout_failure)
+    try:
+        return_code = process.wait(timeout=max(remaining, 0.001))
+    except Exception:
+        _cleanup_git_failure(process, started_threads, grace)
+        _fail("task_git_failed")
+    remaining, timeout_failure = _git_deadline_status(
+        operation_deadline, capture_deadline
+    )
+    if remaining is None:
+        _cleanup_git_failure(process, started_threads, grace)
+        _fail("task_git_failed")
+    if remaining <= 0:
+        if not _cleanup_git_failure(
+            process, started_threads, grace
+        ):
+            _fail("task_git_failed")
+        _fail(timeout_failure)
     join_ok = _join_started_threads(
         started_threads, min(grace, remaining)
     )
-    remaining = _deadline_remaining(deadline)
+    remaining, timeout_failure = _git_deadline_status(
+        operation_deadline, capture_deadline
+    )
     if not join_ok or remaining is None:
         _cleanup_git_failure(process, started_threads, grace)
         _fail("task_git_failed")
@@ -1870,7 +1985,7 @@ def _run_git(
             process, started_threads, grace
         ):
             _fail("task_git_failed")
-        _fail("task_git_timeout")
+        _fail(timeout_failure)
     nominal_ok = (
         _started_threads_stopped(started_threads)
         and not stdout_state.failed
@@ -1881,6 +1996,10 @@ def _run_git(
     )
     if return_code != 0 or not nominal_ok:
         _cleanup_git_failure(process, started_threads, grace)
+        _fail("task_git_failed")
+    if stderr_state.data:
+        if not _cleanup_git_failure(process, started_threads, grace):
+            _fail("task_git_failed")
         _fail("task_git_failed")
     if not _close_process_pipes(process):
         _cleanup_git_failure(process, started_threads, grace)

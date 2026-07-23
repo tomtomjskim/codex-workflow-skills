@@ -6,7 +6,7 @@ import errno
 import io
 import socket
 import unittest
-from dataclasses import replace
+from dataclasses import fields, replace
 from unittest.mock import patch
 
 import scripts.live_eval.task_snapshot as task_snapshot_module
@@ -19,6 +19,7 @@ from scripts.live_eval.task_snapshot import (
     _capture_filesystem,
     _capture_object_topology,
     _cleanup_process,
+    _git_operation_tail,
     _open_root_descriptor,
     _parse_config_output,
     _parse_packed_refs,
@@ -157,6 +158,56 @@ class TaskSnapshotSurfaceTests(unittest.TestCase):
                 TaskSnapshotError, "^task_snapshot_policy_invalid$"
             ):
                 TaskSnapshotPolicy(**values)
+
+    def test_task7_policy_fields_have_exact_order_defaults_and_hard_caps(self):
+        expected = (
+            ("policy_version", "task-object-materializer-v1"),
+            ("git_timeout_seconds", 15),
+            ("git_termination_grace_milliseconds", 250),
+            ("max_git_stdout_bytes", 16 * 1024 * 1024),
+            ("max_git_stderr_bytes", 64 * 1024),
+            ("capture_timeout_seconds", 60),
+            ("max_config_bytes", 256 * 1024),
+            ("max_packed_refs_bytes", 4 * 1024 * 1024),
+            ("max_object_entries", 200000),
+            ("max_object_store_bytes", 2 * 1024 * 1024 * 1024),
+            ("max_object_depth", 3),
+            ("max_component_bytes", 255),
+            ("max_relative_path_bytes", 4096),
+            ("max_tree_entries", 100000),
+            ("max_tree_depth", 64),
+            ("max_files", 10000),
+            ("max_unique_blobs", 256),
+            ("max_file_bytes", 4 * 1024 * 1024),
+            ("max_total_bytes", 64 * 1024 * 1024),
+        )
+        policy = TaskSnapshotPolicy()
+
+        self.assertEqual(
+            tuple((item.name, getattr(policy, item.name)) for item in fields(policy)),
+            expected,
+        )
+        for name, ceiling in (
+            ("capture_timeout_seconds", 60),
+            ("max_tree_entries", 100000),
+            ("max_tree_depth", 64),
+            ("max_unique_blobs", 256),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    getattr(TaskSnapshotPolicy(**{name: ceiling}), name),
+                    ceiling,
+                )
+                self.assertEqual(
+                    getattr(TaskSnapshotPolicy(**{name: 1}), name),
+                    1,
+                )
+                for invalid in (True, 0, ceiling + 1):
+                    with self.assertRaisesRegex(
+                        TaskSnapshotError,
+                        "^task_snapshot_policy_invalid$",
+                    ):
+                        TaskSnapshotPolicy(**{name: invalid})
 
     def test_platform_and_physical_root_fail_closed(self):
         with patch("scripts.live_eval.task_snapshot.sys.platform", "win32"):
@@ -678,7 +729,484 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
 
 
 class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
-    def test_real_config_and_storage_operations_are_bounded(self):
+    def test_task7_process_policy_and_formatted_tree_tail_are_exact(self):
+        policy = TaskSnapshotPolicy(
+            git_timeout_seconds=3,
+            git_termination_grace_milliseconds=10,
+            max_git_stdout_bytes=4096,
+            max_git_stderr_bytes=512,
+            capture_timeout_seconds=7,
+            max_config_bytes=1024,
+        )
+        expected_digest = "sha256:" + "d" * 64
+        expected_tree_tail = (
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            "--format=%(objectmode)%x09%(objecttype)%x09"
+            "%(objectname)%x09%(objectsize)%x09%(path)",
+            "a" * 40,
+        )
+
+        self.assertEqual(
+            _git_operation_tail(
+                "ls-tree", Path("/verified/config"), "a" * 40
+            ),
+            expected_tree_tail,
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot._digest",
+            return_value=expected_digest,
+        ) as digest:
+            self.assertEqual(_process_policy_digest(policy), expected_digest)
+
+        document = digest.call_args.args[0]
+        self.assertEqual(
+            document,
+            {
+                "argv_prefix": [
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.attributesFile=<null-device>",
+                    "-c",
+                    "core.excludesFile=<null-device>",
+                    "-c",
+                    "core.hooksPath=<null-device>",
+                    "-c",
+                    "submodule.recurse=false",
+                    "--git-dir=<verified-git-dir>",
+                ],
+                "capture_deadline": {
+                    "capture_timeout_seconds": 7,
+                    "clock": "time.monotonic",
+                    "effective_process_deadline":
+                        "earliest-of-capture-and-operation",
+                    "equal_expiry_classification":
+                        "task_capture_timeout",
+                    "scope": "fresh-F0-through-source-trust-receipt",
+                },
+                "close_fds": True,
+                "cwd": "/",
+                "document_type": "task-git-process-policy-v1",
+                "environment": {
+                    "GIT_ATTR_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": "<null-device>",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_NO_LAZY_FETCH": "1",
+                    "GIT_NO_REPLACE_OBJECTS": "1",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": "<os.defpath>",
+                },
+                "limits": {
+                    "git_termination_grace_milliseconds": 10,
+                    "git_timeout_seconds": 3,
+                    "max_git_stderr_bytes": 512,
+                    "max_git_stdout_bytes": 4096,
+                },
+                "operation_templates": [
+                    [
+                        "config",
+                        "--file=<verified-config>",
+                        "--no-includes",
+                        "--null",
+                        "--list",
+                    ],
+                    ["rev-parse", "--show-object-format=storage"],
+                    [
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        "<validated-full-commit-oid>^{commit}",
+                    ],
+                    [
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        "<validated-full-commit-oid>^{tree}",
+                    ],
+                    [
+                        "ls-tree",
+                        "-r",
+                        "-z",
+                        "--full-tree",
+                        "--format=%(objectmode)%x09%(objecttype)%x09"
+                        "%(objectname)%x09%(objectsize)%x09%(path)",
+                        "<validated-full-tree-oid>",
+                    ],
+                    [
+                        "cat-file",
+                        "blob",
+                        "<validated-full-blob-oid>",
+                    ],
+                ],
+                "output_policy": {
+                    "cap_is_inclusive": True,
+                    "cap_plus_one_action":
+                        "terminate-process-group",
+                    "cat_file_blob_stdout_cap":
+                        "validated-declared-blob-size",
+                    "generic_stdout_cap": "max_git_stdout_bytes",
+                    "successful_stderr": "empty",
+                },
+                "schema_version": 1,
+                "shell": False,
+                "start_new_session": True,
+                "stdin": "DEVNULL",
+                "termination": [
+                    "concurrent-bounded-drain",
+                    "monotonic-deadline",
+                    "TERM",
+                    "bounded-grace",
+                    "KILL",
+                    "reap",
+                    "close-pipes",
+                    "verify-group-absent",
+                ],
+            },
+        )
+
+    def test_success_with_stderr_is_rejected(self):
+        repo, oid = self.make_repository()
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"sha1\n")
+                self.stderr = io.BytesIO(b"warning-private-sentinel\n")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=FakeProcess(),
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=ProcessLookupError,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ) as caught:
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(),
+                "storage-format",
+            )
+
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_blob_dynamic_stdout_cap_accepts_zero_and_exact_then_rejects_plus_one(
+        self,
+    ):
+        repo, oid = self.make_repository()
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self, output):
+                self.stdout = io.BytesIO(output)
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def run_blob(output, stdout_limit):
+            with patch(
+                "scripts.live_eval.task_snapshot.subprocess.Popen",
+                return_value=FakeProcess(output),
+            ), patch(
+                "scripts.live_eval.task_snapshot.os.killpg",
+                side_effect=ProcessLookupError,
+            ):
+                return _run_git(
+                    repo / ".git",
+                    repo / ".git" / "config",
+                    TaskSnapshotPolicy(),
+                    "cat-blob",
+                    "a" * 40,
+                    stdout_limit=stdout_limit,
+                )
+
+        self.assertEqual(run_blob(b"", 0), b"")
+        self.assertEqual(run_blob(b"blob", 4), b"blob")
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_blob_invalid$"
+        ) as caught:
+            run_blob(b"x", 0)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_capture_deadline_precedes_or_ties_operation_deadline(self):
+        repo, oid = self.make_repository()
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        cases = (
+            (1, 1.0, 2.0, "task_capture_timeout"),
+            (5, 1.0, 2.0, "task_capture_timeout"),
+            (1, 5.0, 2.0, "task_git_timeout"),
+            (1, 5.0, 6.0, "task_capture_timeout"),
+        )
+        for (
+            operation_timeout,
+            capture_deadline,
+            observed_at,
+            expected,
+        ) in cases:
+            with self.subTest(
+                operation_timeout=operation_timeout,
+                capture_deadline=capture_deadline,
+                observed_at=observed_at,
+            ):
+                clock = Clock()
+
+                def delayed_spawn(*args, **kwargs):
+                    clock.value = observed_at
+                    return FakeProcess()
+
+                with patch(
+                    "scripts.live_eval.task_snapshot.time.monotonic", clock
+                ), patch(
+                    "scripts.live_eval.task_snapshot.subprocess.Popen",
+                    side_effect=delayed_spawn,
+                ), patch(
+                    "scripts.live_eval.task_snapshot.os.killpg",
+                    side_effect=ProcessLookupError,
+                ), self.assertRaisesRegex(
+                    TaskSnapshotError, "^" + expected + "$"
+                ):
+                    _run_git(
+                        repo / ".git",
+                        repo / ".git" / "config",
+                        TaskSnapshotPolicy(
+                            git_timeout_seconds=operation_timeout
+                        ),
+                        "storage-format",
+                        capture_deadline=capture_deadline,
+                    )
+
+    def test_expired_capture_deadline_prevents_spawn(self):
+        repo, oid = self.make_repository()
+        with patch(
+            "scripts.live_eval.task_snapshot.time.monotonic",
+            side_effect=(2.0, 2.0),
+        ), patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+        ) as popen, self.assertRaisesRegex(
+            TaskSnapshotError, "^task_capture_timeout$"
+        ) as caught:
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(git_timeout_seconds=5),
+                "storage-format",
+                capture_deadline=1.0,
+            )
+
+        popen.assert_not_called()
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_raising_spawn_rechecks_capture_deadline(self):
+        repo, oid = self.make_repository()
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        cases = (
+            (5, 2.0, 1.0, "task_capture_timeout"),
+            (5, 2.0, 3.0, "task_git_spawn_failed"),
+            (1, 2.0, 5.0, "task_git_timeout"),
+        )
+        for (
+            operation_timeout,
+            observed_at,
+            capture_deadline,
+            expected,
+        ) in cases:
+            with self.subTest(
+                operation_timeout=operation_timeout,
+                observed_at=observed_at,
+                capture_deadline=capture_deadline,
+            ):
+                clock = Clock()
+
+                def delayed_failure(*args, **kwargs):
+                    clock.value = observed_at
+                    raise OSError("spawn-private-sentinel")
+
+                with patch(
+                    "scripts.live_eval.task_snapshot.time.monotonic",
+                    clock,
+                ), patch(
+                    "scripts.live_eval.task_snapshot.subprocess.Popen",
+                    side_effect=delayed_failure,
+                ) as popen, self.assertRaisesRegex(
+                    TaskSnapshotError, "^" + expected + "$"
+                ) as caught:
+                    _run_git(
+                        repo / ".git",
+                        repo / ".git" / "config",
+                        TaskSnapshotPolicy(
+                            git_timeout_seconds=operation_timeout
+                        ),
+                        "storage-format",
+                        capture_deadline=capture_deadline,
+                    )
+
+                self.assertEqual(popen.call_count, 1)
+                self.assertIsNone(caught.exception.__context__)
+                self.assertIsNone(caught.exception.__cause__)
+
+    def test_blob_overflow_precedes_simultaneous_stderr_overflow(self):
+        repo, oid = self.make_repository()
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"x")
+                self.stderr = io.BytesIO(b"yz")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        class SynchronousThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+            def join(self, timeout=None):
+                return None
+
+            def is_alive(self):
+                return False
+
+        def run(cleanup_result=True):
+            with patch(
+                "scripts.live_eval.task_snapshot.subprocess.Popen",
+                return_value=FakeProcess(),
+            ), patch(
+                "scripts.live_eval.task_snapshot.threading.Thread",
+                side_effect=SynchronousThread,
+            ), patch(
+                "scripts.live_eval.task_snapshot.os.killpg",
+                side_effect=ProcessLookupError,
+            ), patch(
+                "scripts.live_eval.task_snapshot._cleanup_git_failure",
+                return_value=cleanup_result,
+            ):
+                return _run_git(
+                    repo / ".git",
+                    repo / ".git" / "config",
+                    TaskSnapshotPolicy(max_git_stderr_bytes=1),
+                    "cat-blob",
+                    "a" * 40,
+                    stdout_limit=0,
+                )
+
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_blob_invalid$"
+        ):
+            run()
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ):
+            run(cleanup_result=False)
+
+    def test_capture_timeout_cleanup_failure_overrides_classification(self):
+        repo, oid = self.make_repository()
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        clock = Clock()
+
+        def delayed_spawn(*args, **kwargs):
+            clock.value = 2.0
+            return FakeProcess()
+
+        with patch(
+            "scripts.live_eval.task_snapshot.time.monotonic", clock
+        ), patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            side_effect=delayed_spawn,
+        ), patch(
+            "scripts.live_eval.task_snapshot._cleanup_git_failure",
+            return_value=False,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ):
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(git_timeout_seconds=5),
+                "storage-format",
+                capture_deadline=1.0,
+            )
+
+    def test_real_config_and_storage_operations_accept_inclusive_caps(self):
         repo, oid = self.make_repository()
         policy = TaskSnapshotPolicy()
         git_dir = repo / ".git"
@@ -701,15 +1229,6 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
         self.assertEqual(
             _run_git(git_dir, config, exact, "config"), config_output
         )
-        over = TaskSnapshotPolicy(
-            max_git_stdout_bytes=len(config_output) - 1,
-            max_git_stderr_bytes=min(64, len(config_output) - 1),
-            max_config_bytes=len(config_output) - 1,
-        )
-        with self.assertRaisesRegex(
-            TaskSnapshotError, "^task_git_output_limit$"
-        ):
-            _run_git(git_dir, config, over, "config")
 
     def test_exact_process_contract_and_replacement_environment(self):
         repo, oid = self.make_repository()
