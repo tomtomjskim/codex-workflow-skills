@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import errno
 import io
 import socket
 import unittest
@@ -23,6 +24,7 @@ from scripts.live_eval.task_snapshot import (
     _require_supported_platform,
     _run_git,
     _source_identity_digest,
+    _open_child_directory,
     _validate_physical_root,
     prepare_task_source,
 )
@@ -174,6 +176,26 @@ class TaskSnapshotSurfaceTests(unittest.TestCase):
             ):
                 _validate_physical_root(candidate)
 
+    def test_pathlike_failure_is_fixed_and_has_no_exception_chain(self):
+        class RaisingPath:
+            def __fspath__(self):
+                raise RuntimeError("private-path-sentinel")
+
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_spec_invalid$"
+        ) as caught:
+            TaskSourceSpec(
+                input_digest="sha256:" + "1" * 64,
+                task_id="task-1",
+                repository_root=RaisingPath(),
+                commit_oid="a" * 40,
+                provisioning_class="operator_owned_trusted_git_local_clone",
+                operator_attested=True,
+                local_clone_policy="remote_or_no_local_or_no_hardlinks",
+            )
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+
 
 class TaskSnapshotControlTests(RepositoryFixture, unittest.TestCase):
     def test_config_parser_accepts_closed_sha1_profile(self):
@@ -224,14 +246,38 @@ class TaskSnapshotControlTests(RepositoryFixture, unittest.TestCase):
             base + b"core.fsmonitor\n/tmp/sentinel\0",
             base + b"filter.lfs.clean\nsentinel\0",
             base + b"remote.origin.promisor\ntrue\0",
+            base
+            + "remote.origin.url\nhttps://example.invalid/\u0085secret\0".encode(
+                "utf-8"
+            ),
             b"core.repositoryformatversion\n1\0core.bare\nfalse\0",
             base + b"bad\nvalue\nextra\0",
         )
         for payload in attacks:
             with self.subTest(payload=payload), self.assertRaisesRegex(
                 TaskSnapshotError, "^task_source_config_invalid$"
-            ):
+            ) as caught:
                 _parse_config_output(payload, raw_digest, "sha1")
+            self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
+
+    def test_promisor_prescan_has_an_independent_inclusive_entry_cap(self):
+        repo, oid = self.make_repository()
+        pack = repo / ".git" / "objects" / "pack"
+        pack.mkdir(exist_ok=True)
+        cap = 20
+        for index in range(cap):
+            (pack / "sentinel-{:02d}".format(index)).write_bytes(b"x")
+        source = self.source_for(repo, oid)
+        policy = TaskSnapshotPolicy(max_object_entries=cap)
+
+        _capture_filesystem(source, policy, "sha1")
+        (pack / "sentinel-over").write_bytes(b"x")
+
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_control_invalid$"
+        ):
+            _capture_filesystem(source, policy, "sha1")
 
     def test_controls_bind_config_and_reject_indirection(self):
         policy = TaskSnapshotPolicy()
@@ -374,6 +420,110 @@ class TaskSnapshotTopologyTests(RepositoryFixture, unittest.TestCase):
         self.assertEqual(first, second)
         self.assertRegex(first, r"^sha256:[0-9a-f]{64}$")
         self.assertRegex(source_identity, r"^sha256:[0-9a-f]{64}$")
+
+    def test_child_descriptor_faults_close_once_without_fd_leak(self):
+        repo, oid = self.make_repository()
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        real_open = os.open
+        real_fstat = os.fstat
+        real_close = os.close
+        for fault in ("fstat", "identity"):
+            with self.subTest(fault=fault):
+                parent_fd = real_open(str(repo), flags)
+                acquired = []
+                closed = []
+
+                def tracking_open(path, open_flags, *args, **kwargs):
+                    descriptor = real_open(path, open_flags, *args, **kwargs)
+                    if path == ".git":
+                        acquired.append(descriptor)
+                    return descriptor
+
+                def failing_fstat(descriptor):
+                    if fault == "fstat" and acquired and descriptor == acquired[0]:
+                        raise OSError(errno.EIO, "fd-sentinel")
+                    return real_fstat(descriptor)
+
+                def tracking_close(descriptor):
+                    if acquired and descriptor == acquired[0]:
+                        closed.append(descriptor)
+                    return real_close(descriptor)
+
+                identity_patch = (
+                    patch(
+                        "scripts.live_eval.task_snapshot._same_identity",
+                        side_effect=ValueError("identity-sentinel"),
+                    )
+                    if fault == "identity"
+                    else patch(
+                        "scripts.live_eval.task_snapshot._same_identity",
+                        wraps=task_snapshot_module._same_identity,
+                    )
+                )
+                try:
+                    with patch(
+                        "scripts.live_eval.task_snapshot.os.open",
+                        side_effect=tracking_open,
+                    ), patch(
+                        "scripts.live_eval.task_snapshot.os.fstat",
+                        side_effect=failing_fstat,
+                    ), patch(
+                        "scripts.live_eval.task_snapshot.os.close",
+                        side_effect=tracking_close,
+                    ), identity_patch, self.assertRaises(TaskSnapshotError):
+                        _open_child_directory(
+                            parent_fd,
+                            ".git",
+                            real_fstat(parent_fd).st_dev,
+                            "task_source_git_dir_invalid",
+                        )
+                    self.assertEqual(len(acquired), 1)
+                    self.assertEqual(closed, acquired)
+                    with self.assertRaises(OSError) as caught:
+                        real_fstat(acquired[0])
+                    self.assertEqual(caught.exception.errno, errno.EBADF)
+                finally:
+                    real_close(parent_fd)
+
+    def test_scandir_transfer_fault_closes_new_child_descriptor_once(self):
+        repo, oid = self.make_repository()
+        real_scandir = os.scandir
+        real_fstat = os.fstat
+        real_close = os.close
+        calls = []
+        failed_fd = []
+        closed = []
+
+        def failing_scandir(descriptor):
+            calls.append(descriptor)
+            if len(calls) == 2:
+                failed_fd.append(descriptor)
+                raise OSError(errno.EIO, "scandir-sentinel")
+            return real_scandir(descriptor)
+
+        def tracking_close(descriptor):
+            if failed_fd and descriptor == failed_fd[0]:
+                closed.append(descriptor)
+            return real_close(descriptor)
+
+        with patch(
+            "scripts.live_eval.task_snapshot.os.scandir",
+            side_effect=failing_scandir,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.close",
+            side_effect=tracking_close,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_source_topology_invalid$"
+        ):
+            _capture_object_topology(
+                self.source_for(repo, oid), TaskSnapshotPolicy(), "sha1"
+            )
+
+        self.assertEqual(len(failed_fd), 1)
+        self.assertEqual(closed, failed_fd)
+        with self.assertRaises(OSError) as caught:
+            real_fstat(failed_fd[0])
+        self.assertEqual(caught.exception.errno, errno.EBADF)
 
 
 class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
@@ -527,6 +677,299 @@ class TaskSnapshotGitAdapterTests(RepositoryFixture, unittest.TestCase):
                     "storage-format",
                 )
 
+    def test_spawn_failure_is_fixed_and_has_no_exception_chain(self):
+        repo, oid = self.make_repository()
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            side_effect=OSError("spawn-private-sentinel"),
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_spawn_failed$"
+        ) as caught:
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(),
+                "storage-format",
+                )
+            self.assertIsNone(caught.exception.__context__)
+            self.assertIsNone(caught.exception.__cause__)
+
+        class RaisingConfigPath:
+            def __fspath__(self):
+                raise RuntimeError("config-path-private-sentinel")
+
+        with self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_operation_invalid$"
+        ) as caught:
+            _run_git(
+                repo / ".git",
+                RaisingConfigPath(),
+                TaskSnapshotPolicy(),
+                "config",
+            )
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_partial_reader_start_failure_cleans_only_started_thread(self):
+        repo, oid = self.make_repository()
+        signals = []
+        threads = []
+
+        class FakeProcess:
+            pid = 987654
+            returncode = None
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = -15
+                return self.returncode
+
+        class FakeThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.started = False
+                self.joined = False
+                threads.append(self)
+
+            def start(self):
+                if len(threads) == 2:
+                    raise RuntimeError("thread-start-sentinel")
+                self.started = True
+                self.target(*self.args)
+
+            def join(self, timeout=None):
+                if not self.started:
+                    raise RuntimeError("joined-unstarted-sentinel")
+                self.joined = True
+
+            def is_alive(self):
+                return False
+
+        group_alive = {"value": True}
+
+        def kill_group(process_group, selected_signal):
+            signals.append(selected_signal)
+            if selected_signal == 0:
+                if group_alive["value"]:
+                    return None
+                raise ProcessLookupError
+            if selected_signal == task_snapshot_module.signal.SIGTERM:
+                group_alive["value"] = False
+
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=FakeProcess(),
+        ), patch(
+            "scripts.live_eval.task_snapshot.threading.Thread",
+            side_effect=FakeThread,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=kill_group,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ) as caught:
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(),
+                "storage-format",
+            )
+
+        self.assertTrue(threads[0].joined)
+        self.assertFalse(threads[1].joined)
+        self.assertIn(task_snapshot_module.signal.SIGTERM, signals)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_poll_monitor_failure_runs_cleanup_and_is_fixed(self):
+        repo, oid = self.make_repository()
+        signals = []
+
+        class StatefulProcess:
+            pid = 987654
+            returncode = None
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+                self.poll_calls = 0
+
+            def poll(self):
+                self.poll_calls += 1
+                if self.poll_calls == 1:
+                    raise RuntimeError("poll-private-sentinel")
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = -15
+                return self.returncode
+
+        process = StatefulProcess()
+        group_alive = {"value": True}
+
+        def kill_group(process_group, selected_signal):
+            signals.append(selected_signal)
+            if selected_signal == 0:
+                if group_alive["value"]:
+                    return None
+                raise ProcessLookupError
+            group_alive["value"] = False
+
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=process,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=kill_group,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ) as caught:
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(),
+                "storage-format",
+            )
+
+        self.assertIn(task_snapshot_module.signal.SIGTERM, signals)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_deadline_starts_before_popen(self):
+        repo, oid = self.make_repository()
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        clock = Clock()
+
+        def delayed_spawn(*args, **kwargs):
+            clock.value = 2.0
+            return FakeProcess()
+
+        with patch(
+            "scripts.live_eval.task_snapshot.time.monotonic", clock
+        ), patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            side_effect=delayed_spawn,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=ProcessLookupError,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_timeout$"
+        ):
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(git_timeout_seconds=1),
+                "storage-format",
+            )
+
+    def test_simultaneous_pipe_caps_and_residual_group_fail_closed(self):
+        repo, oid = self.make_repository()
+
+        class TrackingBytesIO(io.BytesIO):
+            consumed = None
+
+            def close(self):
+                self.consumed = self.tell()
+                super().close()
+
+        class FakeProcess:
+            pid = 987654
+            returncode = 0
+
+            def __init__(self, stdout, stderr):
+                self.stdout = TrackingBytesIO(stdout)
+                self.stderr = TrackingBytesIO(stderr)
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        saturated = FakeProcess(b"12345", b"abcde")
+        cap_policy = TaskSnapshotPolicy(
+            max_git_stdout_bytes=4,
+            max_git_stderr_bytes=4,
+            max_config_bytes=4,
+        )
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=saturated,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=ProcessLookupError,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_output_limit$"
+        ):
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                cap_policy,
+                "storage-format",
+            )
+        self.assertEqual(saturated.stdout.consumed, 5)
+        self.assertEqual(saturated.stderr.consumed, 5)
+
+        residual = FakeProcess(b"", b"")
+        signals = []
+        group_alive = {"value": True}
+
+        def kill_group(process_group, selected_signal):
+            signals.append(selected_signal)
+            if selected_signal == 0:
+                if group_alive["value"]:
+                    return None
+                raise ProcessLookupError
+            group_alive["value"] = False
+
+        with patch(
+            "scripts.live_eval.task_snapshot.subprocess.Popen",
+            return_value=residual,
+        ), patch(
+            "scripts.live_eval.task_snapshot.os.killpg",
+            side_effect=kill_group,
+        ), self.assertRaisesRegex(
+            TaskSnapshotError, "^task_git_failed$"
+        ):
+            _run_git(
+                repo / ".git",
+                repo / ".git" / "config",
+                TaskSnapshotPolicy(),
+                "storage-format",
+            )
+        self.assertIn(task_snapshot_module.signal.SIGTERM, signals)
+        self.assertFalse(group_alive["value"])
+
 
 class TaskSnapshotPreparationTests(RepositoryFixture, unittest.TestCase):
     def test_prepares_immutable_path_private_source_without_receipt(self):
@@ -577,6 +1020,33 @@ class TaskSnapshotPreparationTests(RepositoryFixture, unittest.TestCase):
         self.assertEqual(
             operations,
             [("config", None), ("storage-format", None), ("config", None)],
+        )
+
+    def test_sticky_ancestor_sibling_churn_does_not_change_source_seal(self):
+        repo, oid = self.make_repository()
+        source = self.source_for(repo, oid)
+        original = task_snapshot_module._run_git
+        mutated = {"value": False}
+
+        def sibling_churn(git_dir, config_path, policy, operation, value=None):
+            if not mutated["value"]:
+                (repo.parent / "unrelated-sibling").write_bytes(b"x")
+                mutated["value"] = True
+            return original(git_dir, config_path, policy, operation, value)
+
+        with patch(
+            "scripts.live_eval.task_snapshot._run_git",
+            side_effect=sibling_churn,
+        ):
+            prepared = prepare_task_source(source, TaskSnapshotPolicy())
+
+        self.assertIs(type(prepared), PreparedTaskSource)
+        ancestor_keys = {"kind", "mode", "dev", "ino", "uid", "gid"}
+        self.assertTrue(
+            all(
+                set(record) == ancestor_keys
+                for record in _validate_physical_root(repo)
+            )
         )
 
     def test_seal_change_is_rejected_after_second_capture(self):
