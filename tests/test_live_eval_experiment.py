@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import io
 import inspect
 import itertools
 import json
@@ -8,14 +9,17 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import fields, replace
 from pathlib import Path
 from types import MappingProxyType
 from unittest import mock
 
+import scripts.run_harness_experiment as experiment_cli
 import scripts.live_eval.experiment as experiment_module
 from scripts.live_eval.checkout import CheckoutManifest
 from scripts.live_eval.experiment import (
@@ -1586,6 +1590,647 @@ class FullPreflightIntegrationTests(unittest.TestCase):
             document,
             repositories,
         )
+
+    def _cli_arguments(self, request, plan_path, repositories):
+        arguments = [
+            "preflight",
+            "--input",
+            str(plan_path),
+            "--bundle-root",
+            str(request.bundle_root),
+            "--skill-repo",
+            str(request.skill_repo),
+            "--temp-parent",
+            str(request.temp_parent),
+        ]
+        for task_id in sorted(repositories):
+            arguments.extend(
+                (
+                    "--task-source",
+                    "{}={}".format(task_id, repositories[task_id]),
+                )
+            )
+        return arguments
+
+    def _run_cli(self, arguments):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            return_code = experiment_cli.main(arguments)
+        return return_code, stdout.getvalue(), stderr.getvalue()
+
+    def _assert_fixed_blocked_cli_output(self, output):
+        self.assertEqual(output.count("\n"), 1)
+        self.assertTrue(output.endswith("\n"))
+        payload = json.loads(output)
+        self.assertEqual(
+            payload,
+            {
+                "bundle_digest": None,
+                "cleanup_state": "not_started",
+                "current_profile_digest": None,
+                "global_agents_marker_state": (
+                    "global_agents_marker_not_run"
+                ),
+                "lean_profile_digest": None,
+                "live_backend_state": "live_backend_not_implemented",
+                "materialization_result": "blocked",
+                "model_calls": 0,
+                "pilot_state": "pilot_not_run",
+                "plan_digest": None,
+                "preflight_receipt_digest": None,
+                "qualification_evidence_classification": "not_validated",
+                "reason_code": "experiment_preflight_invalid",
+                "status": "blocked",
+                "task_corpus_receipt_digest": None,
+            },
+        )
+        self.assertEqual(
+            output,
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            + "\n",
+        )
+
+    def test_cli_parser_surface_is_exactly_preflight_and_static_options(self):
+        parser = experiment_cli._build_parser()
+        self.assertEqual(
+            {
+                option
+                for action in parser._actions
+                for option in action.option_strings
+            },
+            {"-h", "--help"},
+        )
+        subparsers = tuple(
+            action
+            for action in parser._actions
+            if isinstance(action, experiment_cli.argparse._SubParsersAction)
+        )
+        self.assertEqual(len(subparsers), 1)
+        self.assertEqual(set(subparsers[0].choices), {"preflight"})
+        preflight = subparsers[0].choices["preflight"]
+        option_actions = tuple(
+            action
+            for action in preflight._actions
+            if action.option_strings
+        )
+        self.assertEqual(
+            {
+                option
+                for action in option_actions
+                for option in action.option_strings
+            },
+            {
+                "-h",
+                "--help",
+                "--input",
+                "--bundle-root",
+                "--skill-repo",
+                "--temp-parent",
+                "--task-source",
+            },
+        )
+        self.assertEqual(
+            {
+                action.option_strings[-1]
+                for action in option_actions
+                if action.required
+            },
+            {
+                "--input",
+                "--bundle-root",
+                "--skill-repo",
+                "--temp-parent",
+                "--task-source",
+            },
+        )
+        task_source = next(
+            action
+            for action in option_actions
+            if "--task-source" in action.option_strings
+        )
+        self.assertIsInstance(
+            task_source, experiment_cli.argparse._AppendAction
+        )
+
+    def test_cli_direct_script_bootstrap_and_entrypoint_are_sanitized(self):
+        root = Path(__file__).parents[1]
+        script = root / "scripts" / "run_harness_experiment.py"
+        completed = subprocess.run(
+            (sys.executable, str(script), "canary"),
+            cwd=str(root),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stderr, "")
+        self._assert_fixed_blocked_cli_output(completed.stdout)
+        self.assertNotIn(str(root), completed.stdout)
+
+        with mock.patch.object(
+            experiment_cli,
+            "main",
+            side_effect=KeyboardInterrupt(),
+        ):
+            self.assertEqual(experiment_cli._entrypoint(()), 130)
+
+    def test_cli_fixture_backed_preflight_is_static_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve() / "PRIVATE-CLI-PATH"
+            base.mkdir(mode=0o700)
+            request, unused_document, repositories = (
+                self._make_request_fixture(base)
+            )
+            plan_path = base / "private-plan.json"
+            plan_path.write_bytes(
+                request.experiment_input.canonical_bytes
+            )
+            arguments = self._cli_arguments(
+                request, plan_path, repositories
+            )
+
+            return_code, stdout, stderr = self._run_cli(arguments)
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(stdout.count("\n"), 1)
+            payload = json.loads(stdout)
+            self.assertEqual(payload["status"], "static_only")
+            self.assertEqual(
+                payload["live_backend_state"],
+                "live_backend_not_implemented",
+            )
+            self.assertEqual(
+                payload["global_agents_marker_state"],
+                "global_agents_marker_not_run",
+            )
+            self.assertEqual(payload["pilot_state"], "pilot_not_run")
+            self.assertEqual(
+                payload["qualification_evidence_classification"],
+                "operator_attested_static",
+            )
+            self.assertEqual(payload["model_calls"], 0)
+            self.assertEqual(
+                payload["materialization_result"], "verified"
+            )
+            self.assertEqual(payload["cleanup_state"], "removed")
+            self.assertEqual(
+                payload["reason_code"], "static_preflight_verified"
+            )
+            self.assertEqual(
+                stdout,
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                + "\n",
+            )
+            captured = stdout + stderr
+            for private_value in (
+                str(base),
+                str(plan_path),
+                str(request.bundle_root),
+                str(request.skill_repo),
+                str(request.temp_parent),
+                *(str(path) for path in repositories.values()),
+                "LOCAL-SENTINEL-DO-NOT-LEAK",
+            ):
+                self.assertNotIn(private_value, captured)
+            self.assertEqual(tuple(request.temp_parent.iterdir()), ())
+
+    def test_cli_rejects_live_commands_and_options_before_any_read_or_run(self):
+        private_path = "/private/SYNTHETIC-CLI-PATH"
+        secret = "synthetic-secret-value"
+        valid_shape = (
+            "preflight",
+            "--input",
+            private_path,
+            "--bundle-root",
+            private_path,
+            "--skill-repo",
+            private_path,
+            "--temp-parent",
+            private_path,
+            "--task-source",
+            "low-alpha=" + private_path,
+            "--task-source",
+            "low-beta=" + private_path,
+            "--task-source",
+            "medium-alpha=" + private_path,
+            "--task-source",
+            "medium-beta=" + private_path,
+        )
+        cases = (
+            ("canary",),
+            ("pilot",),
+            ("canary", "--api-key", secret),
+            ("pilot", "--approve-pilot", secret),
+            valid_shape + ("--api-key", secret),
+            valid_shape + ("--codex-executable", secret),
+            valid_shape + ("--live-ledger", secret),
+            valid_shape + ("--approve-pilot",),
+            valid_shape + ("--help", "--api-key", secret),
+            ("--help", "canary"),
+            (
+                valid_shape[0],
+                "--inp",
+                *valid_shape[2:],
+            ),
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), mock.patch.object(
+                experiment_cli,
+                "_read_stable_input_file",
+            ) as reader, mock.patch.object(
+                experiment_cli,
+                "run_experiment_preflight",
+            ) as runner:
+                return_code, stdout, stderr = self._run_cli(arguments)
+                self.assertEqual(return_code, 2)
+                self.assertEqual(stderr, "")
+                self._assert_fixed_blocked_cli_output(stdout)
+                self.assertEqual(reader.call_count, 0)
+                self.assertEqual(runner.call_count, 0)
+                self.assertNotIn(secret, stdout + stderr)
+                self.assertNotIn(private_path, stdout + stderr)
+
+    def test_cli_rejects_invalid_task_source_bindings_before_orchestration(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            request, unused_document, repositories = (
+                self._make_request_fixture(base)
+            )
+            plan_path = base / "plan.json"
+            plan_path.write_bytes(
+                request.experiment_input.canonical_bytes
+            )
+            valid = self._cli_arguments(
+                request, plan_path, repositories
+            )
+            prefix = valid[:9]
+            bindings = valid[9:]
+            pairs = [
+                tuple(bindings[index : index + 2])
+                for index in range(0, len(bindings), 2)
+            ]
+            private_path = str(next(iter(repositories.values())))
+            cases = {
+                "missing": prefix
+                + [item for pair in pairs[:3] for item in pair],
+                "extra": valid
+                + ["--task-source", "extra-task=" + private_path],
+                "duplicate": valid
+                + ["--task-source", "low-alpha=" + private_path],
+                "relative": prefix
+                + [
+                    item
+                    for pair in (
+                        pairs[:3]
+                        + [
+                            (
+                                "--task-source",
+                                "medium-beta=relative/repository",
+                            )
+                        ]
+                    )
+                    for item in pair
+                ],
+                "malformed": prefix
+                + [
+                    item
+                    for pair in (
+                        pairs[:3]
+                        + [("--task-source", "medium-beta")]
+                    )
+                    for item in pair
+                ],
+                "bad_id": prefix
+                + [
+                    item
+                    for pair in (
+                        pairs[:3]
+                        + [
+                            (
+                                "--task-source",
+                                "bad/id=" + private_path,
+                            )
+                        ]
+                    )
+                    for item in pair
+                ],
+                "unknown": prefix
+                + [
+                    item
+                    for pair in (
+                        pairs[:3]
+                        + [
+                            (
+                                "--task-source",
+                                "unknown-task=" + private_path,
+                            )
+                        ]
+                    )
+                    for item in pair
+                ],
+            }
+            for label, arguments in cases.items():
+                with self.subTest(label=label), mock.patch.object(
+                    experiment_cli,
+                    "run_experiment_preflight",
+                ) as runner:
+                    return_code, stdout, stderr = self._run_cli(
+                        arguments
+                    )
+                    self.assertEqual(return_code, 2)
+                    self.assertEqual(stderr, "")
+                    self._assert_fixed_blocked_cli_output(stdout)
+                    self.assertEqual(runner.call_count, 0)
+                    self.assertNotIn(private_path, stdout + stderr)
+
+    def test_cli_rejects_symlink_hardlink_and_noncanonical_input(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            request, unused_document, repositories = (
+                self._make_request_fixture(base)
+            )
+            plan_path = base / "plan.json"
+            plan_path.write_bytes(
+                request.experiment_input.canonical_bytes
+            )
+            symlink_path = base / "plan-link.json"
+            symlink_path.symlink_to(plan_path)
+            hardlink_path = base / "plan-hardlink.json"
+            os.link(plan_path, hardlink_path)
+            noncanonical_path = base / "noncanonical.json"
+            noncanonical_path.write_text(
+                json.dumps(
+                    json.loads(
+                        request.experiment_input.canonical_bytes
+                    ),
+                    indent=2,
+                )
+            )
+            for candidate in (
+                symlink_path,
+                hardlink_path,
+                noncanonical_path,
+            ):
+                with self.subTest(candidate=candidate), mock.patch.object(
+                    experiment_cli,
+                    "run_experiment_preflight",
+                ) as runner:
+                    arguments = self._cli_arguments(
+                        request, candidate, repositories
+                    )
+                    return_code, stdout, stderr = self._run_cli(
+                        arguments
+                    )
+                    self.assertEqual(return_code, 2)
+                    self.assertEqual(stderr, "")
+                    self._assert_fixed_blocked_cli_output(stdout)
+                    self.assertEqual(runner.call_count, 0)
+                    self.assertNotIn(str(candidate), stdout + stderr)
+
+    def test_cli_reader_uses_bounded_nofollow_nonblocking_descriptor(self):
+        self.assertEqual(experiment_cli._MAX_INPUT_BYTES, 1024 * 1024)
+        self.assertEqual(experiment_cli._READ_CHUNK_BYTES, 64 * 1024)
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root).resolve() / "input.json"
+            path.write_bytes(b"{}")
+            real_open = os.open
+            seen_flags = []
+
+            def capture_open(value, flags):
+                seen_flags.append(flags)
+                return real_open(value, flags)
+
+            with mock.patch.object(
+                experiment_cli.os, "open", side_effect=capture_open
+            ):
+                self.assertEqual(
+                    experiment_cli._read_stable_input_file(path), b"{}"
+                )
+            self.assertEqual(len(seen_flags), 1)
+            self.assertTrue(
+                seen_flags[0] & getattr(os, "O_NOFOLLOW", 0)
+            )
+            self.assertTrue(
+                seen_flags[0] & getattr(os, "O_NONBLOCK", 0)
+            )
+            self.assertTrue(
+                seen_flags[0] & getattr(os, "O_CLOEXEC", 0)
+            )
+
+    def test_cli_validates_all_task_ids_before_any_source_path(self):
+        bindings = [
+            "low-alpha=relative/first",
+            "low-beta=/private/second",
+            "medium-alpha=/private/third",
+            "bad/id=/private/fourth",
+        ]
+        with mock.patch.object(
+            experiment_cli.os.path,
+            "isabs",
+            side_effect=AssertionError("path validation ran"),
+        ), self.assertRaisesRegex(
+            experiment_cli._CLIError,
+            "^invalid_input$",
+        ):
+            experiment_cli._parse_task_source_bindings(bindings)
+
+    def test_cli_reader_closes_descriptor_and_preserves_baseexception(self):
+        metadata = os.stat_result(
+            (stat.S_IFREG | 0o600, 123, 456, 1, 501, 20, 2, 0, 0, 0)
+        )
+        abort = _Abort("reader abort")
+        with mock.patch.object(
+            experiment_cli.os, "lstat", return_value=metadata
+        ), mock.patch.object(
+            experiment_cli.os, "open", return_value=37
+        ), mock.patch.object(
+            experiment_cli.os, "fstat", return_value=metadata
+        ), mock.patch.object(
+            experiment_cli.os, "read", side_effect=abort
+        ), mock.patch.object(
+            experiment_cli.os, "close"
+        ) as close:
+            with self.assertRaises(_Abort) as caught:
+                experiment_cli._read_stable_input_file(
+                    Path("/private/input.json")
+                )
+        self.assertIs(caught.exception, abort)
+        close.assert_called_once_with(37)
+
+    def test_cli_reader_enforces_chunk_size_cap_eof_and_stable_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            path = base / "bounded-input.json"
+            payload = b"x" * (
+                experiment_cli._READ_CHUNK_BYTES * 2 + 3
+            )
+            path.write_bytes(payload)
+            real_read = os.read
+            observations = []
+
+            def capture_read(descriptor, maximum):
+                chunk = real_read(descriptor, maximum)
+                observations.append((maximum, len(chunk)))
+                return chunk
+
+            with mock.patch.object(
+                experiment_cli.os,
+                "read",
+                side_effect=capture_read,
+            ):
+                self.assertEqual(
+                    experiment_cli._read_stable_input_file(path),
+                    payload,
+                )
+            self.assertTrue(observations)
+            self.assertTrue(
+                all(
+                    0 < maximum <= experiment_cli._READ_CHUNK_BYTES
+                    for maximum, unused_size in observations
+                )
+            )
+            self.assertEqual(observations[-1][1], 0)
+            self.assertEqual(
+                sum(size for unused_maximum, size in observations),
+                len(payload),
+            )
+
+            maximum_path = base / "maximum-input.json"
+            maximum_path.write_bytes(
+                b"x" * experiment_cli._MAX_INPUT_BYTES
+            )
+            self.assertEqual(
+                len(
+                    experiment_cli._read_stable_input_file(
+                        maximum_path
+                    )
+                ),
+                experiment_cli._MAX_INPUT_BYTES,
+            )
+            oversized_path = base / "oversized-input.json"
+            oversized_path.write_bytes(
+                b"x" * (experiment_cli._MAX_INPUT_BYTES + 1)
+            )
+            with self.assertRaisesRegex(
+                experiment_cli._CLIError,
+                "^invalid_input$",
+            ):
+                experiment_cli._read_stable_input_file(oversized_path)
+
+            mutable_path = base / "mutable-input.json"
+            mutable_path.write_bytes(b"{}")
+            real_fstat = os.fstat
+            fstat_calls = 0
+
+            def mutate_final_fstat(descriptor):
+                nonlocal fstat_calls
+                fstat_calls += 1
+                metadata = real_fstat(descriptor)
+                if fstat_calls == 2:
+                    values = list(metadata)
+                    values[6] += 1
+                    return os.stat_result(values)
+                return metadata
+
+            with mock.patch.object(
+                experiment_cli.os,
+                "fstat",
+                side_effect=mutate_final_fstat,
+            ), self.assertRaisesRegex(
+                experiment_cli._CLIError,
+                "^invalid_input$",
+            ):
+                experiment_cli._read_stable_input_file(mutable_path)
+
+    def test_cli_does_not_convert_baseexceptions_to_json(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            request, unused_document, repositories = (
+                self._make_request_fixture(base)
+            )
+            plan_path = base / "plan.json"
+            plan_path.write_bytes(
+                request.experiment_input.canonical_bytes
+            )
+            arguments = self._cli_arguments(
+                request, plan_path, repositories
+            )
+            for abort in (
+                KeyboardInterrupt(),
+                SystemExit(73),
+                GeneratorExit(),
+                _Abort("orchestration abort"),
+            ):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with self.subTest(abort=type(abort).__name__), mock.patch.object(
+                    experiment_cli,
+                    "run_experiment_preflight",
+                    side_effect=abort,
+                ), redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(type(abort)) as caught:
+                        experiment_cli.main(arguments)
+                self.assertIs(caught.exception, abort)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_cli_expected_orchestration_exception_is_cleanup_required(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            request, unused_document, repositories = (
+                self._make_request_fixture(base)
+            )
+            plan_path = base / "plan.json"
+            plan_path.write_bytes(
+                request.experiment_input.canonical_bytes
+            )
+            arguments = self._cli_arguments(
+                request, plan_path, repositories
+            )
+            with mock.patch.object(
+                experiment_cli,
+                "run_experiment_preflight",
+                side_effect=ExperimentPreflightError(
+                    "experiment_preflight_invalid"
+                ),
+            ):
+                return_code, stdout, stderr = self._run_cli(arguments)
+            self.assertEqual(return_code, 2)
+            self.assertEqual(stderr, "")
+            payload = json.loads(stdout)
+            self.assertEqual(payload["status"], "blocked")
+            self.assertEqual(payload["cleanup_state"], "cleanup_required")
+            self.assertEqual(
+                payload["reason_code"],
+                "task_snapshot_cleanup_required",
+            )
+            self.assertTrue(
+                all(
+                    payload[name] is None
+                    for name in (
+                        "bundle_digest",
+                        "current_profile_digest",
+                        "lean_profile_digest",
+                        "task_corpus_receipt_digest",
+                        "plan_digest",
+                        "preflight_receipt_digest",
+                    )
+                )
+            )
 
     def test_zero_call_full_success_is_path_free_and_removes_only_phase_tree(self):
         fixture = (

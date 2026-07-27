@@ -66,6 +66,20 @@ require_file scripts/live_eval/harness.py
 require_file tests/live-eval-scenarios.json
 require_file tests/test_live_eval_harness.py
 require_file tests/test_live_eval_runner.py
+require_file .github/workflows/validate.yml
+require_file scripts/run_harness_experiment.py
+require_file scripts/live_eval/experiment.py
+require_file scripts/live_eval/experiment_plan.py
+require_file scripts/live_eval/experiment_receipts.py
+require_file scripts/live_eval/experiment_telemetry.py
+require_file scripts/live_eval/task_snapshot.py
+require_file tests/test_live_eval_experiment.py
+require_file tests/test_live_eval_experiment_plan.py
+require_file tests/test_live_eval_experiment_receipts.py
+require_file tests/test_live_eval_experiment_telemetry.py
+require_file tests/test_live_eval_task_snapshot.py
+require_file tests/fixtures/harness_experiment/valid-plan-input.json
+require_file tests/fixtures/harness_experiment/valid-terminal.jsonl
 
 if [ ! -x scripts/workflow ]; then
   printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2
