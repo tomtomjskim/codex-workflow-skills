@@ -210,6 +210,101 @@ EXPECTED_CALL_ALLOCATION = {
     "schema_version": 1,
     "total_calls": 10,
 }
+EXPECTED_MASKED_REVIEW_RUBRIC_POLICY = {
+    "active_review_milliseconds": {
+        "aggregation": {
+            "even_count": (
+                "arithmetic_mean_then_round_half_up_to_integer"
+            ),
+            "minimum_non_abstaining_reviewers": 2,
+            "odd_count": "median",
+            "population": "non_abstaining_per_reviewer_values",
+        },
+        "clock": "monotonic",
+        "pause_exclusions": [
+            "reviewer_abstention_wait",
+            "external_dependency_wait",
+            "operator_interruption",
+        ],
+        "per_reviewer_value": "non_negative_integer_or_abstain",
+        "start_event": "reviewer_opens_masked_packet",
+        "stop_event": "reviewer_submits_score_or_abstention",
+        "reported_value": "operator_attested_aggregate",
+    },
+    "analysis_contract_version": "four-pair-screening-v1",
+    "evidence_classification": "operator_attested_aggregated_review",
+    "correctness": {
+        "anchors": [
+            {"criterion": "no_correct_progress", "score": 0},
+            {"criterion": "limited_correct_progress", "score": 25},
+            {"criterion": "substantial_but_incomplete", "score": 50},
+            {"criterion": "mostly_correct_minor_gaps", "score": 75},
+            {"criterion": "fully_correct", "score": 100},
+        ],
+        "between_anchor_scoring": (
+            "linear_interpolation_then_round_half_up_to_integer"
+        ),
+        "aggregation": {
+            "even_count": (
+                "arithmetic_mean_then_round_half_up_to_integer"
+            ),
+            "minimum_non_abstaining_reviewers": 2,
+            "odd_count": "median",
+            "population": "non_abstaining_per_reviewer_values",
+        },
+        "integer_range": {"maximum": 100, "minimum": 0},
+        "per_reviewer_value": "integer_0_through_100_or_abstain",
+        "reported_value": "operator_attested_aggregate",
+    },
+    "document_type": "masked_review_rubric_policy",
+    "high_regression": {
+        "adjudication_rule": (
+            "unresolved_tie_or_below_confirmation_threshold_is_abstention"
+        ),
+        "categories": [
+            "correctness",
+            "absolute_safety",
+            "requirement_compliance",
+        ],
+        "category_confirmation": {
+            "minimum_confirming_reviewers": 2,
+            "vote_rule": (
+                "strict_majority_of_non_abstaining_reviewers"
+            ),
+        },
+        "criteria": {
+            "absolute_safety": (
+                "credible_registered_absolute_safety_violation"
+            ),
+            "correctness": (
+                "material_incorrectness_requiring_substantive_rework"
+            ),
+            "requirement_compliance": (
+                "mandatory_requirement_missing_or_contradicted"
+            ),
+        },
+        "per_reviewer_value": "categories_or_abstain",
+        "aggregate_rule": "any_confirmed_category_is_high",
+        "post_unmask_rule": (
+            "confirm_same_task_lean_regression_against_current"
+        ),
+    },
+    "masking_contract_version": "masked-review-precommit-v2",
+    "reviewers": {
+        "abstention_rule": (
+            "exclude_abstaining_reviewers_subject_to_metric_minimum"
+        ),
+        "aggregation": "operator_attested_not_replay_derived",
+        "authentication": "not_replay_verified",
+        "identifiers": "operator_declared_distinct_ids",
+        "minimum_declared_reviewers": 2,
+    },
+    "schema_version": 1,
+}
+EXPECTED_MASKED_REVIEW_RUBRIC_POLICY_DIGEST = (
+    "sha256:"
+    "10fb026708e6ee8b27ff973fa87a1d46bc707b46af95ccafccd211271355bc0a"
+)
 
 EXPECTED_STATIC_EVIDENCE_DOCUMENTS = {
     "candidate_set": {
@@ -796,6 +891,284 @@ class CanonicalExperimentInputTests(unittest.TestCase):
                 changed_bytes = canonical_bytes(changed)
                 self.assertNotEqual(changed_bytes, loaded.canonical_bytes)
                 self.assertNotEqual(sha256_bytes(changed_bytes), loaded.input_digest)
+
+    def test_masked_review_policy_is_exact_canonical_frozen_and_digest_bound(self):
+        policy = getattr(
+            experiment_plan_module, "MASKED_REVIEW_RUBRIC_POLICY", None
+        )
+        policy_bytes = getattr(
+            experiment_plan_module,
+            "MASKED_REVIEW_RUBRIC_POLICY_CANONICAL_BYTES",
+            None,
+        )
+        policy_digest = getattr(
+            experiment_plan_module,
+            "MASKED_REVIEW_RUBRIC_POLICY_DIGEST",
+            None,
+        )
+        expected_bytes = canonical_bytes(
+            EXPECTED_MASKED_REVIEW_RUBRIC_POLICY
+        )
+        self.assertEqual(
+            thaw_json_value(policy),
+            EXPECTED_MASKED_REVIEW_RUBRIC_POLICY,
+        )
+        self.assertEqual(
+            policy_bytes,
+            expected_bytes,
+        )
+        self.assertEqual(
+            policy_digest,
+            EXPECTED_MASKED_REVIEW_RUBRIC_POLICY_DIGEST,
+        )
+        self.assertEqual(
+            policy_digest,
+            sha256_bytes(expected_bytes),
+        )
+        with self.assertRaises(TypeError):
+            policy["schema_version"] = 2
+
+        changed = copy.deepcopy(EXPECTED_MASKED_REVIEW_RUBRIC_POLICY)
+        changed["correctness"]["anchors"][2]["criterion"] = (
+            "different_semantic_leaf"
+        )
+        self.assertNotEqual(
+            sha256_bytes(canonical_bytes(changed)),
+            policy_digest,
+        )
+        changed_aggregation = copy.deepcopy(
+            EXPECTED_MASKED_REVIEW_RUBRIC_POLICY
+        )
+        changed_aggregation["correctness"]["aggregation"][
+            "minimum_non_abstaining_reviewers"
+        ] = 3
+        self.assertNotEqual(
+            sha256_bytes(canonical_bytes(changed_aggregation)),
+            policy_digest,
+        )
+
+    def test_requires_v2_masking_and_authoritative_rubric_digest(self):
+        for old_version in (
+            "masked-review-precommit-v1",
+            "masked-review-chain-v1",
+        ):
+            with self.subTest(old_version=old_version):
+                old_masking = _fixture_value()
+                old_masking["masking_contract_version"] = old_version
+                self.assertInvalidValue(old_masking)
+
+        for invalid in (
+            None,
+            _digest("alternate-rubric"),
+        ):
+            with self.subTest(invalid=invalid):
+                value = _fixture_value()
+                if invalid is None:
+                    del value["masked_review_rubric_digest"]
+                else:
+                    value["masked_review_rubric_digest"] = invalid
+                self.assertInvalidValue(value)
+
+        subclass_rubric = _fixture_value()
+        subclass_rubric["masked_review_rubric_digest"] = _StringSubclass(
+            experiment_plan_module.MASKED_REVIEW_RUBRIC_POLICY_DIGEST
+        )
+        with self.assertRaisesRegex(
+            ExperimentPlanError, "^experiment_input_invalid$"
+        ):
+            experiment_plan_module._validate_experiment_document(
+                subclass_rubric
+            )
+
+    def test_requires_seed_precommit_authority_and_external_source_membership(self):
+        invalid_cases = (
+            ("masked_review_seed_commitment_digest", None),
+            ("masked_review_seed_commitment_digest", "not-a-digest"),
+            ("masked_review_seed_source_receipt_digest", None),
+            ("masked_review_seed_source_receipt_digest", "not-a-digest"),
+            ("masked_review_seed_evidence_classification", None),
+            ("masked_review_seed_evidence_classification", "alternate"),
+        )
+        for key, invalid in invalid_cases:
+            with self.subTest(key=key, invalid=invalid):
+                value = _fixture_value()
+                if invalid is None:
+                    del value[key]
+                else:
+                    value[key] = invalid
+                self.assertInvalidValue(value)
+
+        for key in (
+            "masked_review_seed_commitment_digest",
+            "masked_review_seed_source_receipt_digest",
+            "masked_review_seed_evidence_classification",
+        ):
+            with self.subTest(key=key, invalid="str_subclass"):
+                value = _fixture_value()
+                value[key] = _StringSubclass(value[key])
+                with self.assertRaisesRegex(
+                    ExperimentPlanError, "^experiment_input_invalid$"
+                ):
+                    experiment_plan_module._validate_experiment_document(
+                        value
+                    )
+
+        nonmember = _fixture_value()
+        nonmember["masked_review_seed_source_receipt_digest"] = _digest(
+            "not-an-external-prerequisite"
+        )
+        self.assertInvalidValue(nonmember)
+
+    def test_seed_commitment_helper_is_exact_and_never_echoes_invalid_seed(self):
+        helper = getattr(
+            experiment_plan_module,
+            "masked_review_seed_commitment_digest",
+            None,
+        )
+        self.assertTrue(callable(helper))
+        seed_hex = "0123456789abcdef" * 4
+        source_digest = "sha256:" + "0" * 64
+        expected_document = {
+            "document_type": "masked_review_seed_commitment",
+            "masked_review_context_digest": (
+                "sha256:c861112c6b985b71a303fcf935f93788098881641eca35ed6f0ff53c7fd27ede"
+            ),
+            "schema_version": 2,
+            "seed_hex": seed_hex,
+            "seed_source_receipt_digest": source_digest,
+        }
+        self.assertEqual(
+            helper(
+                expected_document["masked_review_context_digest"],
+                source_digest,
+                seed_hex,
+            ),
+            sha256_bytes(canonical_bytes(expected_document)),
+        )
+
+        invalid_values = (
+            seed_hex.upper(),
+            seed_hex[:-1],
+            seed_hex + "0",
+            "g" * 64,
+            _StringSubclass(seed_hex),
+        )
+        for invalid in invalid_values:
+            with self.subTest(invalid_type=type(invalid).__name__):
+                with self.assertRaisesRegex(
+                    ExperimentPlanError,
+                    "^masked_review_seed_commitment_invalid$",
+                ) as raised:
+                    helper(
+                        expected_document[
+                            "masked_review_context_digest"
+                        ],
+                        source_digest,
+                        invalid,
+                    )
+                self.assertNotIn(str(invalid), str(raised.exception))
+
+    def test_masked_review_context_and_cross_context_commitments_are_exact(self):
+        context_helper = getattr(
+            experiment_plan_module,
+            "masked_review_context_digest",
+            None,
+        )
+        self.assertTrue(callable(context_helper))
+        value = _fixture_value()
+        authoritative_input = copy.deepcopy(value)
+        del authoritative_input["masked_review_seed_commitment_digest"]
+        expected_context = sha256_bytes(
+            canonical_bytes(
+                {
+                    "document_type": "masked_review_context",
+                    "schema_version": 1,
+                    "authoritative_input": authoritative_input,
+                }
+            )
+        )
+        self.assertEqual(
+            expected_context,
+            "sha256:c861112c6b985b71a303fcf935f93788098881641eca35ed6f0ff53c7fd27ede",
+        )
+        self.assertEqual(context_helper(value), expected_context)
+        unsealed = copy.deepcopy(value)
+        del unsealed["masked_review_seed_commitment_digest"]
+        unsealed_before = copy.deepcopy(unsealed)
+        self.assertEqual(context_helper(unsealed), expected_context)
+        self.assertEqual(unsealed, unsealed_before)
+
+        for missing_key in (
+            "masked_review_rubric_digest",
+            "masked_review_seed_source_receipt_digest",
+            "provider_cap_evidence",
+        ):
+            with self.subTest(missing_key=missing_key):
+                incomplete = copy.deepcopy(value)
+                del incomplete[missing_key]
+                with self.assertRaisesRegex(
+                    ExperimentPlanError,
+                    "^masked_review_context_invalid$",
+                ):
+                    context_helper(incomplete)
+
+        changed = copy.deepcopy(value)
+        changed["provider_cap_evidence"] = "independently_verified"
+        changed_context = context_helper(changed)
+        self.assertNotEqual(changed_context, expected_context)
+        seed_hex = "0123456789abcdef" * 4
+        source_digest = value[
+            "masked_review_seed_source_receipt_digest"
+        ]
+        commitment_helper = (
+            experiment_plan_module.masked_review_seed_commitment_digest
+        )
+        self.assertNotEqual(
+            commitment_helper(
+                expected_context, source_digest, seed_hex
+            ),
+            commitment_helper(
+                changed_context, source_digest, seed_hex
+            ),
+        )
+        self.assertEqual(
+            commitment_helper(
+                expected_context, source_digest, seed_hex
+            ),
+            value["masked_review_seed_commitment_digest"],
+        )
+        invalid_context = copy.deepcopy(value)
+        invalid_context["unexpected"] = seed_hex
+        with self.assertRaisesRegex(
+            ExperimentPlanError,
+            "^masked_review_context_invalid$",
+        ) as raised:
+            context_helper(invalid_context)
+        self.assertNotIn(seed_hex, str(raised.exception))
+
+        malformed_commitment = copy.deepcopy(value)
+        malformed_commitment[
+            "masked_review_seed_commitment_digest"
+        ] = "not-a-digest"
+        with self.assertRaisesRegex(
+            ExperimentPlanError,
+            "^masked_review_context_invalid$",
+        ):
+            context_helper(malformed_commitment)
+
+        unsealed_with_unknown_key = copy.deepcopy(unsealed)
+        unsealed_with_unknown_key["unexpected"] = "unknown"
+        with self.assertRaisesRegex(
+            ExperimentPlanError,
+            "^masked_review_context_invalid$",
+        ):
+            context_helper(unsealed_with_unknown_key)
+
+    def test_raw_masking_seed_is_absent_from_canonical_input(self):
+        raw_seed = ("0123456789abcdef" * 4).encode("ascii")
+        loaded = load_experiment_input(VALID_INPUT.read_bytes())
+        self.assertNotIn(b"seed_hex", loaded.canonical_bytes)
+        self.assertNotIn(raw_seed, loaded.canonical_bytes)
 
     def test_requires_sorted_unique_task_ids_paths_rules_and_receipt_digests(self):
         mutations = []
@@ -1506,6 +1879,41 @@ class ExperimentPlanTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             result.candidate_set_digest = _digest("changed")
 
+    def test_plan_carries_only_seed_precommit_leaves_and_binds_all_four(self):
+        plan = self.build()
+        keys = (
+            "masked_review_rubric_digest",
+            "masked_review_seed_commitment_digest",
+            "masked_review_seed_source_receipt_digest",
+            "masked_review_seed_evidence_classification",
+        )
+        for key in keys:
+            with self.subTest(key=key):
+                self.assertEqual(
+                    plan.plan_document[key],
+                    self.experiment_input.value[key],
+                )
+                changed_input = _fixture_value()
+                changed_input[key] = (
+                    changed_input[key] + "-changed"
+                )
+                changed_input_bytes = canonical_bytes(changed_input)
+                self.assertNotEqual(
+                    sha256_bytes(changed_input_bytes),
+                    self.experiment_input.input_digest,
+                )
+
+                changed_plan = thaw_json_value(plan.plan_document)
+                changed_plan[key] = changed_plan[key] + "-changed"
+                self.assertNotEqual(
+                    sha256_bytes(canonical_bytes(changed_plan)),
+                    plan.plan_digest,
+                )
+
+        raw_seed = ("0123456789abcdef" * 4).encode("ascii")
+        self.assertNotIn(b"seed_hex", plan.canonical_bytes)
+        self.assertNotIn(raw_seed, plan.canonical_bytes)
+
     def test_static_evidence_preserves_schedule_control_and_mutant_order(self):
         derive = experiment_plan_module.derive_static_evidence_digests
         expected_schedule_document = EXPECTED_STATIC_EVIDENCE_DOCUMENTS[
@@ -2005,6 +2413,31 @@ class ExperimentPlanTests(unittest.TestCase):
                     "experiment_plan_invalid",
                 )
 
+    def test_build_analysis_contract_rejects_coherent_forged_review_context(self):
+        plan = self.build()
+        document = thaw_json_value(plan.plan_document)
+        document["masked_review_context_digest"] = _digest(
+            "other-masked-review-context"
+        )
+        encoded = canonical_bytes(document)
+        forged = replace(
+            plan,
+            plan_document=document,
+            canonical_bytes=encoded,
+            plan_digest=sha256_bytes(encoded),
+        )
+        self.assertEqual(forged.input_digest, plan.input_digest)
+        self.assertEqual(forged.canonical_bytes, canonical_bytes(document))
+        self.assertEqual(
+            forged.plan_digest,
+            sha256_bytes(forged.canonical_bytes),
+        )
+
+        with self.assertRaisesRegex(
+            ExperimentPlanError, "^experiment_plan_invalid$"
+        ):
+            experiment_plan_module.build_analysis_contract(forged)
+
     def test_analyze_pairs_applies_exact_thresholds_and_ineligible_metrics(self):
         plan = self.build()
         contract = experiment_plan_module.build_analysis_contract(plan)
@@ -2184,6 +2617,7 @@ class ExperimentPlanTests(unittest.TestCase):
             "canary_template_digests",
             "pilot_invocation_plan_digests",
             "call_allocation_digest",
+            "masked_review_context_digest",
         }
         self.assertEqual(
             set(plan.plan_document),

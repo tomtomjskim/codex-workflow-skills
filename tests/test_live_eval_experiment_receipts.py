@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
 from fractions import Fraction
 import hashlib
+import hmac
 import inspect
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ from types import MappingProxyType
 import unittest
 
 import scripts.live_eval.experiment_plan as experiment_plan_module
+import scripts.live_eval.experiment_receipts as experiment_receipts_module
 from scripts.live_eval.experiment_plan import (
     CANARY_ARGV_TEMPLATE_DIGEST,
     CANARY_OVERLAY_RECIPE_DIGEST,
@@ -49,6 +51,7 @@ from scripts.workflow_coordination.canonical_json import canonical_bytes
 
 FIXTURE = Path(__file__).parent / "fixtures" / "harness_experiment"
 VALID_INPUT = FIXTURE / "valid-plan-input.json"
+MASKED_REVIEW_SEED_REVEAL = "0123456789abcdef" * 4
 
 
 def _digest(label):
@@ -719,37 +722,125 @@ def _append_completed_pilots(
 
 def _review_chain_payloads(plan, terminals, *, high=False):
     eligible = [terminal.receipt_digest for terminal in terminals]
-    randomized_order = [
-        "neutral-{:02d}".format(index)
-        for index in range(len(terminals), 0, -1)
+    seed = bytes.fromhex(MASKED_REVIEW_SEED_REVEAL)
+    ranked = []
+    for schedule_ordinal, (run, terminal) in enumerate(
+        zip(plan.pilot_schedule, terminals), 1
+    ):
+        common = {
+            "schema_version": 1,
+            "masked_review_context_digest": plan.plan_document[
+                "masked_review_context_digest"
+            ],
+            "schedule_ordinal": schedule_ordinal,
+        }
+        rank = hmac.new(
+            seed,
+            canonical_bytes(
+                dict(
+                    common,
+                    document_type="masked_review_order_rank",
+                )
+            ),
+            hashlib.sha256,
+        ).digest()
+        neutral_id = "neutral-" + hmac.new(
+            seed,
+            canonical_bytes(
+                dict(
+                    common,
+                    document_type="masked_review_neutral_id",
+                )
+            ),
+            hashlib.sha256,
+        ).hexdigest()[:32]
+        ranked.append(
+            (rank, schedule_ordinal, neutral_id, run, terminal)
+        )
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    randomized_order = [item[2] for item in ranked]
+    review_artifact_records = [
+        {
+            "neutral_id": neutral_id,
+            "review_artifact_commitment_digest": (
+                _review_artifact_commitment_digest(
+                    seed,
+                    plan,
+                    neutral_id,
+                    run,
+                    terminal,
+                )
+            ),
+        }
+        for _, _, neutral_id, run, terminal in ranked
     ]
-    rubric_digest = sha256_bytes(
+    mapping_records = [
+        {
+            "neutral_id": neutral_id,
+            "task_id": run.task_id,
+            "condition": run.condition,
+            "pilot_terminal_receipt_digest": terminal.receipt_digest,
+        }
+        for _, _, neutral_id, run, terminal in ranked
+    ]
+    mapping_salt = hmac.new(
+        seed,
         canonical_bytes(
             {
-                "document_type": "masked_review_rubric_policy",
+                "document_type": "masked_review_mapping_salt",
                 "schema_version": 1,
-                "analysis_contract_version": plan.plan_document[
-                    "analysis_contract_version"
+                "masked_review_context_digest": plan.plan_document[
+                    "masked_review_context_digest"
                 ],
-                "masking_contract_version": plan.plan_document[
-                    "masking_contract_version"
+                "plan_digest": plan.plan_digest,
+            }
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    mapping_commitment = sha256_bytes(
+        canonical_bytes(
+            {
+                "document_type": "condition_mapping_commitment",
+                "schema_version": 1,
+                "masked_review_context_digest": plan.plan_document[
+                    "masked_review_context_digest"
                 ],
+                "plan_digest": plan.plan_digest,
+                "mapping_salt": mapping_salt,
+                "records": mapping_records,
             }
         )
     )
     packet_payload = {
+        "condition_mapping_commitment_digest": mapping_commitment,
         "eligible_pilot_terminal_digests": eligible,
-        "packet_digest": _digest("masked-packet"),
+        "packet_digest": None,
         "randomized_order": randomized_order,
+        "review_artifact_records": review_artifact_records,
         "leakage_scan_result": "pass",
-        "rubric_digest": rubric_digest,
+        "review_evidence_classification": (
+            "operator_attested_aggregated_review"
+        ),
+        "rubric_digest": plan.plan_document[
+            "masked_review_rubric_digest"
+        ],
         "reviewer_ids": ["reviewer-a", "reviewer-b"],
     }
+    packet_payload["packet_digest"] = _packet_manifest_digest(
+        packet_payload
+    )
+    regression_task_id = plan.pilot_schedule[0].task_id
     score_records = [
         {
             "neutral_id": neutral_id,
             "correctness_score": 80 + index,
             "active_review_milliseconds": 500 + index * 10,
+            "confirmed_high": (
+                high
+                and mapping_records[index]["task_id"]
+                == regression_task_id
+                and mapping_records[index]["condition"] == "lean"
+            ),
         }
         for index, neutral_id in enumerate(randomized_order)
     ]
@@ -767,27 +858,10 @@ def _review_chain_payloads(plan, terminals, *, high=False):
         "locked_score_records": score_records,
         "locked_score_records_digest": score_digest,
         "review_findings_digest": _digest("review-findings"),
-        "high_regression_basis_digest": None,
+        "review_evidence_classification": (
+            "operator_attested_aggregated_review"
+        ),
     }
-    terminal_by_neutral = dict(
-        zip(randomized_order, reversed(terminals))
-    )
-    mapping_records = []
-    schedule_by_terminal = {
-        terminal.receipt_digest: run
-        for terminal, run in zip(terminals, plan.pilot_schedule)
-    }
-    for neutral_id in randomized_order:
-        terminal = terminal_by_neutral[neutral_id]
-        run = schedule_by_terminal[terminal.receipt_digest]
-        mapping_records.append(
-            {
-                "neutral_id": neutral_id,
-                "task_id": run.task_id,
-                "condition": run.condition,
-                "pilot_terminal_receipt_digest": terminal.receipt_digest,
-            }
-        )
     mapping_digest = sha256_bytes(
         canonical_bytes(
             {
@@ -799,10 +873,190 @@ def _review_chain_payloads(plan, terminals, *, high=False):
     )
     mapping_payload = {
         "score_lock_receipt_digest": None,
+        "masked_review_seed_reveal": MASKED_REVIEW_SEED_REVEAL,
         "condition_mapping_records": mapping_records,
         "condition_mapping_digest": mapping_digest,
+        "high_regression_basis_digest": None,
     }
     return packet_payload, score_payload, mapping_payload
+
+
+def _review_artifact_manifest_digest(
+    plan,
+    neutral_id,
+    run,
+    terminal,
+    **overrides,
+):
+    candidate = next(
+        item
+        for item in plan.plan_document["candidates"]
+        if item["task_id"] == run.task_id
+    )
+    manifest = {
+        "document_type": "masked_review_artifact_manifest",
+        "schema_version": 1,
+        "masked_review_context_digest": plan.plan_document[
+            "masked_review_context_digest"
+        ],
+        "neutral_id": neutral_id,
+        "prompt_digest": candidate["prompt_digest"],
+        "assertion_digest": candidate["assertion_digest"],
+        "absolute_safety_assertion_ids": list(
+            candidate["absolute_safety_assertion_ids"]
+        ),
+        "sanitized_diff_digest": terminal.payload[
+            "sanitized_diff_digest"
+        ],
+        "rubric_digest": plan.plan_document[
+            "masked_review_rubric_digest"
+        ],
+        "presentation_contract_version": (
+            "content-addressed-masked-review-v1"
+        ),
+        "presentation_policy_digest": (
+            experiment_receipts_module
+            .MASKED_REVIEW_PRESENTATION_POLICY_DIGEST
+        ),
+    }
+    manifest.update(overrides)
+    return sha256_bytes(canonical_bytes(manifest))
+
+
+def _review_artifact_commitment_digest(
+    seed,
+    plan,
+    neutral_id,
+    run,
+    terminal,
+    **overrides,
+):
+    manifest = {
+        "masked_review_context_digest": plan.plan_document[
+            "masked_review_context_digest"
+        ],
+        "neutral_id": neutral_id,
+        "prompt_digest": next(
+            item
+            for item in plan.plan_document["candidates"]
+            if item["task_id"] == run.task_id
+        )["prompt_digest"],
+        "assertion_digest": next(
+            item
+            for item in plan.plan_document["candidates"]
+            if item["task_id"] == run.task_id
+        )["assertion_digest"],
+        "absolute_safety_assertion_ids": list(
+            next(
+                item
+                for item in plan.plan_document["candidates"]
+                if item["task_id"] == run.task_id
+            )["absolute_safety_assertion_ids"]
+        ),
+        "sanitized_diff_digest": terminal.payload[
+            "sanitized_diff_digest"
+        ],
+        "rubric_digest": plan.plan_document[
+            "masked_review_rubric_digest"
+        ],
+        "presentation_contract_version": (
+            "content-addressed-masked-review-v1"
+        ),
+        "presentation_policy_digest": (
+            experiment_receipts_module
+            .MASKED_REVIEW_PRESENTATION_POLICY_DIGEST
+        ),
+    }
+    manifest.update(overrides)
+    commitment = {
+        "document_type": "masked_review_artifact_commitment",
+        "schema_version": 1,
+        **manifest,
+    }
+    return "sha256:" + hmac.new(
+        seed,
+        canonical_bytes(commitment),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _packet_manifest_digest(packet_payload):
+    return sha256_bytes(
+        canonical_bytes(
+            {
+                "document_type": "masked_review_packet_manifest",
+                "schema_version": 2,
+                "eligible_pilot_terminal_digests": packet_payload[
+                    "eligible_pilot_terminal_digests"
+                ],
+                "condition_mapping_commitment_digest": packet_payload[
+                    "condition_mapping_commitment_digest"
+                ],
+                "randomized_order": packet_payload["randomized_order"],
+                "review_artifact_records": packet_payload[
+                    "review_artifact_records"
+                ],
+                "leakage_scan_result": packet_payload[
+                    "leakage_scan_result"
+                ],
+                "rubric_digest": packet_payload["rubric_digest"],
+                "reviewer_ids": packet_payload["reviewer_ids"],
+                "review_evidence_classification": packet_payload[
+                    "review_evidence_classification"
+                ],
+            }
+        )
+    )
+
+
+def _high_regression_basis(packet, score, mapping_payload):
+    regression_task_ids = sorted(
+        {
+            record["task_id"]
+            for record in mapping_payload["condition_mapping_records"]
+            if record["condition"] == "lean"
+            and next(
+                score_record["confirmed_high"]
+                for score_record in score.payload[
+                    "locked_score_records"
+                ]
+                if score_record["neutral_id"] == record["neutral_id"]
+            )
+        }
+        - {
+            record["task_id"]
+            for record in mapping_payload["condition_mapping_records"]
+            if record["condition"] == "current"
+            and next(
+                score_record["confirmed_high"]
+                for score_record in score.payload[
+                    "locked_score_records"
+                ]
+                if score_record["neutral_id"] == record["neutral_id"]
+            )
+        }
+    )
+    return sha256_bytes(
+        canonical_bytes(
+            {
+                "document_type": "masked_high_regression_basis",
+                "schema_version": 2,
+                "masked_packet_receipt_digest": packet.receipt_digest,
+                "score_lock_receipt_digest": score.receipt_digest,
+                "review_findings_digest": score.payload[
+                    "review_findings_digest"
+                ],
+                "rubric_digest": packet.payload["rubric_digest"],
+                "condition_mapping_digest": mapping_payload[
+                    "condition_mapping_digest"
+                ],
+                "regression_task_ids": regression_task_ids,
+                "adjudication": (
+                    "post_unmask_same_task_lean_high_current_not_high"
+                ),
+            }
+        )
+    )
 
 
 def _append_review_chain(
@@ -819,25 +1073,14 @@ def _append_review_chain(
         packet_payload,
     )
     score_payload["masked_packet_receipt_digest"] = packet.receipt_digest
-    if high:
-        score_payload["high_regression_basis_digest"] = sha256_bytes(
-            canonical_bytes(
-                {
-                    "document_type": "masked_high_regression_basis",
-                    "schema_version": 1,
-                    "masked_packet_receipt_digest": packet.receipt_digest,
-                    "review_findings_digest": score_payload[
-                        "review_findings_digest"
-                    ],
-                    "rubric_digest": packet.payload["rubric_digest"],
-                    "adjudication": "high_regression",
-                }
-            )
-        )
     score = _append_runtime(
         plan, preflight, history, "score_lock", score_payload
     )
     mapping_payload["score_lock_receipt_digest"] = score.receipt_digest
+    if high:
+        mapping_payload["high_regression_basis_digest"] = (
+            _high_regression_basis(packet, score, mapping_payload)
+        )
     unmask = _append_runtime(
         plan, preflight, history, "unmask", mapping_payload
     )
@@ -908,7 +1151,7 @@ def _append_controlled_review_chain(
     plan, preflight, history, terminals, *, high=False
 ):
     packet_payload, score_payload, mapping_payload = (
-        _review_chain_payloads(plan, terminals)
+        _review_chain_payloads(plan, terminals, high=high)
     )
     condition_by_neutral = {
         record["neutral_id"]: record["condition"]
@@ -939,25 +1182,14 @@ def _append_controlled_review_chain(
         packet_payload,
     )
     score_payload["masked_packet_receipt_digest"] = packet.receipt_digest
-    if high:
-        score_payload["high_regression_basis_digest"] = sha256_bytes(
-            canonical_bytes(
-                {
-                    "document_type": "masked_high_regression_basis",
-                    "schema_version": 1,
-                    "masked_packet_receipt_digest": packet.receipt_digest,
-                    "review_findings_digest": score_payload[
-                        "review_findings_digest"
-                    ],
-                    "rubric_digest": packet.payload["rubric_digest"],
-                    "adjudication": "high_regression",
-                }
-            )
-        )
     score = _append_runtime(
         plan, preflight, history, "score_lock", score_payload
     )
     mapping_payload["score_lock_receipt_digest"] = score.receipt_digest
+    if high:
+        mapping_payload["high_regression_basis_digest"] = (
+            _high_regression_basis(packet, score, mapping_payload)
+        )
     unmask = _append_runtime(
         plan, preflight, history, "unmask", mapping_payload
     )
@@ -2682,12 +2914,20 @@ class RuntimeReplayTests(unittest.TestCase):
         for field_name, delta in (
             ("correctness_score", 1),
             ("active_review_milliseconds", 1),
+            ("confirmed_high", True),
         ):
             with self.subTest(nested_score_field=field_name):
                 changed_score = json.loads(json.dumps(score_payload))
-                changed_score["locked_score_records"][0][
-                    field_name
-                ] += delta
+                if field_name == "confirmed_high":
+                    changed_score["locked_score_records"][0][
+                        field_name
+                    ] = not changed_score[
+                        "locked_score_records"
+                    ][0][field_name]
+                else:
+                    changed_score["locked_score_records"][0][
+                        field_name
+                    ] += delta
                 score_candidate = _runtime_receipt(
                     plan,
                     preflight,
@@ -2713,21 +2953,26 @@ class RuntimeReplayTests(unittest.TestCase):
         forged_high["high_regression_basis_digest"] = _digest(
             "forged-high"
         )
-        self.assertHistoryInvalid(
-            validate_runtime_transition,
-            plan,
-            preflight,
-            history,
+        with self.assertRaisesRegex(
+            ExperimentReceiptError, "experiment_receipt_invalid"
+        ):
             _runtime_receipt(
                 plan,
                 preflight,
                 history,
                 "score_lock",
                 forged_high,
-            ),
-        )
+            )
         score = _append_runtime(
             plan, preflight, history, "score_lock", score_payload
+        )
+        self.assertEqual(
+            packet.payload["review_evidence_classification"],
+            "operator_attested_aggregated_review",
+        )
+        self.assertEqual(
+            score.payload["review_evidence_classification"],
+            "operator_attested_aggregated_review",
         )
         mapping_payload["score_lock_receipt_digest"] = (
             score.receipt_digest
@@ -2797,6 +3042,1257 @@ class RuntimeReplayTests(unittest.TestCase):
                     rebuilt,
                 )
 
+    def test_unmask_rejects_recomputed_plan_valid_mapping_bijection(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, score_payload, mapping_payload = (
+            _review_chain_payloads(plan, terminals)
+        )
+        packet = _append_runtime(
+            plan,
+            preflight,
+            history,
+            "masked_review_packet",
+            packet_payload,
+        )
+        score_payload["masked_packet_receipt_digest"] = (
+            packet.receipt_digest
+        )
+        score = _append_runtime(
+            plan, preflight, history, "score_lock", score_payload
+        )
+        mapping_payload["score_lock_receipt_digest"] = (
+            score.receipt_digest
+        )
+        records = mapping_payload["condition_mapping_records"]
+        binding_keys = (
+            "task_id",
+            "condition",
+            "pilot_terminal_receipt_digest",
+        )
+        first_binding = {
+            key: records[0][key] for key in binding_keys
+        }
+        second_binding = {
+            key: records[1][key] for key in binding_keys
+        }
+        records[0].update(second_binding)
+        records[1].update(first_binding)
+        mapping_payload["condition_mapping_digest"] = sha256_bytes(
+            canonical_bytes(
+                {
+                    "document_type": "condition_mapping_records",
+                    "schema_version": 1,
+                    "records": records,
+                }
+            )
+        )
+        forged = _runtime_receipt(
+            plan, preflight, history, "unmask", mapping_payload
+        )
+
+        self.assertHistoryInvalid(
+            validate_runtime_transition,
+            plan,
+            preflight,
+            history,
+            forged,
+        )
+
+    def test_v2_packet_rejects_old_rubric_and_one_reviewer(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, _, _ = _review_chain_payloads(
+            plan, terminals
+        )
+        old_rubric = json.loads(json.dumps(packet_payload))
+        old_rubric["rubric_digest"] = sha256_bytes(
+            canonical_bytes(
+                {
+                    "document_type": "masked_review_rubric_policy",
+                    "schema_version": 1,
+                    "analysis_contract_version": plan.plan_document[
+                        "analysis_contract_version"
+                    ],
+                    "masking_contract_version": plan.plan_document[
+                        "masking_contract_version"
+                    ],
+                }
+            )
+        )
+        old_rubric["packet_digest"] = _packet_manifest_digest(
+            old_rubric
+        )
+        self.assertNotEqual(
+            old_rubric["rubric_digest"],
+            plan.plan_document["masked_review_rubric_digest"],
+        )
+        self.assertHistoryInvalid(
+            validate_runtime_transition,
+            plan,
+            preflight,
+            history,
+            _runtime_receipt(
+                plan,
+                preflight,
+                history,
+                "masked_review_packet",
+                old_rubric,
+            ),
+        )
+
+        one_reviewer = json.loads(json.dumps(packet_payload))
+        one_reviewer["reviewer_ids"] = ["reviewer-a"]
+        with self.assertRaisesRegex(
+            ExperimentReceiptError, "experiment_receipt_invalid"
+        ):
+            _runtime_receipt(
+                plan,
+                preflight,
+                history,
+                "masked_review_packet",
+                one_reviewer,
+            )
+
+    def test_v2_seed_binding_known_answer_and_pre_unmask_secrecy(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, score_payload, mapping_payload = (
+            _review_chain_payloads(plan, terminals)
+        )
+        self.assertEqual(
+            packet_payload["randomized_order"],
+            [
+                "neutral-5e49618943059579990fdd4ae9d1422e",
+                "neutral-68c9f61f0696a22846199fd74d462f67",
+                "neutral-9ecf1eafad45f438dd186b593ec0c324",
+                "neutral-b32771167e1e1660f19bcbf7fc2be6f7",
+                "neutral-84e2f3bc118a78381c0d369eff852fc2",
+                "neutral-98607e0bd5fa3ba10ecc6c359096690f",
+                "neutral-03f5f65c457c8779d24a22b2aae099c4",
+                "neutral-9ba4ca9aa1003685d5cb1bb7bc5725d5",
+            ],
+        )
+        self.assertEqual(
+            packet_payload["condition_mapping_commitment_digest"],
+            "sha256:41381a9e538f1243848602087de4c82432523391fadb6d6db7fcc2870d2618f8",
+        )
+        self.assertEqual(
+            [
+                record["neutral_id"]
+                for record in packet_payload[
+                    "review_artifact_records"
+                ]
+            ],
+            packet_payload["randomized_order"],
+        )
+        for record in packet_payload["review_artifact_records"]:
+            self.assertEqual(
+                set(record),
+                {
+                    "neutral_id",
+                    "review_artifact_commitment_digest",
+                },
+            )
+        self.assertEqual(
+            mapping_payload["condition_mapping_digest"],
+            "sha256:df383fc0fb3288965dbae67f7e90feda4b631c3c0147debae9fa742e59dccc6d",
+        )
+        packet = _append_runtime(
+            plan,
+            preflight,
+            history,
+            "masked_review_packet",
+            packet_payload,
+        )
+        score_payload["masked_packet_receipt_digest"] = (
+            packet.receipt_digest
+        )
+        score = _append_runtime(
+            plan, preflight, history, "score_lock", score_payload
+        )
+        for document in (
+            thaw_json_value(plan.plan_document),
+            thaw_json_value(packet.payload),
+            thaw_json_value(score.payload),
+        ):
+            self.assertNotIn("masked_review_seed_reveal", document)
+            self.assertNotIn(
+                MASKED_REVIEW_SEED_REVEAL,
+                canonical_bytes(document).decode("utf-8"),
+            )
+        self.assertNotIn("high_regression_basis_digest", score.payload)
+
+    def test_review_artifact_commitment_binds_visible_content(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, _, mapping_payload = _review_chain_payloads(
+            plan, terminals
+        )
+        record = packet_payload["review_artifact_records"][0]
+        mapping = mapping_payload["condition_mapping_records"][0]
+        run = next(
+            item
+            for item in plan.pilot_schedule
+            if item.task_id == mapping["task_id"]
+            and item.condition == mapping["condition"]
+        )
+        terminal = next(
+            item
+            for item in terminals
+            if item.receipt_digest
+            == mapping["pilot_terminal_receipt_digest"]
+        )
+        seed = bytes.fromhex(MASKED_REVIEW_SEED_REVEAL)
+        expected = _review_artifact_commitment_digest(
+            seed, plan, record["neutral_id"], run, terminal
+        )
+        self.assertEqual(
+            record["review_artifact_commitment_digest"], expected
+        )
+        self.assertEqual(
+            _review_artifact_manifest_digest(
+                plan, record["neutral_id"], run, terminal
+            ),
+            "sha256:97ea89029c7eab96d8f2f28289b8eb8703bf64e472eeea7cc7a89826ac891de0",
+        )
+        mutations = {
+            "masked_review_context_digest": _digest(
+                "changed-review-context"
+            ),
+            "neutral_id": "neutral-changed",
+            "prompt_digest": _digest("changed-prompt"),
+            "assertion_digest": _digest("changed-assertion"),
+            "absolute_safety_assertion_ids": [
+                "changed-safety-assertion"
+            ],
+            "sanitized_diff_digest": _digest("changed-sanitized-diff"),
+            "rubric_digest": _digest("changed-rubric"),
+            "presentation_contract_version": (
+                "changed-presentation-contract"
+            ),
+            "presentation_policy_digest": _digest(
+                "changed-presentation-policy"
+            ),
+        }
+        for field_name, changed_value in mutations.items():
+            with self.subTest(bound_field=field_name):
+                changed_neutral_id = (
+                    changed_value
+                    if field_name == "neutral_id"
+                    else record["neutral_id"]
+                )
+                overrides = (
+                    {}
+                    if field_name == "neutral_id"
+                    else {field_name: changed_value}
+                )
+                self.assertNotEqual(
+                    expected,
+                    _review_artifact_commitment_digest(
+                        seed,
+                        plan,
+                        changed_neutral_id,
+                        run,
+                        terminal,
+                        **overrides,
+                    ),
+                )
+
+    def test_seeded_commitments_prevent_plain_digest_enumeration(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, _, mapping_payload = _review_chain_payloads(
+            plan, terminals
+        )
+        mappings = mapping_payload["condition_mapping_records"]
+        terminal_by_digest = {
+            terminal.receipt_digest: terminal for terminal in terminals
+        }
+        run_by_pair = {
+            (run.task_id, run.condition): run
+            for run in plan.pilot_schedule
+        }
+
+        old_plain_records = []
+        for mapping in mappings:
+            run = run_by_pair[
+                (mapping["task_id"], mapping["condition"])
+            ]
+            terminal = terminal_by_digest[
+                mapping["pilot_terminal_receipt_digest"]
+            ]
+            old_plain_records.append(
+                {
+                    "neutral_id": mapping["neutral_id"],
+                    "review_artifact_manifest_digest": (
+                        _review_artifact_manifest_digest(
+                            plan,
+                            mapping["neutral_id"],
+                            run,
+                            terminal,
+                        )
+                    ),
+                }
+            )
+
+        recovered = []
+        for old_record in old_plain_records:
+            matches = []
+            for run, terminal in zip(
+                plan.pilot_schedule, terminals
+            ):
+                candidate = _review_artifact_manifest_digest(
+                    plan,
+                    old_record["neutral_id"],
+                    run,
+                    terminal,
+                )
+                if (
+                    candidate
+                    == old_record["review_artifact_manifest_digest"]
+                ):
+                    matches.append((run.task_id, run.condition))
+            self.assertEqual(len(matches), 1)
+            recovered.append(matches[0])
+        self.assertEqual(
+            recovered,
+            [
+                (mapping["task_id"], mapping["condition"])
+                for mapping in mappings
+            ],
+        )
+
+        for record in packet_payload["review_artifact_records"]:
+            plain_candidates = {
+                _review_artifact_manifest_digest(
+                    plan,
+                    record["neutral_id"],
+                    run,
+                    terminal,
+                )
+                for run, terminal in zip(
+                    plan.pilot_schedule, terminals
+                )
+            }
+            self.assertNotIn(
+                record["review_artifact_commitment_digest"],
+                plain_candidates,
+            )
+
+    def test_artifact_commitments_require_true_seed_reveal(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, _, mapping_payload = _review_chain_payloads(
+            plan, terminals
+        )
+        true_seed = bytes.fromhex(MASKED_REVIEW_SEED_REVEAL)
+        wrong_seeds = (bytes.fromhex("f" * 64), bytes.fromhex("1" * 64))
+        terminal_by_digest = {
+            terminal.receipt_digest: terminal for terminal in terminals
+        }
+        run_by_pair = {
+            (run.task_id, run.condition): run
+            for run in plan.pilot_schedule
+        }
+        for record, mapping in zip(
+            packet_payload["review_artifact_records"],
+            mapping_payload["condition_mapping_records"],
+        ):
+            run = run_by_pair[
+                (mapping["task_id"], mapping["condition"])
+            ]
+            terminal = terminal_by_digest[
+                mapping["pilot_terminal_receipt_digest"]
+            ]
+            expected = record[
+                "review_artifact_commitment_digest"
+            ]
+            self.assertEqual(
+                _review_artifact_commitment_digest(
+                    true_seed,
+                    plan,
+                    record["neutral_id"],
+                    run,
+                    terminal,
+                ),
+                expected,
+            )
+            for wrong_seed in wrong_seeds:
+                wrong_candidates = {
+                    _review_artifact_commitment_digest(
+                        wrong_seed,
+                        plan,
+                        record["neutral_id"],
+                        candidate_run,
+                        candidate_terminal,
+                    )
+                    for candidate_run, candidate_terminal in zip(
+                        plan.pilot_schedule, terminals
+                    )
+                }
+                self.assertNotIn(
+                    expected,
+                    wrong_candidates,
+                )
+
+    def test_packet_rejects_old_plain_artifact_digest_field(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, _, _ = _review_chain_payloads(
+            plan, terminals
+        )
+        changed = json.loads(json.dumps(packet_payload))
+        for record in changed["review_artifact_records"]:
+            record["review_artifact_manifest_digest"] = record.pop(
+                "review_artifact_commitment_digest"
+            )
+        changed["packet_digest"] = _packet_manifest_digest(changed)
+        with self.assertRaisesRegex(
+            ExperimentReceiptError, "experiment_receipt_invalid"
+        ):
+            _runtime_receipt(
+                plan,
+                preflight,
+                history,
+                "masked_review_packet",
+                changed,
+            )
+
+    def test_masked_review_presentation_policy_is_canonical_and_known(self):
+        expected_document = {
+            "document_type": "masked_review_presentation_policy",
+            "schema_version": 1,
+            "presentation_contract_version": (
+                "content-addressed-masked-review-v1"
+            ),
+            "artifact_commitment": (
+                "seed_hmac_sha256_over_content_addressed_canonical_manifest"
+            ),
+            "visible_sources": [
+                "task_prompt_bytes",
+                "assertion_context",
+                "sanitized_diff_bytes",
+                "masked_review_rubric",
+            ],
+            "forbidden_identity_fields": [
+                "task_id",
+                "condition",
+                "profile",
+                "pilot_terminal_receipt_digest",
+            ],
+            "reviewer_instructions": [
+                "evaluate_against_requirements",
+                "apply_exact_rubric",
+                "do_not_infer_condition",
+                "report_score_time_high_or_abstain",
+            ],
+        }
+        policy = thaw_json_value(
+            experiment_receipts_module
+            .MASKED_REVIEW_PRESENTATION_POLICY
+        )
+        self.assertEqual(policy, expected_document)
+        self.assertEqual(
+            experiment_receipts_module
+            .MASKED_REVIEW_PRESENTATION_POLICY_DIGEST,
+            "sha256:697d2bb7543879072f7eac2347753156247f360ac59b7dde9c8cc44c3767d755",
+        )
+        self.assertEqual(
+            experiment_receipts_module
+            .MASKED_REVIEW_PRESENTATION_POLICY_DIGEST,
+            sha256_bytes(canonical_bytes(expected_document)),
+        )
+        mutations = {
+            "presentation_contract_version": "changed-version",
+            "artifact_commitment": "changed-commitment",
+            "visible_sources": ["changed-visible-source"],
+            "forbidden_identity_fields": ["changed-forbidden-field"],
+            "reviewer_instructions": ["changed-instruction"],
+        }
+        for field_name, changed_value in mutations.items():
+            with self.subTest(policy_leaf=field_name):
+                changed = dict(expected_document)
+                changed[field_name] = changed_value
+                self.assertNotEqual(
+                    experiment_receipts_module
+                    .MASKED_REVIEW_PRESENTATION_POLICY_DIGEST,
+                    sha256_bytes(canonical_bytes(changed)),
+                )
+
+    def test_unmask_rejects_self_consistent_forged_artifact_commitments(self):
+        for mutation in ("swapped", "arbitrary"):
+            with self.subTest(mutation=mutation):
+                plan, preflight = _runtime_fixture()
+                history = []
+                _append_containment_and_canaries(
+                    plan, preflight, history
+                )
+                terminals = _append_completed_pilots(
+                    plan, preflight, history
+                )
+                packet_payload, score_payload, mapping_payload = (
+                    _review_chain_payloads(plan, terminals)
+                )
+                records = packet_payload["review_artifact_records"]
+                if mutation == "swapped":
+                    first = records[0][
+                        "review_artifact_commitment_digest"
+                    ]
+                    records[0]["review_artifact_commitment_digest"] = (
+                        records[1]["review_artifact_commitment_digest"]
+                    )
+                    records[1][
+                        "review_artifact_commitment_digest"
+                    ] = first
+                else:
+                    records[0][
+                        "review_artifact_commitment_digest"
+                    ] = _digest("arbitrary-stale-artifact-commitment")
+                packet_payload["packet_digest"] = (
+                    _packet_manifest_digest(packet_payload)
+                )
+                packet = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "masked_review_packet",
+                    packet_payload,
+                )
+                score_payload["masked_packet_receipt_digest"] = (
+                    packet.receipt_digest
+                )
+                score = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "score_lock",
+                    score_payload,
+                )
+                mapping_payload["score_lock_receipt_digest"] = (
+                    score.receipt_digest
+                )
+                self.assertHistoryInvalid(
+                    validate_runtime_transition,
+                    plan,
+                    preflight,
+                    history,
+                    _runtime_receipt(
+                        plan,
+                        preflight,
+                        history,
+                        "unmask",
+                        mapping_payload,
+                    ),
+                )
+
+    def test_packet_rejects_invalid_review_artifact_record_coverage(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, _, _ = _review_chain_payloads(
+            plan, terminals
+        )
+        mutations = {}
+        missing = json.loads(json.dumps(packet_payload))
+        missing["review_artifact_records"].pop()
+        mutations["missing"] = missing
+        duplicate = json.loads(json.dumps(packet_payload))
+        duplicate["review_artifact_records"][1] = dict(
+            duplicate["review_artifact_records"][0]
+        )
+        mutations["duplicate"] = duplicate
+        reordered = json.loads(json.dumps(packet_payload))
+        reordered["review_artifact_records"][0:2] = reversed(
+            reordered["review_artifact_records"][0:2]
+        )
+        mutations["order"] = reordered
+        for mutation, changed in mutations.items():
+            with self.subTest(mutation=mutation):
+                changed["packet_digest"] = _packet_manifest_digest(
+                    changed
+                )
+                with self.assertRaisesRegex(
+                    ExperimentReceiptError,
+                    "experiment_receipt_invalid",
+                ):
+                    _runtime_receipt(
+                        plan,
+                        preflight,
+                        history,
+                        "masked_review_packet",
+                        changed,
+                    )
+
+    def test_review_order_is_stable_across_build_only_plan_changes(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        original_packet, _, _ = _review_chain_payloads(
+            plan, terminals
+        )
+        changed_document = thaw_json_value(plan.plan_document)
+        changed_document["bundle_digest"] = _digest(
+            "alternate-build-only-bundle"
+        )
+        changed_bytes = canonical_bytes(changed_document)
+        changed_plan = replace(
+            plan,
+            plan_document=changed_document,
+            canonical_bytes=changed_bytes,
+            plan_digest=sha256_bytes(changed_bytes),
+        )
+        changed_packet, _, _ = _review_chain_payloads(
+            changed_plan, terminals
+        )
+
+        self.assertNotEqual(plan.plan_digest, changed_plan.plan_digest)
+        self.assertEqual(
+            original_packet["randomized_order"],
+            changed_packet["randomized_order"],
+        )
+
+    def test_packet_manifest_rejects_changed_declared_reviewers(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, _, _ = _review_chain_payloads(
+            plan, terminals
+        )
+        mutations = {}
+        changed = json.loads(json.dumps(packet_payload))
+        changed["reviewer_ids"] = ["reviewer-a", "reviewer-c"]
+        mutations["reviewer_ids"] = changed
+        changed = json.loads(json.dumps(packet_payload))
+        changed["eligible_pilot_terminal_digests"][0:2] = reversed(
+            changed["eligible_pilot_terminal_digests"][0:2]
+        )
+        changed["packet_digest"] = _packet_manifest_digest(changed)
+        mutations["eligible_terminals"] = changed
+        changed = json.loads(json.dumps(packet_payload))
+        changed["condition_mapping_commitment_digest"] = _digest(
+            "alternate-mapping-commitment"
+        )
+        mutations["mapping_commitment"] = changed
+        changed = json.loads(json.dumps(packet_payload))
+        changed["review_artifact_records"][0][
+            "review_artifact_commitment_digest"
+        ] = _digest("alternate-review-artifact-commitment")
+        mutations["review_artifact_records"] = changed
+        changed = json.loads(json.dumps(packet_payload))
+        changed["randomized_order"][0:2] = reversed(
+            changed["randomized_order"][0:2]
+        )
+        changed["review_artifact_records"][0:2] = reversed(
+            changed["review_artifact_records"][0:2]
+        )
+        mutations["randomized_order"] = changed
+        changed = json.loads(json.dumps(packet_payload))
+        changed["rubric_digest"] = _digest("alternate-rubric")
+        mutations["rubric_digest"] = changed
+        for field_name, changed_payload in mutations.items():
+            with self.subTest(field_name=field_name):
+                self.assertHistoryInvalid(
+                    validate_runtime_transition,
+                    plan,
+                    preflight,
+                    history,
+                    _runtime_receipt(
+                        plan,
+                        preflight,
+                        history,
+                        "masked_review_packet",
+                        changed_payload,
+                    ),
+                )
+
+        for target in ("packet", "score_lock"):
+            with self.subTest(wrong_classification=target):
+                changed_payload = json.loads(
+                    json.dumps(
+                        packet_payload
+                        if target == "packet"
+                        else _review_chain_payloads(
+                            plan, terminals
+                        )[1]
+                    )
+                )
+                changed_payload["review_evidence_classification"] = (
+                    "replay_verified_independent_review"
+                )
+                if target == "score_lock":
+                    changed_payload["masked_packet_receipt_digest"] = (
+                        _digest("packet")
+                    )
+                with self.assertRaisesRegex(
+                    ExperimentReceiptError,
+                    "experiment_receipt_invalid",
+                ):
+                    _runtime_receipt(
+                        plan,
+                        preflight,
+                        history,
+                        (
+                            "masked_review_packet"
+                            if target == "packet"
+                            else "score_lock"
+                        ),
+                        changed_payload,
+                    )
+
+    def test_v2_unmask_rejects_alternate_reveal_and_commitment(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, score_payload, mapping_payload = (
+            _review_chain_payloads(plan, terminals)
+        )
+        packet = _append_runtime(
+            plan,
+            preflight,
+            history,
+            "masked_review_packet",
+            packet_payload,
+        )
+        score_payload["masked_packet_receipt_digest"] = (
+            packet.receipt_digest
+        )
+        score = _append_runtime(
+            plan, preflight, history, "score_lock", score_payload
+        )
+        mapping_payload["score_lock_receipt_digest"] = (
+            score.receipt_digest
+        )
+        alternate_reveal = json.loads(json.dumps(mapping_payload))
+        alternate_reveal["masked_review_seed_reveal"] = "f" * 64
+        self.assertHistoryInvalid(
+            validate_runtime_transition,
+            plan,
+            preflight,
+            history,
+            _runtime_receipt(
+                plan,
+                preflight,
+                history,
+                "unmask",
+                alternate_reveal,
+            ),
+        )
+        uppercase_reveal = json.loads(json.dumps(mapping_payload))
+        uppercase_reveal["masked_review_seed_reveal"] = (
+            MASKED_REVIEW_SEED_REVEAL.upper()
+        )
+        with self.assertRaisesRegex(
+            ExperimentReceiptError, "experiment_receipt_invalid"
+        ):
+            _runtime_receipt(
+                plan,
+                preflight,
+                history,
+                "unmask",
+                uppercase_reveal,
+            )
+
+        wrong_commitment_packet = json.loads(
+            json.dumps(packet_payload)
+        )
+        wrong_commitment_packet[
+            "condition_mapping_commitment_digest"
+        ] = _digest("caller-chosen-mapping-commitment")
+        wrong_commitment_packet["packet_digest"] = (
+            _packet_manifest_digest(wrong_commitment_packet)
+        )
+        alternate_history = history[:-2]
+        forged_packet = _append_runtime(
+            plan,
+            preflight,
+            alternate_history,
+            "masked_review_packet",
+            wrong_commitment_packet,
+        )
+        forged_score_payload = json.loads(json.dumps(score_payload))
+        forged_score_payload["masked_packet_receipt_digest"] = (
+            forged_packet.receipt_digest
+        )
+        forged_score = _append_runtime(
+            plan,
+            preflight,
+            alternate_history,
+            "score_lock",
+            forged_score_payload,
+        )
+        forged_unmask = json.loads(json.dumps(mapping_payload))
+        forged_unmask["score_lock_receipt_digest"] = (
+            forged_score.receipt_digest
+        )
+        self.assertHistoryInvalid(
+            validate_runtime_transition,
+            plan,
+            preflight,
+            alternate_history,
+            _runtime_receipt(
+                plan,
+                preflight,
+                alternate_history,
+                "unmask",
+                forged_unmask,
+            ),
+        )
+
+    def test_reveal_rejects_changed_authoritative_context_with_stale_commitment(self):
+        changed_input = json.loads(VALID_INPUT.read_text())
+        changed_input["provider_cap_evidence"] = (
+            "independently_verified"
+        )
+        experiment_input = load_experiment_input(
+            canonical_bytes(changed_input)
+        )
+        (
+            _,
+            sources,
+            snapshots,
+            selection,
+            corpus,
+        ) = _static_receipts(experiment_input)
+        plan = _build_plan(
+            experiment_input,
+            sources,
+            snapshots,
+            selection,
+            corpus,
+        )
+        preflight = make_receipt(
+            "preflight",
+            plan.input_digest,
+            plan.plan_digest,
+            None,
+            _preflight_payload(plan),
+        )
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, score_payload, mapping_payload = (
+            _review_chain_payloads(plan, terminals)
+        )
+        packet = _append_runtime(
+            plan,
+            preflight,
+            history,
+            "masked_review_packet",
+            packet_payload,
+        )
+        score_payload["masked_packet_receipt_digest"] = (
+            packet.receipt_digest
+        )
+        score = _append_runtime(
+            plan, preflight, history, "score_lock", score_payload
+        )
+        mapping_payload["score_lock_receipt_digest"] = (
+            score.receipt_digest
+        )
+
+        self.assertHistoryInvalid(
+            validate_runtime_transition,
+            plan,
+            preflight,
+            history,
+            _runtime_receipt(
+                plan,
+                preflight,
+                history,
+                "unmask",
+                mapping_payload,
+            ),
+        )
+
+    def test_v2_unmask_rejects_caller_chosen_order_and_neutral_id(self):
+        for mutation in ("order", "neutral_id"):
+            with self.subTest(mutation=mutation):
+                plan, preflight = _runtime_fixture()
+                history = []
+                _append_containment_and_canaries(
+                    plan, preflight, history
+                )
+                terminals = _append_completed_pilots(
+                    plan, preflight, history
+                )
+                packet_payload, score_payload, mapping_payload = (
+                    _review_chain_payloads(plan, terminals)
+                )
+                if mutation == "order":
+                    packet_payload["randomized_order"][0:2] = reversed(
+                        packet_payload["randomized_order"][0:2]
+                    )
+                    packet_payload["review_artifact_records"][
+                        0:2
+                    ] = reversed(
+                        packet_payload["review_artifact_records"][0:2]
+                    )
+                    score_payload["locked_score_records"][0:2] = reversed(
+                        score_payload["locked_score_records"][0:2]
+                    )
+                else:
+                    original = packet_payload["randomized_order"][0]
+                    replacement = "neutral-caller-chosen"
+                    packet_payload["randomized_order"][0] = replacement
+                    packet_payload["review_artifact_records"][0][
+                        "neutral_id"
+                    ] = replacement
+                    score_payload["locked_score_records"][0][
+                        "neutral_id"
+                    ] = replacement
+                    next(
+                        record
+                        for record in mapping_payload[
+                            "condition_mapping_records"
+                        ]
+                        if record["neutral_id"] == original
+                    )["neutral_id"] = replacement
+                    mapping_payload["condition_mapping_digest"] = (
+                        sha256_bytes(
+                            canonical_bytes(
+                                {
+                                    "document_type": (
+                                        "condition_mapping_records"
+                                    ),
+                                    "schema_version": 1,
+                                    "records": mapping_payload[
+                                        "condition_mapping_records"
+                                    ],
+                                }
+                            )
+                        )
+                    )
+                score_payload["locked_score_records_digest"] = (
+                    sha256_bytes(
+                        canonical_bytes(
+                            {
+                                "document_type": "locked_score_records",
+                                "schema_version": 1,
+                                "records": score_payload[
+                                    "locked_score_records"
+                                ],
+                            }
+                        )
+                    )
+                )
+                packet_payload["packet_digest"] = (
+                    _packet_manifest_digest(packet_payload)
+                )
+                packet = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "masked_review_packet",
+                    packet_payload,
+                )
+                score_payload["masked_packet_receipt_digest"] = (
+                    packet.receipt_digest
+                )
+                score = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "score_lock",
+                    score_payload,
+                )
+                mapping_payload["score_lock_receipt_digest"] = (
+                    score.receipt_digest
+                )
+                self.assertHistoryInvalid(
+                    validate_runtime_transition,
+                    plan,
+                    preflight,
+                    history,
+                    _runtime_receipt(
+                        plan,
+                        preflight,
+                        history,
+                        "unmask",
+                        mapping_payload,
+                    ),
+                )
+
+    def test_confirmed_high_is_bound_at_score_lock_but_basis_is_post_unmask(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, score_payload, mapping_payload = (
+            _review_chain_payloads(plan, terminals, high=True)
+        )
+        packet = _append_runtime(
+            plan,
+            preflight,
+            history,
+            "masked_review_packet",
+            packet_payload,
+        )
+        score_payload["masked_packet_receipt_digest"] = (
+            packet.receipt_digest
+        )
+        score = _append_runtime(
+            plan, preflight, history, "score_lock", score_payload
+        )
+        self.assertTrue(
+            any(
+                record["confirmed_high"]
+                for record in score.payload["locked_score_records"]
+            )
+        )
+        self.assertNotIn("high_regression_basis_digest", score.payload)
+        partial_history = list(history)
+        partial_stop = _append_runtime(
+            plan,
+            preflight,
+            partial_history,
+            "experiment_stop",
+            _stop_payload(
+                stage="unmask",
+                reason="reviewer_abstention",
+                canary_count=2,
+                pilot_count=8,
+                evidence=(score.receipt_digest,),
+            ),
+        )
+        partial = analyze_runtime_history(
+            build_analysis_contract(plan),
+            plan,
+            preflight,
+            partial_history,
+        )
+        self.assertEqual(partial_stop.payload["outcome"], "inconclusive")
+        self.assertEqual(partial.outcome, "inconclusive")
+        self.assertFalse(partial.comparative_aggregate_emitted)
+        self.assertNotEqual(partial.reason_code, "masked_high_regression")
+        mapping_payload["score_lock_receipt_digest"] = (
+            score.receipt_digest
+        )
+        mapping_payload["high_regression_basis_digest"] = (
+            _high_regression_basis(packet, score, mapping_payload)
+        )
+        unmask = _append_runtime(
+            plan, preflight, history, "unmask", mapping_payload
+        )
+        self.assertIsNotNone(
+            unmask.payload["high_regression_basis_digest"]
+        )
+        dataset = project_analysis_dataset(plan, preflight, history)
+        self.assertEqual(
+            dataset.masked_review.high_regression_basis_digest,
+            unmask.payload["high_regression_basis_digest"],
+        )
+
+    def test_current_only_and_both_condition_high_have_no_regression_basis(self):
+        for high_conditions in (("current",), ("current", "lean")):
+            with self.subTest(high_conditions=high_conditions):
+                plan, preflight = _runtime_fixture()
+                history = []
+                _append_containment_and_canaries(
+                    plan, preflight, history
+                )
+                terminals = _append_completed_pilots(
+                    plan, preflight, history
+                )
+                packet_payload, score_payload, mapping_payload = (
+                    _review_chain_payloads(plan, terminals)
+                )
+                target_task = plan.pilot_schedule[0].task_id
+                mapping_by_neutral = {
+                    record["neutral_id"]: record
+                    for record in mapping_payload[
+                        "condition_mapping_records"
+                    ]
+                }
+                for score_record in score_payload[
+                    "locked_score_records"
+                ]:
+                    mapping = mapping_by_neutral[
+                        score_record["neutral_id"]
+                    ]
+                    score_record["confirmed_high"] = (
+                        mapping["task_id"] == target_task
+                        and mapping["condition"] in high_conditions
+                    )
+                score_payload["locked_score_records_digest"] = (
+                    sha256_bytes(
+                        canonical_bytes(
+                            {
+                                "document_type": (
+                                    "locked_score_records"
+                                ),
+                                "schema_version": 1,
+                                "records": score_payload[
+                                    "locked_score_records"
+                                ],
+                            }
+                        )
+                    )
+                )
+                packet = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "masked_review_packet",
+                    packet_payload,
+                )
+                score_payload["masked_packet_receipt_digest"] = (
+                    packet.receipt_digest
+                )
+                score = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "score_lock",
+                    score_payload,
+                )
+                mapping_payload["score_lock_receipt_digest"] = (
+                    score.receipt_digest
+                )
+                unmask = _append_runtime(
+                    plan,
+                    preflight,
+                    history,
+                    "unmask",
+                    mapping_payload,
+                )
+                self.assertIsNone(
+                    unmask.payload["high_regression_basis_digest"]
+                )
+
+    def test_multiple_lean_only_high_basis_is_sorted_and_known(self):
+        plan, preflight = _runtime_fixture()
+        history = []
+        _append_containment_and_canaries(plan, preflight, history)
+        terminals = _append_completed_pilots(
+            plan, preflight, history
+        )
+        packet_payload, score_payload, mapping_payload = (
+            _review_chain_payloads(plan, terminals)
+        )
+        regression_task_ids = sorted(
+            {
+                plan.pilot_schedule[0].task_id,
+                plan.pilot_schedule[2].task_id,
+            }
+        )
+        mapping_by_neutral = {
+            record["neutral_id"]: record
+            for record in mapping_payload["condition_mapping_records"]
+        }
+        for score_record in score_payload["locked_score_records"]:
+            mapping = mapping_by_neutral[score_record["neutral_id"]]
+            score_record["confirmed_high"] = (
+                mapping["task_id"] in regression_task_ids
+                and mapping["condition"] == "lean"
+            )
+        score_payload["locked_score_records_digest"] = sha256_bytes(
+            canonical_bytes(
+                {
+                    "document_type": "locked_score_records",
+                    "schema_version": 1,
+                    "records": score_payload["locked_score_records"],
+                }
+            )
+        )
+        packet = _append_runtime(
+            plan,
+            preflight,
+            history,
+            "masked_review_packet",
+            packet_payload,
+        )
+        score_payload["masked_packet_receipt_digest"] = (
+            packet.receipt_digest
+        )
+        score = _append_runtime(
+            plan, preflight, history, "score_lock", score_payload
+        )
+        mapping_payload["score_lock_receipt_digest"] = (
+            score.receipt_digest
+        )
+        basis = _high_regression_basis(
+            packet, score, mapping_payload
+        )
+        expected_basis = sha256_bytes(
+            canonical_bytes(
+                {
+                    "document_type": "masked_high_regression_basis",
+                    "schema_version": 2,
+                    "masked_packet_receipt_digest": packet.receipt_digest,
+                    "score_lock_receipt_digest": score.receipt_digest,
+                    "review_findings_digest": score.payload[
+                        "review_findings_digest"
+                    ],
+                    "rubric_digest": packet.payload["rubric_digest"],
+                    "condition_mapping_digest": mapping_payload[
+                        "condition_mapping_digest"
+                    ],
+                    "regression_task_ids": regression_task_ids,
+                    "adjudication": (
+                        "post_unmask_same_task_lean_high_current_not_high"
+                    ),
+                }
+            )
+        )
+        self.assertEqual(basis, expected_basis)
+        self.assertEqual(
+            basis,
+            "sha256:609172cf9154cfff9f94b76b6e11f9e73c419e2ad6a99e480590eac306f1574a",
+        )
+        mapping_payload["high_regression_basis_digest"] = basis
+        unmask = _append_runtime(
+            plan, preflight, history, "unmask", mapping_payload
+        )
+        self.assertEqual(
+            unmask.payload["high_regression_basis_digest"],
+            expected_basis,
+        )
+
     def test_registered_absolute_safety_and_masked_high_are_only_valid_rejections(self):
         plan, preflight = _runtime_fixture()
         history = []
@@ -2853,7 +4349,7 @@ class RuntimeReplayTests(unittest.TestCase):
         packet, score, unmask = _append_review_chain(
             plan, preflight, history, terminals, high=True
         )
-        high_basis = score.payload["high_regression_basis_digest"]
+        high_basis = unmask.payload["high_regression_basis_digest"]
         high_stop = _append_runtime(
             plan,
             preflight,

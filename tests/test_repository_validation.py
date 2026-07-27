@@ -57,6 +57,46 @@ _FORBIDDEN_OS_PROCESS_CALLS = {
     "os.spawnvpe",
     "os.system",
 }
+_PHASE_A_INTERNAL_DEPENDENCY_ALLOWLIST = {
+    "experiment_plan.py": frozenset(
+        {"scripts.workflow_coordination.canonical_json"}
+    ),
+    "experiment_receipts.py": frozenset(
+        {
+            "scripts.live_eval.experiment_plan",
+            "scripts.live_eval.experiment_telemetry",
+            "scripts.workflow_coordination.canonical_json",
+        }
+    ),
+    "experiment_telemetry.py": frozenset(
+        {"scripts.workflow_coordination.canonical_json"}
+    ),
+    "task_snapshot.py": frozenset(
+        {
+            "scripts.live_eval.experiment_receipts",
+            "scripts.workflow_coordination.canonical_json",
+        }
+    ),
+    "experiment.py": frozenset(
+        {
+            "scripts.live_eval.checkout",
+            "scripts.live_eval.experiment_plan",
+            "scripts.live_eval.experiment_receipts",
+            "scripts.live_eval.harness",
+            "scripts.live_eval.task_snapshot",
+            "scripts.workflow_coordination.canonical_json",
+        }
+    ),
+    "run_harness_experiment.py": frozenset(
+        {
+            "scripts.live_eval.experiment",
+            "scripts.live_eval.experiment_plan",
+            "scripts.live_eval.experiment_receipts",
+            "scripts.live_eval.harness",
+            "scripts.live_eval.task_snapshot",
+        }
+    ),
+}
 
 
 def _qualified_name(node, aliases):
@@ -67,6 +107,42 @@ def _qualified_name(node, aliases):
         if parent is not None:
             return parent + "." + node.attr
     return None
+
+
+def _phase_a_internal_dependencies(source, filename):
+    parsed = ast.parse(source, filename=filename)
+    dependencies = set()
+    for node in ast.walk(parsed):
+        if isinstance(node, ast.Import):
+            dependencies.update(
+                alias.name
+                for alias in node.names
+                if alias.name == "scripts"
+                or alias.name.startswith("scripts.")
+            )
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and (
+                node.module == "scripts"
+                or node.module.startswith("scripts.")
+            )
+        ):
+            dependencies.add(node.module)
+    return frozenset(dependencies)
+
+
+def _phase_a_internal_dependency_violations(source, filename):
+    module_name = Path(filename).name
+    allowed = _PHASE_A_INTERNAL_DEPENDENCY_ALLOWLIST[module_name]
+    actual = _phase_a_internal_dependencies(source, filename)
+    return tuple(
+        "unexpected_internal_import:" + dependency
+        for dependency in sorted(actual - allowed)
+    ) + tuple(
+        "missing_internal_import:" + dependency
+        for dependency in sorted(allowed - actual)
+    )
 
 
 def _phase_a_dependency_violations(source, filename):
@@ -485,6 +561,124 @@ class RepositoryValidationTests(unittest.TestCase):
         self.assertLess(setup, baseline)
         self.assertLess(baseline, assertion)
         self.assertLess(assertion, validation)
+
+    def test_plan_documents_exact_phase_a_internal_dependencies(self):
+        root = Path(__file__).parents[1]
+        plan_source = (
+            root
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-07-23-harness-experiment-readiness-plan.md"
+        ).read_text(encoding="utf-8")
+        dependency_cells = {
+            Path(columns[1].strip("`")).name: columns[3]
+            for line in plan_source.splitlines()
+            for columns in ([cell.strip() for cell in line.split("|")],)
+            if len(columns) >= 5
+            and columns[1].startswith("`scripts/")
+            and Path(columns[1].strip("`")).name
+            in _PHASE_A_INTERNAL_DEPENDENCY_ALLOWLIST
+        }
+
+        self.assertEqual(
+            set(dependency_cells),
+            set(_PHASE_A_INTERNAL_DEPENDENCY_ALLOWLIST),
+        )
+        for module_name, allowed in (
+            _PHASE_A_INTERNAL_DEPENDENCY_ALLOWLIST.items()
+        ):
+            documented = set(
+                dependency_cells[module_name].split("`")[1::2]
+            )
+            expected = {
+                dependency.rsplit(".", 1)[-1]
+                for dependency in allowed
+            }
+            with self.subTest(module_name=module_name):
+                self.assertEqual(documented, expected)
+
+    def test_phase_a_internal_imports_follow_dependency_direction(self):
+        root = Path(__file__).parents[1]
+        targets = (
+            root / "scripts" / "run_harness_experiment.py",
+            root / "scripts" / "live_eval" / "experiment.py",
+            root / "scripts" / "live_eval" / "experiment_plan.py",
+            root / "scripts" / "live_eval" / "experiment_receipts.py",
+            root / "scripts" / "live_eval" / "experiment_telemetry.py",
+            root / "scripts" / "live_eval" / "task_snapshot.py",
+        )
+
+        for path in targets:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    _phase_a_internal_dependency_violations(
+                        path.read_text(encoding="utf-8"),
+                        str(path),
+                    ),
+                    (),
+                )
+
+    def test_phase_a_internal_dependency_gate_detects_direction_mutations(self):
+        root = Path(__file__).parents[1]
+        mutations = (
+            (
+                "scripts/live_eval/experiment_plan.py",
+                "from scripts.live_eval.experiment_receipts "
+                "import validate_runtime_records\n",
+                "unexpected_internal_import:"
+                "scripts.live_eval.experiment_receipts",
+            ),
+            (
+                "scripts/run_harness_experiment.py",
+                "from scripts.live_eval.experiment_telemetry "
+                "import parse_telemetry_jsonl\n",
+                "unexpected_internal_import:"
+                "scripts.live_eval.experiment_telemetry",
+            ),
+            (
+                "scripts/live_eval/experiment.py",
+                "import scripts.live_eval.experiment_telemetry "
+                "as telemetry\n",
+                "unexpected_internal_import:"
+                "scripts.live_eval.experiment_telemetry",
+            ),
+        )
+
+        for relative, mutation, expected in mutations:
+            path = root / relative
+            source = path.read_text(encoding="utf-8")
+            with self.subTest(relative=relative):
+                self.assertIn(
+                    expected,
+                    _phase_a_internal_dependency_violations(
+                        source + "\n" + mutation,
+                        relative,
+                    ),
+                )
+
+        telemetry_path = (
+            root / "scripts" / "live_eval" / "experiment_telemetry.py"
+        )
+        telemetry_source = telemetry_path.read_text(encoding="utf-8")
+        canonical_import = (
+            "from scripts.workflow_coordination.canonical_json "
+            "import canonical_bytes\n"
+        )
+        self.assertEqual(telemetry_source.count(canonical_import), 1)
+        without_canonical_import = telemetry_source.replace(
+            canonical_import,
+            "",
+            1,
+        )
+        self.assertIn(
+            "missing_internal_import:"
+            "scripts.workflow_coordination.canonical_json",
+            _phase_a_internal_dependency_violations(
+                without_canonical_import,
+                str(telemetry_path),
+            ),
+        )
 
     def test_phase_a_modules_have_no_live_or_network_dependency_seam(self):
         root = Path(__file__).parents[1]

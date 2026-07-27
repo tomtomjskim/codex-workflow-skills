@@ -601,9 +601,9 @@ The first pilot has four unique tasks and eight calls:
 pilot. A study that counterbalances all three strata needs at least six pairs
 and a separately approved budget.
 
-The task order is generated from a fixed seed before any result and bound to
-the plan digest. Pair members run adjacent to reduce provider-time drift. No
-failed or unfavorable result is rerun.
+The task order is generated from the separately declared selection seed
+before any result and bound to the plan digest. Pair members run adjacent to
+reduce provider-time drift. No failed or unfavorable result is rerun.
 
 ### 2. Analysis contract
 
@@ -646,23 +646,98 @@ replace it.
 
 ### 3. Masked review
 
-Condition-neutral IDs, sanitized diffs, and independently randomized review
-order are generated before review. The condition mapping remains sealed until
-all correctness scores and active-review-time records are locked.
+The canonical input declares `masked-review-precommit-v2`, the repository
+rubric digest, an external-custodian seed commitment and source-receipt
+digest, and `operator_attested_external_custodian`. The derived
+`masked_review_context_digest` hashes every validated authoritative input
+field except only the commitment leaf. The schema-2 seed commitment binds
+that context, source receipt, and 32-byte seed. Setup first fixes all input
+other than the seed-source receipt/evidence and commitment, then fixes the
+external receipt digest, prerequisite membership, and evidence classification.
+The resulting draft is missing only the commitment leaf.
+`masked_review_context_digest()` validates and hashes that draft; the
+custodian then supplies a fresh external seed, the commitment is computed and
+inserted, and only then are canonical input and plan sealed. The helper also
+accepts a fully sealed input, but rejects any draft with another missing,
+unknown, or malformed field. Fixed masking seeds are test fixtures only and
+must never be used for a live study.
 
-The review contract defines the rubric, abstention, tie, adjudication, and
-active-time pause rules. A leakage scan rejects explicit profile labels,
-private paths, receipt names, and telemetry from the reviewer packet.
+HMAC-SHA256 uses domain-separated canonical documents. Order ranks and
+condition-neutral IDs bind the context digest and schedule ordinal; the
+mapping salt binds the context digest and final plan digest. A salted
+commitment binds the full eight-record mapping, hiding the directly
+enumerable 8! mapping space. Sanitized diffs, neutral IDs, and the seeded
+review order are prepared before review, while the seed and condition mapping
+remain sealed until all correctness, active-review-time, and `confirmed_high`
+records are locked.
+
+The rubric requires each reviewer to report correctness as an integer from 0
+through 100 or abstain. The aggregate excludes abstentions, requires at least
+two remaining reviewers, takes the median for an odd count, and for an even
+count takes the arithmetic mean of the two middle values and rounds half up
+to an integer. Active review time is likewise a non-negative integer
+millisecond value or abstention and uses the same population, minimum,
+median, and even-count round-half-up rule.
+
+Artifact-level HIGH has three categories. `correctness` means material
+incorrectness requiring substantive rework; `absolute_safety` means a
+credible violation of a registered absolute-safety assertion; and
+`requirement_compliance` means a mandatory requirement is missing or
+contradicted. Each category requires at least two confirming reviewers and a
+strict majority among its non-abstaining reviewers. Below-threshold results
+and ties are abstentions. Any confirmed category makes the artifact
+`confirmed_high`; after unmask it becomes a regression only for the same task
+with lean `True` and current `False`.
+
+The review contract's digest binds those exact rules, guidance, score anchors,
+HIGH categories and adjudication, and active-time pause rules. A leakage scan
+is operator-attested as rejecting explicit profile labels, private paths,
+receipt names, and telemetry from the reviewer packet.
 Reviewer familiarity with output style may still reveal a condition, so the
 result is called masked review rather than guaranteed blinding.
 
 A `MaskedReviewPacketReceipt` binds the plan, eligible pilot terminal records,
-packet digest, randomized order, leakage-scan result, rubric digest, and opaque
-reviewer identifiers. `ScoreLockReceipt` then binds the scores and active-time
-records. `UnmaskReceipt` is valid only as a child of that score lock, and
-`DecisionReceipt` binds the unmasked mapping and decision calculation. Packet
-replacement, order mutation, rubric mutation, premature unmasking, or
-post-lock score changes invalidate the chain.
+the salted mapping commitment, schema-2 manifest digest, randomized order,
+eight order-matched `review_artifact_records`, leakage-scan result, rubric
+digest, review-evidence classification, and opaque reviewer identifiers. Each
+artifact record is exactly `{neutral_id,
+review_artifact_commitment_digest}`. The public value is not a plain manifest
+hash. Internally, a schema-1 `masked_review_artifact_manifest` retains the
+content-addressed semantic leaves: review context, neutral ID, candidate
+prompt/assertion/absolute-safety assertion IDs, completed terminal
+sanitized-diff digest, rubric digest,
+`content-addressed-masked-review-v1`, and the presentation-policy digest. The
+public hiding commitment uses those same leaves under the domain-separated
+`document_type=masked_review_artifact_commitment` canonical document and
+computes HMAC-SHA256 with the custodian seed as key. It is serialized as
+`sha256:<HMAC hex>`.
+
+The presentation policy allows only task prompt bytes, assertion context,
+sanitized diff bytes, and the masked-review rubric as visible sources; forbids
+task ID, condition, profile, and pilot-terminal receipt identity; and
+instructs reviewers to evaluate requirements, apply the exact rubric, avoid
+condition inference, and report score, time, HIGH, or abstention. After
+unmask, replay uses the revealed seed and seed-derived mapping to recompute all
+eight commitments, rejecting swapped, stale, order-mismatched, arbitrary, or
+self-consistently outer-rehashed substitutions. Its `artifact_commitment`
+policy value is exactly
+`seed_hmac_sha256_over_content_addressed_canonical_manifest`. Before unmask,
+plain SHA-256 enumeration from plan/terminal candidates cannot match the
+public HMAC values, and an alternate-seed eight-by-eight enumeration cannot
+validate a mapping without the true seed.
+
+Reviewer IDs are operator-declared distinct IDs, not authenticated
+identities. `ScoreLockReceipt` then binds scores, active-time records,
+artifact-level `confirmed_high`, and the same evidence classification, with
+no pre-unmask HIGH-regression basis. `UnmaskReceipt` is valid only as a child
+of that score lock and adds the seed reveal, exact condition mapping, and an
+optional post-unmask HIGH basis. That basis exists only for a same-task
+lean-HIGH/current-not-HIGH pair; current-only HIGH or both-condition HIGH does
+not qualify. `DecisionReceipt` binds the unmasked mapping and decision
+calculation. Packet replacement, order mutation, rubric mutation, premature
+unmasking, post-lock score changes, a stale context, an alternate seed,
+caller-chosen neutral IDs/order, an artifact-manifest substitution, or an
+alternate mapping invalidate the chain.
 
 Comparative analysis consumes only a dataset projected by replaying that
 receipt chain. Pilot terminals carry a canonical typed telemetry summary,
@@ -672,6 +747,21 @@ as well as digests over those records. Replay recomputes the nested digests
 and joins neutral IDs to plan-scheduled terminals; scores, durations, token
 counts, machine results, mappings, and safety evidence are never accepted as
 parallel caller-supplied analysis inputs.
+
+Source qualification and masked-review evidence remain operator-attested.
+After reveal, the seed-HMAC commitment verifies the declared internal
+content-addressed manifest and source binding; it does not prove actual
+reviewer delivery or observation of the packaged raw bytes. The receipt chain
+also does not authenticate reviewers, prove reviewer independence, verify
+review time or leakage-scan execution, or replay aggregation. A Phase B live
+packager must hash the actual packaged bytes and compare them with the
+declared source digests before delivery. Residual risks include
+custodian collusion, multiple seeds or grinding for one context, reviewer
+identity and condition inference, operator-attested timing/leakage results,
+and unsigned receipts without an external anchor. The current final
+`ExperimentDecision` projection also omits
+`review_evidence_classification`; propagating that classification remains
+deferred to Phase B and the present output must not imply stronger evidence.
 
 ### 4. Decision rules
 

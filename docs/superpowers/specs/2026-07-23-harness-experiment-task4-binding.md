@@ -267,9 +267,39 @@ identities whose format and receipt linkage are validated in Phase A.
 
 Eligible pilot terminal digests are in plan schedule order. The packet's
 `randomized_order` contains eight unique neutral IDs. Score and mapping
-records are each in exactly that order. Reviewer IDs are non-empty, UTF-8-byte
-sorted, and unique. Supporting evidence receipt digests are unique, in ledger
-order, and reference only earlier accepted receipts.
+records and review-artifact records are each in exactly that order. Reviewer
+IDs are non-empty, UTF-8-byte sorted, unique, and operator-declared distinct;
+they are not authenticated reviewer identities. Supporting evidence receipt
+digests are unique, in ledger order, and reference only earlier accepted
+receipts.
+
+The authoritative input uses `masked-review-precommit-v2` and contains exactly
+four masked-review authority fields: rubric digest, seed commitment digest,
+seed-source receipt digest, and seed evidence classification. The last value
+is `operator_attested_external_custodian`, and the source digest must also be
+an external-prerequisite member. The derived context digest hashes a schema-1
+document containing the validated authoritative input with only the seed
+commitment leaf omitted. The seed commitment is a schema-2 canonical document
+binding that context, the source receipt, and the 32-byte lowercase-hex seed.
+Setup first fixes all input other than the seed-source receipt/evidence and
+commitment, then fixes the source receipt digest, its external-prerequisite
+membership, and its evidence classification. That leaves an exact
+commitment-only-missing draft. `masked_review_context_digest()` validates and
+hashes that draft, after which the custodian supplies a fresh external seed,
+the commitment is computed and inserted, and input and plan are sealed. The
+helper accepts a sealed input or that exact draft and rejects any other
+missing, unknown, or malformed field. Fixed masking seeds are deterministic
+test fixtures only, never live inputs.
+
+For schedule ordinals 1 through 8, separate canonical HMAC-SHA256 domains
+derive `masked_review_order_rank` and `masked_review_neutral_id` from the seed,
+context digest, and ordinal. A third domain derives
+`masked_review_mapping_salt` from the seed, context digest, and final plan
+digest. The condition-mapping commitment hashes that salt with the complete
+eight-record mapping. Salting prevents direct checking of the 8! candidate
+mappings. Seed and mapping reveal occur only in unmask after score lock.
+Replay rejects stale context, alternate seed, caller-chosen order or neutral
+ID, and alternate mapping or commitment.
 
 The score-record digest is:
 
@@ -289,35 +319,133 @@ pilot terminal exactly once. Outer receipt validity never substitutes for
 recomputing telemetry, score-record, mapping, or decision-calculation
 digests.
 
-The packet rubric digest must equal:
+The packet has exactly
+`condition_mapping_commitment_digest`,
+`eligible_pilot_terminal_digests`, `packet_digest`, `randomized_order`,
+`review_artifact_records`, `leakage_scan_result`,
+`review_evidence_classification`, `rubric_digest`, and `reviewer_ids`.
+`review_artifact_records` contains exactly eight entries in
+`randomized_order`; each entry is exactly `{neutral_id,
+review_artifact_commitment_digest}`. Any alternate or legacy record field is
+rejected. `packet_digest` is the canonical schema-2
+`masked_review_packet_manifest` digest over the other eight fields. The
+packet rubric digest equals the plan's authoritative
+`masked_review_rubric_digest`, which binds guidance, anchors, HIGH categories
+and adjudication, and active-time rules.
 
-```python
-sha256_bytes(canonical_bytes({
-    "document_type": "masked_review_rubric_policy",
-    "schema_version": 1,
-    "analysis_contract_version":
-        plan.plan_document["analysis_contract_version"],
-    "masking_contract_version":
-        plan.plan_document["masking_contract_version"],
-}))
+The public `review_artifact_commitment_digest` is not a plain SHA-256 digest
+of the internal manifest. The internal canonical schema-1
+`masked_review_artifact_manifest` retains exactly these semantic leaves:
+
+```text
+document_type=masked_review_artifact_manifest
+schema_version=1
+masked_review_context_digest
+neutral_id
+prompt_digest
+assertion_digest
+absolute_safety_assertion_ids
+sanitized_diff_digest
+rubric_digest
+presentation_contract_version=content-addressed-masked-review-v1
+presentation_policy_digest
 ```
 
-The HIGH-basis calculation uses this already validated rubric identity.
+The candidate supplies the prompt, assertion, and ordered
+absolute-safety-assertion IDs; the matched completed terminal supplies the
+sanitized-diff digest. To form the public hiding commitment, the implementation
+changes the domain leaf to
+`document_type=masked_review_artifact_commitment`, canonically serializes the
+same remaining leaves, and computes HMAC-SHA256 with the custodian seed as the
+key. It serializes the result as `sha256:<HMAC hex>`.
+
+The canonical presentation policy declares visible
+sources as task prompt bytes, assertion context, sanitized diff bytes, and the
+masked-review rubric. It forbids task ID, condition, profile, and
+pilot-terminal receipt digest, and instructs reviewers to evaluate against
+requirements, apply the exact rubric, not infer condition, and report score,
+time, HIGH categories, or abstention. Its `artifact_commitment` value is
+exactly
+`seed_hmac_sha256_over_content_addressed_canonical_manifest`.
+
+On unmask, the revealed seed and exact seed-derived
+task/condition/terminal mapping recompute all eight commitments. Replay
+rejects swapped, stale, order-mismatched, arbitrary, and self-consistently
+outer-rehashed commitments. Before reveal, plan/terminal candidate plain-SHA
+enumeration cannot match the public HMAC values; alternate-seed eight-by-eight
+enumeration cannot validate a mapping without the true seed.
+
+The score lock has exactly `masked_packet_receipt_digest`,
+`locked_score_records`, `locked_score_records_digest`,
+`review_findings_digest`, and `review_evidence_classification`. Each score
+record has exactly `neutral_id`, integer `correctness_score`, non-negative
+`active_review_milliseconds`, and boolean `confirmed_high`. The packet and
+score-lock classification is exactly
+`operator_attested_aggregated_review`. There is no
+`high_regression_basis_digest` in the score-lock schema.
+
+The rubric contract has these exact aggregation semantics:
+
+- correctness is one per-reviewer integer from 0 through 100 or abstention;
+  exclude abstentions, require at least two reviewers, take the median for an
+  odd count, and for an even count take the arithmetic mean of the two middle
+  values rounded half up to an integer;
+- active review time is one per-reviewer non-negative integer millisecond
+  value or abstention, with the identical population, minimum, median, and
+  even-count round-half-up rule;
+- HIGH is artifact-level across `correctness`, `absolute_safety`, and
+  `requirement_compliance`. These mean, respectively, material incorrectness
+  requiring substantive rework, a credible registered absolute-safety
+  violation, and a missing or contradicted mandatory requirement. Each
+  category requires at least two confirming reviewers and a strict majority
+  of non-abstaining reviewers. A tie or either unmet threshold is abstention.
+  Any confirmed category makes the artifact `confirmed_high=True`.
+
+Only after unmask does artifact-level HIGH become a regression basis, and only
+for the same task with lean `True` and current `False`.
+
+The unmask has exactly `score_lock_receipt_digest`,
+`masked_review_seed_reveal`, `condition_mapping_records`,
+`condition_mapping_digest`, and nullable `high_regression_basis_digest`.
 
 A non-null HIGH basis must equal:
 
 ```python
 sha256_bytes(canonical_bytes({
     "document_type": "masked_high_regression_basis",
-    "schema_version": 1,
+    "schema_version": 2,
     "masked_packet_receipt_digest": packet.receipt_digest,
+    "score_lock_receipt_digest": score_lock.receipt_digest,
     "review_findings_digest": score_lock.payload["review_findings_digest"],
     "rubric_digest": packet.payload["rubric_digest"],
-    "adjudication": "high_regression",
+    "condition_mapping_digest":
+        unmask_payload["condition_mapping_digest"],
+    "regression_task_ids": sorted_regression_task_ids,
+    "adjudication":
+        "post_unmask_same_task_lean_high_current_not_high",
 }))
 ```
 
-It is usable only after valid unmask.
+It is usable only after valid unmask and is non-null only when at least one
+same-task pair has lean `confirmed_high=True` and current
+`confirmed_high=False`. Current-only HIGH and both-condition HIGH produce no
+basis.
+
+The rubric binds review guidance, score anchors, HIGH categories and
+adjudication, and active-time rules, but the actual reviewers, scores, times,
+HIGH confirmations, leakage scan, and aggregation remain operator-attested.
+After reveal, the seed-HMAC commitment verifies the declared internal
+content-addressed manifest and source binding; it does not prove actual
+reviewer delivery or reviewer observation of the raw packaged bytes. The
+receipt chain does not authenticate reviewers, prove independent review, or
+replay aggregation. A Phase B live packager must hash the actual packaged
+bytes and compare them with the declared source digests before delivery.
+Residual risks include custodian collusion, multiple seeds or grinding for one
+context, reviewer identity and condition inference, unverified time/leakage
+evidence, and unsigned receipts without an external anchor. The current
+`ExperimentDecision` and decision-calculation digest omit
+`review_evidence_classification`; propagation remains deferred, and any Phase
+B output must carry that classification explicitly.
 
 ## 7. Stop evidence
 

@@ -9,7 +9,9 @@ This report records the latest validation evidence for the public `codex-workflo
 - `workflow-intake` guided-intake behavior for planning, design artifact decisions, validation level selection, and E2E recommendations.
 - `adversarial-review-loop` behavior for read-only review routing, evidence requirements, finding severity, disposition, and residual-risk reporting.
 - Fixed `current|lean` harness materialization preflight behavior, including path-free summaries and zero model calls.
-- Phase A four-task harness experiment preflight behavior, including canonical input, static receipts, deterministic planning, cleanup, and fixed path-free result states.
+- Phase A four-task harness experiment preflight behavior, including canonical
+  input, masked-review precommit v2, static receipts, deterministic planning,
+  cleanup, and fixed path-free result states.
 - Repository release hygiene for README links, changelog coverage, plugin manifest version alignment, and public-content scans.
 
 ## Fresh-Context Forward Tests
@@ -63,7 +65,17 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
 - Forward tests used synthetic prompts and artifacts rather than a real production repository.
 - The clean-install smoke test verifies clone, file visibility, symlink shape, and repository validation. It does not programmatically launch a brand-new Codex UI session and inspect skill-trigger behavior.
 - Browser or Playwright E2E remains task-dependent. `workflow-intake` should recommend it by default for real UI work, but these skills themselves do not include a browser app to exercise.
-- Phase A task qualification remains `operator_attested_static`. The checks do not independently execute the task validators, prove crash-durable evidence, or eliminate the documented same-UID and filesystem-metadata residual risks.
+- Phase A task qualification remains `operator_attested_static`, and masked
+  review remains `operator_attested_aggregated_review`. The checks do not
+  independently execute task validators or prove actual reviewer delivery,
+  observation of the delivered raw bytes, reviewer authentication or
+  independence, aggregation replay, crash-durable/external anchoring, or
+  elimination of custodian collusion, multiple-seed/grinding, same-UID, and
+  filesystem-metadata residual risks. The content-addressed artifact manifest
+  is an operator-attested commitment to declared content and source bindings,
+  not proof that a reviewer received or observed those bytes. A Phase B live
+  packager must hash the actual packaged bytes and compare them with the
+  declared digests before delivery.
 
 ## Release Gate
 
@@ -83,17 +95,42 @@ The following local checks passed on 2026-07-27 with Python 3.9.6:
 ```bash
 python3 -m unittest tests.test_live_eval_experiment tests.test_repository_validation -v
 python3 -m unittest discover -s tests -p 'test_live_eval_*.py' -v
+python3 -m unittest tests.test_live_eval_experiment_plan -v
+python3 -m unittest tests.test_live_eval_experiment_receipts -v
+python3 -m unittest tests.test_repository_validation -v
+./scripts/validate_repo.sh
 ```
 
-- Focused Phase A CLI, orchestration, cleanup, and repository-contract tests: 81 passed.
-- Full live-eval-pattern discovery: 573 passed.
+- Task 10 masked-review v2 focused plan tests: 56 passed.
+- Task 10 masked-review v2 focused receipt/replay tests: 55 passed.
+- A-01 repository validation: 11 passed.
+- The current focused integration of those three suites: 122 passed.
+- Full live-eval-pattern discovery: 599 passed.
+- Full repository validation: 749 tests ran, with 2 environment-dependent
+  shared-agent checks skipped because `SHARED_AGENTS_ROOT` was not configured;
+  the validation gate passed.
+- The v2 tests verified exact seed/context commitment binding, pre-unmask seed
+  secrecy, context-bound HMAC order and neutral IDs, salted mapping
+  commitment, schema-2 packet binding, seed-HMAC hiding commitments over
+  content-addressed review-artifact semantics, rejection of stale context,
+  alternate seed/order/mapping, pre-unmask enumeration, and swapped, stale, or
+  arbitrary self-consistently rehashed artifact commitments, plus same-task
+  post-unmask
+  lean-HIGH/current-not-HIGH adjudication. These are deterministic contract
+  tests, not evidence that a live masked review occurred or that declared
+  bytes were actually delivered to a reviewer.
 - The fixture-backed CLI preflight exited `0` with `status=static_only`, `live_backend_state=live_backend_not_implemented`, `global_agents_marker_state=global_agents_marker_not_run`, `pilot_state=pilot_not_run`, `qualification_evidence_classification=operator_attested_static`, `materialization_result=verified`, `cleanup_state=removed`, and `model_calls=0`.
 - The owned `phase-a` tree was removed and the caller-owned temporary parent remained empty.
 - Captured stdout and stderr contained none of the input, bundle, skill, task-source, or temporary absolute paths and none of the private task sentinel bytes. Invalid live-intent arguments produced one fixed blocked JSON result, exit `2`, and empty stderr before file reading or orchestration.
 - The dependency gate covered all six Phase A modules and rejected representative aliased, dynamic, relative, authentication, network, environment-credential, checkout, harness, and subprocess escapes. This AST policy is a regression gate, not proof against intentionally obfuscated reflection; runtime poison-pill tests remain part of the boundary.
 - The workflow is configured with `actions/setup-python@v7`, `python-version: "3.9"`, and an explicit 3.9 assertion. No remote GitHub Actions result is claimed here.
 - live containment backend, canary, pilot, approval, credential, executable, network, live-ledger, and paid model calls: unavailable or not_run
-- No model-quality, harness-consumption, profile-winner, or production-containment conclusion is inferred from `static_only` evidence.
+- Phase A remains `static_only`; model, API, and network calls were 0. No live
+  experiment, model-quality, harness-consumption, profile-winner, reviewer
+  independence, or production-containment conclusion is inferred.
+- The current final decision projection omits
+  `review_evidence_classification`; Phase B output must carry
+  `operator_attested_aggregated_review` explicitly.
 
 Before public release, run:
 

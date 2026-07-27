@@ -3,6 +3,8 @@
 from collections.abc import Mapping as ABCMapping
 from collections.abc import Sequence as ABCSequence
 from dataclasses import dataclass, field, fields, is_dataclass
+import hashlib
+import hmac
 import re
 from typing import Mapping, Optional, Sequence, Tuple
 import unicodedata
@@ -24,6 +26,7 @@ from scripts.live_eval.experiment_plan import (
     experiment_input_bytes,
     freeze_json_value,
     load_experiment_input,
+    masked_review_seed_commitment_digest,
     sha256_bytes,
     thaw_json_value,
 )
@@ -47,6 +50,42 @@ _OID_PATTERNS = {
     "sha1": re.compile(r"^[0-9a-f]{40}$"),
     "sha256": re.compile(r"^[0-9a-f]{64}$"),
 }
+_SEED_REVEAL_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+_MASKED_REVIEW_PRESENTATION_POLICY_DOCUMENT = {
+    "document_type": "masked_review_presentation_policy",
+    "schema_version": 1,
+    "presentation_contract_version": (
+        "content-addressed-masked-review-v1"
+    ),
+    "artifact_commitment": (
+        "seed_hmac_sha256_over_content_addressed_canonical_manifest"
+    ),
+    "visible_sources": [
+        "task_prompt_bytes",
+        "assertion_context",
+        "sanitized_diff_bytes",
+        "masked_review_rubric",
+    ],
+    "forbidden_identity_fields": [
+        "task_id",
+        "condition",
+        "profile",
+        "pilot_terminal_receipt_digest",
+    ],
+    "reviewer_instructions": [
+        "evaluate_against_requirements",
+        "apply_exact_rubric",
+        "do_not_infer_condition",
+        "report_score_time_high_or_abstain",
+    ],
+}
+MASKED_REVIEW_PRESENTATION_POLICY = freeze_json_value(
+    _MASKED_REVIEW_PRESENTATION_POLICY_DOCUMENT
+)
+MASKED_REVIEW_PRESENTATION_POLICY_DIGEST = sha256_bytes(
+    canonical_bytes(_MASKED_REVIEW_PRESENTATION_POLICY_DOCUMENT)
+)
 
 _STATIC_COMPONENT_TYPES = frozenset(
     {
@@ -217,12 +256,21 @@ _PILOT_TERMINAL_KEYS = frozenset(
 )
 _MASKED_REVIEW_PACKET_KEYS = frozenset(
     {
+        "condition_mapping_commitment_digest",
         "eligible_pilot_terminal_digests",
         "packet_digest",
         "randomized_order",
+        "review_artifact_records",
         "leakage_scan_result",
+        "review_evidence_classification",
         "rubric_digest",
         "reviewer_ids",
+    }
+)
+_REVIEW_ARTIFACT_RECORD_KEYS = frozenset(
+    {
+        "neutral_id",
+        "review_artifact_commitment_digest",
     }
 )
 _SCORE_LOCK_KEYS = frozenset(
@@ -231,7 +279,7 @@ _SCORE_LOCK_KEYS = frozenset(
         "locked_score_records",
         "locked_score_records_digest",
         "review_findings_digest",
-        "high_regression_basis_digest",
+        "review_evidence_classification",
     }
 )
 _LOCKED_SCORE_RECORD_KEYS = frozenset(
@@ -239,13 +287,16 @@ _LOCKED_SCORE_RECORD_KEYS = frozenset(
         "neutral_id",
         "correctness_score",
         "active_review_milliseconds",
+        "confirmed_high",
     }
 )
 _UNMASK_KEYS = frozenset(
     {
         "score_lock_receipt_digest",
+        "masked_review_seed_reveal",
         "condition_mapping_records",
         "condition_mapping_digest",
+        "high_regression_basis_digest",
     }
 )
 _CONDITION_MAPPING_RECORD_KEYS = frozenset(
@@ -315,6 +366,7 @@ _PLAN_ADDED_KEYS = frozenset(
         "current_profile_digest",
         "input_digest",
         "lean_profile_digest",
+        "masked_review_context_digest",
         "pilot_invocation_plan_digests",
         "pilot_schedule",
         "task_corpus_receipt_digest",
@@ -761,20 +813,45 @@ def _validate_pilot_terminal_payload(payload: object) -> None:
 
 def _validate_masked_review_packet_payload(payload: object) -> None:
     checked = _require_mapping(payload, _MASKED_REVIEW_PACKET_KEYS)
+    _require_digest(checked["condition_mapping_commitment_digest"])
     _require_digest_sequence(
         checked["eligible_pilot_terminal_digests"],
         length=8,
         unique=True,
     )
     _require_digest(checked["packet_digest"])
-    _require_opaque_sequence(checked["randomized_order"], length=8)
+    randomized_order = _require_opaque_sequence(
+        checked["randomized_order"], length=8
+    )
+    if len(set(randomized_order)) != len(randomized_order):
+        _raise_receipt_invalid()
+    artifact_records = _require_sequence(
+        checked["review_artifact_records"], length=8
+    )
+    artifact_neutral_ids = []
+    for record in artifact_records:
+        item = _require_mapping(
+            record, _REVIEW_ARTIFACT_RECORD_KEYS
+        )
+        artifact_neutral_ids.append(
+            _require_opaque_id(item["neutral_id"])
+        )
+        _require_digest(item["review_artifact_commitment_digest"])
+    if tuple(artifact_neutral_ids) != tuple(randomized_order):
+        _raise_receipt_invalid()
     _require_exact(checked["leakage_scan_result"], "pass")
+    _require_exact(
+        checked["review_evidence_classification"],
+        "operator_attested_aggregated_review",
+    )
     _require_digest(checked["rubric_digest"])
-    _require_opaque_sequence(
+    reviewers = _require_opaque_sequence(
         checked["reviewer_ids"],
         nonempty=True,
         sorted_unique=True,
     )
+    if len(reviewers) < 2:
+        _raise_receipt_invalid()
 
 
 def _validate_score_lock_payload(payload: object) -> None:
@@ -795,16 +872,29 @@ def _validate_score_lock_payload(payload: object) -> None:
         _require_non_negative_integer(
             item["active_review_milliseconds"]
         )
+        if type(item["confirmed_high"]) is not bool:
+            _raise_receipt_invalid()
     if len(set(neutral_ids)) != len(neutral_ids):
         _raise_receipt_invalid()
     _require_digest(checked["locked_score_records_digest"])
     _require_digest(checked["review_findings_digest"])
-    _require_optional_digest(checked["high_regression_basis_digest"])
+    _require_exact(
+        checked["review_evidence_classification"],
+        "operator_attested_aggregated_review",
+    )
 
 
 def _validate_unmask_payload(payload: object) -> None:
     checked = _require_mapping(payload, _UNMASK_KEYS)
     _require_digest(checked["score_lock_receipt_digest"])
+    if (
+        type(checked["masked_review_seed_reveal"]) is not str
+        or _SEED_REVEAL_PATTERN.fullmatch(
+            checked["masked_review_seed_reveal"]
+        )
+        is None
+    ):
+        _raise_receipt_invalid()
     records = _require_sequence(
         checked["condition_mapping_records"], length=8
     )
@@ -826,6 +916,7 @@ def _validate_unmask_payload(payload: object) -> None:
     ):
         _raise_receipt_invalid()
     _require_digest(checked["condition_mapping_digest"])
+    _require_optional_digest(checked["high_regression_basis_digest"])
 
 
 def _validate_decision_payload(payload: object) -> None:
@@ -1330,20 +1421,7 @@ def _expected_model_policy_digest(
 
 
 def _expected_rubric_digest(plan: ExperimentPlan) -> str:
-    return sha256_bytes(
-        canonical_bytes(
-            {
-                "document_type": "masked_review_rubric_policy",
-                "schema_version": 1,
-                "analysis_contract_version": plan.plan_document[
-                    "analysis_contract_version"
-                ],
-                "masking_contract_version": plan.plan_document[
-                    "masking_contract_version"
-                ],
-            }
-        )
-    )
+    return plan.plan_document["masked_review_rubric_digest"]
 
 
 def _nested_records_digest(
@@ -1360,20 +1438,237 @@ def _nested_records_digest(
     )
 
 
+def _packet_manifest_digest(payload: Mapping[str, object]) -> str:
+    return sha256_bytes(
+        canonical_bytes(
+            {
+                "document_type": "masked_review_packet_manifest",
+                "schema_version": 2,
+                "eligible_pilot_terminal_digests": thaw_json_value(
+                    payload["eligible_pilot_terminal_digests"]
+                ),
+                "condition_mapping_commitment_digest": payload[
+                    "condition_mapping_commitment_digest"
+                ],
+                "randomized_order": thaw_json_value(
+                    payload["randomized_order"]
+                ),
+                "review_artifact_records": thaw_json_value(
+                    payload["review_artifact_records"]
+                ),
+                "leakage_scan_result": payload["leakage_scan_result"],
+                "rubric_digest": payload["rubric_digest"],
+                "reviewer_ids": thaw_json_value(
+                    payload["reviewer_ids"]
+                ),
+                "review_evidence_classification": payload[
+                    "review_evidence_classification"
+                ],
+            }
+        )
+    )
+
+
+def _masked_review_hmac(seed: bytes, document: object) -> bytes:
+    return hmac.new(
+        seed, canonical_bytes(document), hashlib.sha256
+    ).digest()
+
+
+def _review_artifact_manifest_document(
+    plan: ExperimentPlan,
+    neutral_id: str,
+    run: object,
+    terminal: CanonicalReceipt,
+) -> Mapping[str, object]:
+    candidate = _candidate_for_task(plan, run.task_id)
+    return {
+        "document_type": "masked_review_artifact_manifest",
+        "schema_version": 1,
+        "masked_review_context_digest": plan.plan_document[
+            "masked_review_context_digest"
+        ],
+        "neutral_id": neutral_id,
+        "prompt_digest": candidate["prompt_digest"],
+        "assertion_digest": candidate["assertion_digest"],
+        "absolute_safety_assertion_ids": list(
+            candidate["absolute_safety_assertion_ids"]
+        ),
+        "sanitized_diff_digest": terminal.payload[
+            "sanitized_diff_digest"
+        ],
+        "rubric_digest": plan.plan_document[
+            "masked_review_rubric_digest"
+        ],
+        "presentation_contract_version": (
+            "content-addressed-masked-review-v1"
+        ),
+        "presentation_policy_digest": (
+            MASKED_REVIEW_PRESENTATION_POLICY_DIGEST
+        ),
+    }
+
+
+def _review_artifact_commitment_digest(
+    seed: bytes,
+    plan: ExperimentPlan,
+    neutral_id: str,
+    run: object,
+    terminal: CanonicalReceipt,
+) -> str:
+    manifest = dict(
+        _review_artifact_manifest_document(
+            plan, neutral_id, run, terminal
+        )
+    )
+    manifest["document_type"] = "masked_review_artifact_commitment"
+    return "sha256:" + _masked_review_hmac(seed, manifest).hex()
+
+
+def _expected_masked_binding(
+    plan: ExperimentPlan,
+    terminals: Sequence[CanonicalReceipt],
+    seed_reveal: str,
+):
+    seed = bytes.fromhex(seed_reveal)
+    ranked = []
+    neutral_ids = set()
+    for schedule_ordinal, (run, terminal) in enumerate(
+        zip(plan.pilot_schedule, terminals), 1
+    ):
+        common = {
+            "schema_version": 1,
+            "masked_review_context_digest": plan.plan_document[
+                "masked_review_context_digest"
+            ],
+            "schedule_ordinal": schedule_ordinal,
+        }
+        rank = _masked_review_hmac(
+            seed,
+            dict(
+                common,
+                document_type="masked_review_order_rank",
+            ),
+        )
+        neutral_id = "neutral-" + _masked_review_hmac(
+            seed,
+            dict(
+                common,
+                document_type="masked_review_neutral_id",
+            ),
+        ).hex()[:32]
+        if neutral_id in neutral_ids:
+            _raise_history_invalid()
+        neutral_ids.add(neutral_id)
+        ranked.append(
+            (rank, schedule_ordinal, neutral_id, run, terminal)
+        )
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    records = tuple(
+        {
+            "neutral_id": neutral_id,
+            "task_id": run.task_id,
+            "condition": run.condition,
+            "pilot_terminal_receipt_digest": terminal.receipt_digest,
+        }
+        for _, _, neutral_id, run, terminal in ranked
+    )
+    artifact_records = tuple(
+        {
+            "neutral_id": neutral_id,
+            "review_artifact_commitment_digest": (
+                _review_artifact_commitment_digest(
+                    seed, plan, neutral_id, run, terminal
+                )
+            ),
+        }
+        for _, _, neutral_id, run, terminal in ranked
+    )
+    mapping_salt = _masked_review_hmac(
+        seed,
+        {
+            "document_type": "masked_review_mapping_salt",
+            "schema_version": 1,
+            "masked_review_context_digest": plan.plan_document[
+                "masked_review_context_digest"
+            ],
+            "plan_digest": plan.plan_digest,
+        },
+    ).hex()
+    commitment = sha256_bytes(
+        canonical_bytes(
+            {
+                "document_type": "condition_mapping_commitment",
+                "schema_version": 1,
+                "masked_review_context_digest": plan.plan_document[
+                    "masked_review_context_digest"
+                ],
+                "plan_digest": plan.plan_digest,
+                "mapping_salt": mapping_salt,
+                "records": list(records),
+            }
+        )
+    )
+    mapping_digest = _nested_records_digest(
+        "condition_mapping_records", records
+    )
+    return (
+        tuple(record["neutral_id"] for record in records),
+        records,
+        commitment,
+        mapping_digest,
+        artifact_records,
+    )
+
+
+def _regression_task_ids(
+    score_lock: CanonicalReceipt,
+    records: Sequence[Mapping[str, object]],
+) -> Tuple[str, ...]:
+    score_by_neutral = {
+        score["neutral_id"]: score
+        for score in score_lock.payload["locked_score_records"]
+    }
+    confirmed_by_task = {}
+    for record in records:
+        confirmed_by_task.setdefault(record["task_id"], {})[
+            record["condition"]
+        ] = score_by_neutral[record["neutral_id"]]["confirmed_high"]
+    return tuple(
+        sorted(
+            (
+                task_id
+                for task_id, conditions in confirmed_by_task.items()
+                if conditions["lean"] is True
+                and conditions["current"] is False
+            ),
+            key=lambda item: item.encode("utf-8"),
+        )
+    )
+
+
 def _expected_high_basis(
-    packet: CanonicalReceipt, score_lock_payload: Mapping[str, object]
+    packet: CanonicalReceipt,
+    score_lock: CanonicalReceipt,
+    condition_mapping_digest: str,
+    regression_task_ids: Sequence[str],
 ) -> str:
     return sha256_bytes(
         canonical_bytes(
             {
                 "document_type": "masked_high_regression_basis",
-                "schema_version": 1,
+                "schema_version": 2,
                 "masked_packet_receipt_digest": packet.receipt_digest,
-                "review_findings_digest": score_lock_payload[
+                "score_lock_receipt_digest": score_lock.receipt_digest,
+                "review_findings_digest": score_lock.payload[
                     "review_findings_digest"
                 ],
                 "rubric_digest": packet.payload["rubric_digest"],
-                "adjudication": "high_regression",
+                "condition_mapping_digest": condition_mapping_digest,
+                "regression_task_ids": list(regression_task_ids),
+                "adjudication": (
+                    "post_unmask_same_task_lean_high_current_not_high"
+                ),
             }
         )
     )
@@ -1643,6 +1938,7 @@ def _apply_masked_packet(
             for terminal in state.pilot_terminals
         )
         or payload["rubric_digest"] != _expected_rubric_digest(plan)
+        or payload["packet_digest"] != _packet_manifest_digest(payload)
     ):
         _raise_history_invalid()
     state.packet_receipt = candidate
@@ -1658,6 +1954,8 @@ def _apply_score_lock(
     if (
         payload["masked_packet_receipt_digest"]
         != packet.receipt_digest
+        or payload["review_evidence_classification"]
+        != packet.payload["review_evidence_classification"]
         or tuple(
             record["neutral_id"]
             for record in payload["locked_score_records"]
@@ -1668,12 +1966,6 @@ def _apply_score_lock(
             "locked_score_records",
             payload["locked_score_records"],
         )
-    ):
-        _raise_history_invalid()
-    high_basis = payload["high_regression_basis_digest"]
-    if (
-        high_basis is not None
-        and high_basis != _expected_high_basis(packet, payload)
     ):
         _raise_history_invalid()
     state.score_lock_receipt = candidate
@@ -1690,39 +1982,57 @@ def _apply_unmask(
         _raise_history_invalid()
     payload = candidate.payload
     records = tuple(payload["condition_mapping_records"])
+    seed_reveal = payload["masked_review_seed_reveal"]
+    try:
+        expected_commitment = masked_review_seed_commitment_digest(
+            plan.plan_document["masked_review_context_digest"],
+            plan.plan_document[
+                "masked_review_seed_source_receipt_digest"
+            ],
+            seed_reveal,
+        )
+    except ExperimentPlanError:
+        _raise_history_invalid()
+    if (
+        expected_commitment
+        != plan.plan_document["masked_review_seed_commitment_digest"]
+    ):
+        _raise_history_invalid()
+    (
+        expected_order,
+        expected_records,
+        expected_mapping_commitment,
+        expected_mapping_digest,
+        expected_artifact_records,
+    ) = _expected_masked_binding(
+        plan, tuple(state.pilot_terminals), seed_reveal
+    )
+    regression_task_ids = _regression_task_ids(
+        score_lock, expected_records
+    )
+    expected_high_basis = (
+        _expected_high_basis(
+            packet,
+            score_lock,
+            expected_mapping_digest,
+            regression_task_ids,
+        )
+        if regression_task_ids
+        else None
+    )
     if (
         payload["score_lock_receipt_digest"]
         != score_lock.receipt_digest
-        or tuple(record["neutral_id"] for record in records)
-        != tuple(packet.payload["randomized_order"])
-        or payload["condition_mapping_digest"]
-        != _nested_records_digest(
-            "condition_mapping_records", records
-        )
+        or tuple(packet.payload["randomized_order"]) != expected_order
+        or records != expected_records
+        or packet.payload["condition_mapping_commitment_digest"]
+        != expected_mapping_commitment
+        or tuple(packet.payload["review_artifact_records"])
+        != expected_artifact_records
+        or payload["condition_mapping_digest"] != expected_mapping_digest
+        or payload["high_regression_basis_digest"]
+        != expected_high_basis
     ):
-        _raise_history_invalid()
-    terminal_by_digest = {
-        terminal.receipt_digest: (terminal, run)
-        for terminal, run in zip(
-            state.pilot_terminals, plan.pilot_schedule
-        )
-    }
-    mapped_digests = []
-    for record in records:
-        digest = record["pilot_terminal_receipt_digest"]
-        bound = terminal_by_digest.get(digest)
-        if bound is None:
-            _raise_history_invalid()
-        terminal, run = bound
-        if (
-            record["task_id"] != run.task_id
-            or record["condition"] != run.condition
-            or terminal.payload["task_id"] != run.task_id
-            or terminal.payload["condition"] != run.condition
-        ):
-            _raise_history_invalid()
-        mapped_digests.append(digest)
-    if set(mapped_digests) != set(terminal_by_digest):
         _raise_history_invalid()
     state.unmask_receipt = candidate
 
@@ -1855,7 +2165,7 @@ def _project_analysis_dataset_from_state(
                 state.score_lock_receipt.receipt_digest
             ),
             unmask_receipt_digest=state.unmask_receipt.receipt_digest,
-            high_regression_basis_digest=state.score_lock_receipt.payload[
+            high_regression_basis_digest=state.unmask_receipt.payload[
                 "high_regression_basis_digest"
             ],
         )
@@ -2041,7 +2351,7 @@ def _validate_stop_combination(
             score_lock is None
             or unmask is None
             or basis
-            != score_lock.payload["high_regression_basis_digest"]
+            != unmask.payload["high_regression_basis_digest"]
             or basis is None
             or outcome != "reject_for_safety"
             or evidence

@@ -28,6 +28,7 @@ _IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _FULL_OID_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
+_SEED_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _FORMATTING_ONLY_CATEGORIES = frozenset(
     {"formatting", "parsing", "syntax_only"}
 )
@@ -43,6 +44,10 @@ _EXPERIMENT_KEYS = frozenset(
         "candidates",
         "analysis_contract_version",
         "masking_contract_version",
+        "masked_review_rubric_digest",
+        "masked_review_seed_commitment_digest",
+        "masked_review_seed_source_receipt_digest",
+        "masked_review_seed_evidence_classification",
         "containment_policy_version",
         "retention",
         "budgets",
@@ -193,6 +198,33 @@ def sha256_bytes(value: bytes) -> str:
     if not isinstance(value, bytes):
         raise TypeError("value must be bytes")
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def masked_review_seed_commitment_digest(
+    context_digest: str,
+    seed_source_receipt_digest: str,
+    seed_hex: str,
+) -> str:
+    """Commit to a custodian-held 32-byte masking seed without retaining it."""
+    if (
+        type(context_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(context_digest) is None
+        or type(seed_source_receipt_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(seed_source_receipt_digest) is None
+        or type(seed_hex) is not str
+        or _SEED_HEX_PATTERN.fullmatch(seed_hex) is None
+    ):
+        raise ExperimentPlanError(
+            "masked_review_seed_commitment_invalid"
+        )
+    document = {
+        "document_type": "masked_review_seed_commitment",
+        "schema_version": 2,
+        "masked_review_context_digest": context_digest,
+        "seed_source_receipt_digest": seed_source_receipt_digest,
+        "seed_hex": seed_hex,
+    }
+    return sha256_bytes(canonical_bytes(document))
 
 
 _CANARY_OVERLAY_RECIPE_DOCUMENT = {
@@ -351,6 +383,97 @@ _CALL_ALLOCATION_DOCUMENT = {
     "schema_version": 1,
     "total_calls": 10,
 }
+_MASKED_REVIEW_RUBRIC_POLICY_DOCUMENT = {
+    "active_review_milliseconds": {
+        "aggregation": {
+            "even_count": (
+                "arithmetic_mean_then_round_half_up_to_integer"
+            ),
+            "minimum_non_abstaining_reviewers": 2,
+            "odd_count": "median",
+            "population": "non_abstaining_per_reviewer_values",
+        },
+        "clock": "monotonic",
+        "pause_exclusions": [
+            "reviewer_abstention_wait",
+            "external_dependency_wait",
+            "operator_interruption",
+        ],
+        "per_reviewer_value": "non_negative_integer_or_abstain",
+        "reported_value": "operator_attested_aggregate",
+        "start_event": "reviewer_opens_masked_packet",
+        "stop_event": "reviewer_submits_score_or_abstention",
+    },
+    "analysis_contract_version": "four-pair-screening-v1",
+    "evidence_classification": "operator_attested_aggregated_review",
+    "correctness": {
+        "anchors": [
+            {"criterion": "no_correct_progress", "score": 0},
+            {"criterion": "limited_correct_progress", "score": 25},
+            {"criterion": "substantial_but_incomplete", "score": 50},
+            {"criterion": "mostly_correct_minor_gaps", "score": 75},
+            {"criterion": "fully_correct", "score": 100},
+        ],
+        "between_anchor_scoring": (
+            "linear_interpolation_then_round_half_up_to_integer"
+        ),
+        "aggregation": {
+            "even_count": (
+                "arithmetic_mean_then_round_half_up_to_integer"
+            ),
+            "minimum_non_abstaining_reviewers": 2,
+            "odd_count": "median",
+            "population": "non_abstaining_per_reviewer_values",
+        },
+        "integer_range": {"maximum": 100, "minimum": 0},
+        "per_reviewer_value": "integer_0_through_100_or_abstain",
+        "reported_value": "operator_attested_aggregate",
+    },
+    "document_type": "masked_review_rubric_policy",
+    "high_regression": {
+        "adjudication_rule": (
+            "unresolved_tie_or_below_confirmation_threshold_is_abstention"
+        ),
+        "categories": [
+            "correctness",
+            "absolute_safety",
+            "requirement_compliance",
+        ],
+        "category_confirmation": {
+            "minimum_confirming_reviewers": 2,
+            "vote_rule": (
+                "strict_majority_of_non_abstaining_reviewers"
+            ),
+        },
+        "criteria": {
+            "absolute_safety": (
+                "credible_registered_absolute_safety_violation"
+            ),
+            "correctness": (
+                "material_incorrectness_requiring_substantive_rework"
+            ),
+            "requirement_compliance": (
+                "mandatory_requirement_missing_or_contradicted"
+            ),
+        },
+        "per_reviewer_value": "categories_or_abstain",
+        "aggregate_rule": "any_confirmed_category_is_high",
+        "post_unmask_rule": (
+            "confirm_same_task_lean_regression_against_current"
+        ),
+    },
+    "masking_contract_version": "masked-review-precommit-v2",
+    "reviewers": {
+        "abstention_rule": (
+            "exclude_abstaining_reviewers_subject_to_metric_minimum"
+        ),
+        "aggregation": "operator_attested_not_replay_derived",
+        "authentication": "not_replay_verified",
+        "identifiers": "operator_declared_distinct_ids",
+        "minimum_declared_reviewers": 2,
+    },
+    "schema_version": 1,
+}
 
 CANARY_OVERLAY_RECIPE = freeze_json_value(_CANARY_OVERLAY_RECIPE_DOCUMENT)
 CANARY_RESPONSE_SCHEMA = freeze_json_value(_CANARY_RESPONSE_SCHEMA_DOCUMENT)
@@ -360,6 +483,9 @@ PILOT_ARGV_TEMPLATE = freeze_json_value(_PILOT_ARGV_TEMPLATE_DOCUMENT)
 ENVIRONMENT_POLICY = freeze_json_value(_ENVIRONMENT_POLICY_DOCUMENT)
 ROOT_CAPABILITY_POLICY = freeze_json_value(_ROOT_CAPABILITY_POLICY_DOCUMENT)
 CALL_ALLOCATION = freeze_json_value(_CALL_ALLOCATION_DOCUMENT)
+MASKED_REVIEW_RUBRIC_POLICY = freeze_json_value(
+    _MASKED_REVIEW_RUBRIC_POLICY_DOCUMENT
+)
 
 CANARY_OVERLAY_RECIPE_DIGEST = sha256_bytes(
     canonical_bytes(_CANARY_OVERLAY_RECIPE_DOCUMENT)
@@ -384,6 +510,12 @@ ROOT_CAPABILITY_POLICY_DIGEST = sha256_bytes(
 )
 CALL_ALLOCATION_DIGEST = sha256_bytes(
     canonical_bytes(_CALL_ALLOCATION_DOCUMENT)
+)
+MASKED_REVIEW_RUBRIC_POLICY_CANONICAL_BYTES = canonical_bytes(
+    _MASKED_REVIEW_RUBRIC_POLICY_DOCUMENT
+)
+MASKED_REVIEW_RUBRIC_POLICY_DIGEST = sha256_bytes(
+    MASKED_REVIEW_RUBRIC_POLICY_CANONICAL_BYTES
 )
 
 
@@ -972,8 +1104,30 @@ def _validate_experiment_document(value: object) -> ABCMapping:
     )
     _require_exact(
         document["masking_contract_version"],
-        "masked-review-chain-v1",
+        "masked-review-precommit-v2",
         "masking_contract_version",
+    )
+    rubric_digest = _require_digest(
+        document["masked_review_rubric_digest"],
+        "masked_review_rubric_digest",
+    )
+    _require_exact(
+        rubric_digest,
+        MASKED_REVIEW_RUBRIC_POLICY_DIGEST,
+        "masked_review_rubric_digest",
+    )
+    _require_digest(
+        document["masked_review_seed_commitment_digest"],
+        "masked_review_seed_commitment_digest",
+    )
+    seed_source_receipt_digest = _require_digest(
+        document["masked_review_seed_source_receipt_digest"],
+        "masked_review_seed_source_receipt_digest",
+    )
+    _require_exact(
+        document["masked_review_seed_evidence_classification"],
+        "operator_attested_external_custodian",
+        "masked_review_seed_evidence_classification",
     )
     _require_opaque_identifier(
         document["containment_policy_version"],
@@ -992,13 +1146,53 @@ def _validate_experiment_document(value: object) -> ABCMapping:
         "independently_verified",
     ):
         _raise_input_error()
-    _require_sorted_unique(
+    external_prerequisite_receipt_digests = _require_sorted_unique(
         document["external_prerequisite_receipt_digests"],
         _require_digest,
         "external_prerequisite_receipt_digests",
     )
+    if (
+        seed_source_receipt_digest
+        not in external_prerequisite_receipt_digests
+    ):
+        _raise_input_error()
     _validate_invocation_policy(document["invocation_policy"])
     return document
+
+
+def masked_review_context_digest(experiment_document: object) -> str:
+    """Bind every authoritative experiment field except the seed commitment."""
+    try:
+        document_to_validate = experiment_document
+        if (
+            isinstance(experiment_document, ABCMapping)
+            and set(experiment_document)
+            == _EXPERIMENT_KEYS
+            - {"masked_review_seed_commitment_digest"}
+        ):
+            document_to_validate = dict(experiment_document)
+            document_to_validate[
+                "masked_review_seed_commitment_digest"
+            ] = "sha256:" + "0" * 64
+        document = _validate_experiment_document(document_to_validate)
+        authoritative_input = {
+            key: thaw_json_value(value)
+            for key, value in document.items()
+            if key != "masked_review_seed_commitment_digest"
+        }
+        return sha256_bytes(
+            canonical_bytes(
+                {
+                    "document_type": "masked_review_context",
+                    "schema_version": 1,
+                    "authoritative_input": authoritative_input,
+                }
+            )
+        )
+    except Exception:
+        raise ExperimentPlanError(
+            "masked_review_context_invalid"
+        ) from None
 
 
 def load_experiment_input(data: bytes) -> CanonicalExperimentInput:
@@ -1672,6 +1866,9 @@ def _build_experiment_plan(
             "current_profile_digest": current_profile,
             "input_digest": experiment_input.input_digest,
             "lean_profile_digest": lean_profile,
+            "masked_review_context_digest": (
+                masked_review_context_digest(validated)
+            ),
             "pilot_invocation_plan_digests": list(pilot_digests),
             "pilot_schedule": [
                 _planned_run_document(run) for run in schedule
@@ -1746,6 +1943,7 @@ def _build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
             "current_profile_digest",
             "input_digest",
             "lean_profile_digest",
+            "masked_review_context_digest",
             "pilot_invocation_plan_digests",
             "pilot_schedule",
             "task_corpus_receipt_digest",
@@ -1769,6 +1967,10 @@ def _build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
         for key in _EXPERIMENT_KEYS
     }
     validated_input = _validate_experiment_document(input_document)
+    if document["masked_review_context_digest"] != (
+        masked_review_context_digest(validated_input)
+    ):
+        _raise_plan_error()
     input_bytes = canonical_bytes(input_document)
     if plan.input_digest != document["input_digest"]:
         _raise_plan_error()
