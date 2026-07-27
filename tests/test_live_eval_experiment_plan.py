@@ -1,5 +1,5 @@
 import copy
-from dataclasses import FrozenInstanceError, asdict, fields, replace
+from dataclasses import FrozenInstanceError, asdict, dataclass, fields, replace
 from fractions import Fraction
 import hashlib
 import inspect
@@ -47,6 +47,11 @@ ANALYSIS_BOUNDARIES = FIXTURE / "analysis-boundaries.json"
 
 class _StringSubclass(str):
     pass
+
+
+@dataclass(frozen=True)
+class _CanonicalExperimentInputSubclass(CanonicalExperimentInput):
+    extra: int = 0
 
 
 EXPECTED_CANARY_OVERLAY_RECIPE = {
@@ -204,6 +209,385 @@ EXPECTED_CALL_ALLOCATION = {
     "retry_calls": 0,
     "schema_version": 1,
     "total_calls": 10,
+}
+
+EXPECTED_STATIC_EVIDENCE_DOCUMENTS = {
+    "candidate_set": {
+        "candidates": [
+            {
+                "allowed_write_paths": [
+                    "scripts/alpha.py",
+                    "tests/test_alpha.py",
+                ],
+                "commit_oid": "1111111111111111111111111111111111111111",
+                "task_id": "low-alpha",
+            },
+            {
+                "allowed_write_paths": [
+                    "scripts/beta.py",
+                    "tests/test_beta.py",
+                ],
+                "commit_oid": "2222222222222222222222222222222222222222",
+                "task_id": "low-beta",
+            },
+            {
+                "allowed_write_paths": [
+                    "scripts/gamma.py",
+                    "tests/test_gamma.py",
+                ],
+                "commit_oid": "3333333333333333333333333333333333333333",
+                "task_id": "medium-alpha",
+            },
+            {
+                "allowed_write_paths": [
+                    "scripts/delta.py",
+                    "tests/test_delta.py",
+                ],
+                "commit_oid": "4444444444444444444444444444444444444444",
+                "task_id": "medium-beta",
+            },
+        ],
+        "document_type": "harness-experiment-candidate-set-v1",
+        "schema_version": 1,
+    },
+    "selection_seed": {
+        "document_type": "harness-experiment-selection-seed-v1",
+        "schema_version": 1,
+        "selection_seed": "phase-a-seed-0001",
+    },
+    "pilot_schedule": {
+        "document_type": "harness-experiment-pilot-schedule-v1",
+        "pilot_schedule": [
+            {
+                "condition": "lean",
+                "difficulty": "low",
+                "ordinal": 1,
+                "task_id": "low-beta",
+            },
+            {
+                "condition": "current",
+                "difficulty": "low",
+                "ordinal": 2,
+                "task_id": "low-beta",
+            },
+            {
+                "condition": "current",
+                "difficulty": "medium",
+                "ordinal": 3,
+                "task_id": "medium-alpha",
+            },
+            {
+                "condition": "lean",
+                "difficulty": "medium",
+                "ordinal": 4,
+                "task_id": "medium-alpha",
+            },
+            {
+                "condition": "current",
+                "difficulty": "low",
+                "ordinal": 5,
+                "task_id": "low-alpha",
+            },
+            {
+                "condition": "lean",
+                "difficulty": "low",
+                "ordinal": 6,
+                "task_id": "low-alpha",
+            },
+            {
+                "condition": "lean",
+                "difficulty": "medium",
+                "ordinal": 7,
+                "task_id": "medium-beta",
+            },
+            {
+                "condition": "current",
+                "difficulty": "medium",
+                "ordinal": 8,
+                "task_id": "medium-beta",
+            },
+        ],
+        "schema_version": 1,
+    },
+    "reference_result": {
+        "document_type": "harness-experiment-reference-results-v1",
+        "reference_results": [
+            {"reference_result": "pass", "task_id": "low-alpha"},
+            {"reference_result": "pass", "task_id": "low-beta"},
+            {"reference_result": "pass", "task_id": "medium-alpha"},
+            {"reference_result": "pass", "task_id": "medium-beta"},
+        ],
+        "schema_version": 1,
+    },
+    "mutation_sensitivity": {
+        "candidate_mutation_evidence": [
+            {
+                "assertion_digest": (
+                    "sha256:"
+                    "3333333333333333333333333333333333333333333333333333333333333333"
+                ),
+                "behavior_mutants": [
+                    {
+                        "category": "incorrect_result",
+                        "mutant_digest": (
+                            "sha256:"
+                            "7777777777777777777777777777777777777777777777777777777777777777"
+                        ),
+                        "result": "fail",
+                    }
+                ],
+                "negative_controls": [
+                    {"control_id": "wrong-answer", "result": "fail"}
+                ],
+                "task_id": "low-alpha",
+                "validator_digest": (
+                    "sha256:"
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                ),
+            },
+            {
+                "assertion_digest": (
+                    "sha256:"
+                    "4444444444444444444444444444444444444444444444444444444444444444"
+                ),
+                "behavior_mutants": [
+                    {
+                        "category": "incorrect_result",
+                        "mutant_digest": (
+                            "sha256:"
+                            "8888888888888888888888888888888888888888888888888888888888888888"
+                        ),
+                        "result": "fail",
+                    }
+                ],
+                "negative_controls": [
+                    {"control_id": "wrong-answer", "result": "fail"}
+                ],
+                "task_id": "low-beta",
+                "validator_digest": (
+                    "sha256:"
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                ),
+            },
+            {
+                "assertion_digest": (
+                    "sha256:"
+                    "5555555555555555555555555555555555555555555555555555555555555555"
+                ),
+                "behavior_mutants": [
+                    {
+                        "category": "incorrect_result",
+                        "mutant_digest": (
+                            "sha256:"
+                            "9999999999999999999999999999999999999999999999999999999999999999"
+                        ),
+                        "result": "fail",
+                    }
+                ],
+                "negative_controls": [
+                    {"control_id": "wrong-answer", "result": "fail"}
+                ],
+                "task_id": "medium-alpha",
+                "validator_digest": (
+                    "sha256:"
+                    "1111111111111111111111111111111111111111111111111111111111111111"
+                ),
+            },
+            {
+                "assertion_digest": (
+                    "sha256:"
+                    "6666666666666666666666666666666666666666666666666666666666666666"
+                ),
+                "behavior_mutants": [
+                    {
+                        "category": "incorrect_result",
+                        "mutant_digest": (
+                            "sha256:"
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        ),
+                        "result": "fail",
+                    }
+                ],
+                "negative_controls": [
+                    {"control_id": "wrong-answer", "result": "fail"}
+                ],
+                "task_id": "medium-beta",
+                "validator_digest": (
+                    "sha256:"
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                ),
+            },
+        ],
+        "document_type": "harness-experiment-mutation-sensitivity-v1",
+        "schema_version": 1,
+    },
+    "difficulty_assignment": {
+        "difficulty_assignments": [
+            {
+                "difficulty": "low",
+                "difficulty_rubric_digest": (
+                    "sha256:"
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+                "task_id": "low-alpha",
+            },
+            {
+                "difficulty": "low",
+                "difficulty_rubric_digest": (
+                    "sha256:"
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                ),
+                "task_id": "low-beta",
+            },
+            {
+                "difficulty": "medium",
+                "difficulty_rubric_digest": (
+                    "sha256:"
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                ),
+                "task_id": "medium-alpha",
+            },
+            {
+                "difficulty": "medium",
+                "difficulty_rubric_digest": (
+                    "sha256:"
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                ),
+                "task_id": "medium-beta",
+            },
+        ],
+        "document_type": (
+            "harness-experiment-difficulty-assignments-v1"
+        ),
+        "schema_version": 1,
+    },
+    "qualification": {
+        "candidate_qualification_records": [
+            {
+                "absolute_safety_assertion_ids": [
+                    "no-network",
+                    "no-secrets",
+                ],
+                "exclusion_rule_ids": [],
+                "inclusion_rule_ids": ["offline-qualified-v1"],
+                "local_clone_policy": (
+                    "remote_or_no_local_or_no_hardlinks"
+                ),
+                "offline_executable": True,
+                "operator_attested": True,
+                "provenance_id": "operator-corpus-a",
+                "source_provisioning_class": (
+                    "operator_owned_trusted_git_local_clone"
+                ),
+                "task_id": "low-alpha",
+            },
+            {
+                "absolute_safety_assertion_ids": [
+                    "no-network",
+                    "no-secrets",
+                ],
+                "exclusion_rule_ids": [],
+                "inclusion_rule_ids": ["offline-qualified-v1"],
+                "local_clone_policy": (
+                    "remote_or_no_local_or_no_hardlinks"
+                ),
+                "offline_executable": True,
+                "operator_attested": True,
+                "provenance_id": "operator-corpus-b",
+                "source_provisioning_class": (
+                    "operator_owned_trusted_git_local_clone"
+                ),
+                "task_id": "low-beta",
+            },
+            {
+                "absolute_safety_assertion_ids": [
+                    "no-network",
+                    "no-secrets",
+                ],
+                "exclusion_rule_ids": [],
+                "inclusion_rule_ids": ["offline-qualified-v1"],
+                "local_clone_policy": (
+                    "remote_or_no_local_or_no_hardlinks"
+                ),
+                "offline_executable": True,
+                "operator_attested": True,
+                "provenance_id": "operator-corpus-c",
+                "source_provisioning_class": (
+                    "operator_owned_trusted_git_local_clone"
+                ),
+                "task_id": "medium-alpha",
+            },
+            {
+                "absolute_safety_assertion_ids": [
+                    "no-network",
+                    "no-secrets",
+                ],
+                "exclusion_rule_ids": [],
+                "inclusion_rule_ids": ["offline-qualified-v1"],
+                "local_clone_policy": (
+                    "remote_or_no_local_or_no_hardlinks"
+                ),
+                "offline_executable": True,
+                "operator_attested": True,
+                "provenance_id": "operator-corpus-d",
+                "source_provisioning_class": (
+                    "operator_owned_trusted_git_local_clone"
+                ),
+                "task_id": "medium-beta",
+            },
+        ],
+        "candidate_set_digest": (
+            "sha256:"
+            "fdadc2e44800226d0999c48b45953e27b684d5f8b0744516935db8278280cdf8"
+        ),
+        "difficulty_assignment_digest": (
+            "sha256:"
+            "53648044c46a46c31259290ea150bcc6c77f54291e1dbc639d5686e4c43704f6"
+        ),
+        "document_type": "harness-experiment-qualification-v1",
+        "mutation_sensitivity_digest": (
+            "sha256:"
+            "4c5e09726c6f43d20d75ec78acff7908a3f1d2f3236b6027e5becac4f4d6326f"
+        ),
+        "qualification_evidence_classification": (
+            "operator_attested_static"
+        ),
+        "reference_result_digest": (
+            "sha256:"
+            "792f904d201ceb2d2b303d7da1f7573b9db7d8d17eb4f0e34c004cc82e27cf8a"
+        ),
+        "schema_version": 1,
+    },
+}
+EXPECTED_STATIC_EVIDENCE_DIGESTS = {
+    "candidate_set_digest": (
+        "sha256:"
+        "fdadc2e44800226d0999c48b45953e27b684d5f8b0744516935db8278280cdf8"
+    ),
+    "selection_seed_digest": (
+        "sha256:"
+        "6cb1dffb4d344902712ae90ab9223f286cf3216420cd58a90f0b922e68d3b386"
+    ),
+    "pilot_schedule_digest": (
+        "sha256:"
+        "d4ec332e4772a648b5e2c54cb39420f04f5e35517988c4a3b9af38c2c89e3507"
+    ),
+    "qualification_digest": (
+        "sha256:"
+        "a259a42255c5967c7796eaf6e6b9d3eae055546cefa9190b295a867773f75c9c"
+    ),
+    "reference_result_digest": (
+        "sha256:"
+        "792f904d201ceb2d2b303d7da1f7573b9db7d8d17eb4f0e34c004cc82e27cf8a"
+    ),
+    "mutation_sensitivity_digest": (
+        "sha256:"
+        "4c5e09726c6f43d20d75ec78acff7908a3f1d2f3236b6027e5becac4f4d6326f"
+    ),
+    "difficulty_assignment_digest": (
+        "sha256:"
+        "53648044c46a46c31259290ea150bcc6c77f54291e1dbc639d5686e4c43704f6"
+    ),
 }
 
 
@@ -992,11 +1376,6 @@ class ExperimentPlanTests(unittest.TestCase):
         )
         pilot_plans = []
         for run in schedule:
-            codex_home = _digest("codex-home-{}".format(run.ordinal))
-            task_root = _digest("task-root-{}".format(run.ordinal))
-            temp_root = _digest("temp-root-{}".format(run.ordinal))
-            tool_read = tuple(sorted((codex_home, task_root), key=str.encode))
-            validator_read = tuple(sorted((task_root, temp_root), key=str.encode))
             pilot_plans.append(
                 PilotInvocationPlan(
                     ordinal=run.ordinal + 2,
@@ -1004,19 +1383,23 @@ class ExperimentPlanTests(unittest.TestCase):
                     snapshot_receipt_digest=_digest(
                         "snapshot-{}".format(run.task_id)
                     ),
+                    allowed_write_policy_digest=_digest(
+                        "allowed-write-{}".format(run.task_id)
+                    ),
+                    base_profile_digest=(
+                        self.current_profile_digest
+                        if run.condition == "current"
+                        else self.lean_profile_digest
+                    ),
+                    root_capability_policy_digest=(
+                        ROOT_CAPABILITY_POLICY_DIGEST
+                    ),
                     model_id=model["model_id"],
                     reasoning_effort=model["reasoning_effort"],
                     sandbox="workspace-write",
                     approval_policy="never",
                     provider_transport_allowed=True,
                     tool_network_disabled=True,
-                    codex_home_identity_digest=codex_home,
-                    task_root_identity_digest=task_root,
-                    temp_root_identity_digest=temp_root,
-                    tool_read_root_identity_digests=tool_read,
-                    tool_write_root_identity_digests=(task_root,),
-                    validator_read_root_identity_digests=validator_read,
-                    validator_write_root_identity_digests=(temp_root,),
                     child_process_policy=invocation["child_process_policy"],
                     validator_policy=invocation["validator_policy"],
                     output_schema_digest=PILOT_RESPONSE_SCHEMA_DIGEST,
@@ -1067,6 +1450,306 @@ class ExperimentPlanTests(unittest.TestCase):
             plan_digest=sha256_bytes(encoded),
             pilot_schedule=schedule,
         )
+
+    def test_static_evidence_known_answer_documents_and_public_result_are_exact(
+        self,
+    ):
+        derive = experiment_plan_module.derive_static_evidence_digests
+        result_type = experiment_plan_module.StaticEvidenceDigests
+
+        self.assertEqual(
+            tuple(inspect.signature(derive).parameters),
+            ("experiment_input",),
+        )
+        self.assertEqual(
+            tuple(item.name for item in fields(result_type)),
+            tuple(EXPECTED_STATIC_EVIDENCE_DIGESTS),
+        )
+        self.assertEqual(
+            asdict(derive(self.experiment_input)),
+            EXPECTED_STATIC_EVIDENCE_DIGESTS,
+        )
+
+        document_types = set()
+        expected_key_by_document = {
+            "candidate_set": "candidate_set_digest",
+            "selection_seed": "selection_seed_digest",
+            "pilot_schedule": "pilot_schedule_digest",
+            "qualification": "qualification_digest",
+            "reference_result": "reference_result_digest",
+            "mutation_sensitivity": "mutation_sensitivity_digest",
+            "difficulty_assignment": "difficulty_assignment_digest",
+        }
+        for name, document in EXPECTED_STATIC_EVIDENCE_DOCUMENTS.items():
+            with self.subTest(document=name):
+                document_types.add(document["document_type"])
+                self.assertEqual(
+                    sha256_bytes(canonical_bytes(document)),
+                    EXPECTED_STATIC_EVIDENCE_DIGESTS[
+                        expected_key_by_document[name]
+                    ],
+                )
+                wrong_domain = copy.deepcopy(document)
+                wrong_domain["document_type"] = (
+                    "harness-experiment-cross-domain-v1"
+                )
+                self.assertNotEqual(
+                    sha256_bytes(canonical_bytes(wrong_domain)),
+                    EXPECTED_STATIC_EVIDENCE_DIGESTS[
+                        expected_key_by_document[name]
+                    ],
+                )
+        self.assertEqual(len(document_types), 7)
+        self.assertEqual(len(set(EXPECTED_STATIC_EVIDENCE_DIGESTS.values())), 7)
+
+        result = derive(self.experiment_input)
+        with self.assertRaises(FrozenInstanceError):
+            result.candidate_set_digest = _digest("changed")
+
+    def test_static_evidence_preserves_schedule_control_and_mutant_order(self):
+        derive = experiment_plan_module.derive_static_evidence_digests
+        expected_schedule_document = EXPECTED_STATIC_EVIDENCE_DOCUMENTS[
+            "pilot_schedule"
+        ]
+        self.assertNotEqual(
+            [
+                record["task_id"]
+                for record in expected_schedule_document["pilot_schedule"]
+            ],
+            sorted(
+                (
+                    record["task_id"]
+                    for record in expected_schedule_document["pilot_schedule"]
+                ),
+                key=str.encode,
+            ),
+        )
+
+        first = _fixture_value()
+        first["candidates"][0]["negative_controls"] = [
+            {"control_id": "z-control", "result": "fail"},
+            {"control_id": "a-control", "result": "fail"},
+        ]
+        first["candidates"][0]["behavior_mutants"] = [
+            {
+                "category": "incorrect_result",
+                "mutant_digest": _digest("mutant-z"),
+                "result": "fail",
+            },
+            {
+                "category": "formatting",
+                "mutant_digest": _digest("mutant-a"),
+                "result": "fail",
+            },
+        ]
+        second = copy.deepcopy(first)
+        second["candidates"][0]["negative_controls"].reverse()
+        second["candidates"][0]["behavior_mutants"].reverse()
+
+        first_result = derive(load_experiment_input(canonical_bytes(first)))
+        second_result = derive(load_experiment_input(canonical_bytes(second)))
+        self.assertNotEqual(
+            first_result.mutation_sensitivity_digest,
+            second_result.mutation_sensitivity_digest,
+        )
+        self.assertNotEqual(
+            first_result.qualification_digest,
+            second_result.qualification_digest,
+        )
+        for field_name in (
+            "candidate_set_digest",
+            "selection_seed_digest",
+            "pilot_schedule_digest",
+            "reference_result_digest",
+            "difficulty_assignment_digest",
+        ):
+            with self.subTest(field=field_name):
+                self.assertEqual(
+                    getattr(first_result, field_name),
+                    getattr(second_result, field_name),
+                )
+
+    def test_static_evidence_binds_mutation_authority_and_outcomes(self):
+        derive = experiment_plan_module.derive_static_evidence_digests
+        baseline = derive(self.experiment_input)
+
+        mutations = (
+            (
+                "validator",
+                lambda candidate: candidate.__setitem__(
+                    "validator_digest", _digest("changed-validator")
+                ),
+            ),
+            (
+                "assertion",
+                lambda candidate: candidate.__setitem__(
+                    "assertion_digest", _digest("changed-assertion")
+                ),
+            ),
+            (
+                "control",
+                lambda candidate: candidate["negative_controls"][0].__setitem__(
+                    "control_id", "changed-control"
+                ),
+            ),
+            (
+                "mutant-category",
+                lambda candidate: candidate["behavior_mutants"][0].__setitem__(
+                    "category", "changed_behavior"
+                ),
+            ),
+            (
+                "mutant-digest",
+                lambda candidate: candidate["behavior_mutants"][0].__setitem__(
+                    "mutant_digest", _digest("changed-mutant")
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(mutation=label):
+                document = _fixture_value()
+                mutate(document["candidates"][0])
+                changed = derive(
+                    load_experiment_input(canonical_bytes(document))
+                )
+                self.assertNotEqual(
+                    changed.mutation_sensitivity_digest,
+                    baseline.mutation_sensitivity_digest,
+                )
+                self.assertNotEqual(
+                    changed.qualification_digest,
+                    baseline.qualification_digest,
+                )
+
+    def test_qualification_binds_leaf_digests_and_operator_attested_records(
+        self,
+    ):
+        derive = experiment_plan_module.derive_static_evidence_digests
+        baseline = derive(self.experiment_input)
+        cases = (
+            (
+                "candidate-set",
+                "candidate_set_digest",
+                lambda candidate: candidate.__setitem__(
+                    "commit_oid", "5" * 40
+                ),
+            ),
+            (
+                "reference-result",
+                "reference_result_digest",
+                lambda candidate: candidate.__setitem__(
+                    "task_id", "low-alphaa"
+                ),
+            ),
+            (
+                "mutation-sensitivity",
+                "mutation_sensitivity_digest",
+                lambda candidate: candidate.__setitem__(
+                    "validator_digest", _digest("qualification-validator")
+                ),
+            ),
+            (
+                "difficulty-assignment",
+                "difficulty_assignment_digest",
+                lambda candidate: candidate.__setitem__(
+                    "difficulty_rubric_digest",
+                    _digest("qualification-rubric"),
+                ),
+            ),
+        )
+        for label, leaf_field, mutate in cases:
+            with self.subTest(leaf=label):
+                document = _fixture_value()
+                mutate(document["candidates"][0])
+                changed = derive(
+                    load_experiment_input(canonical_bytes(document))
+                )
+                self.assertNotEqual(
+                    getattr(changed, leaf_field),
+                    getattr(baseline, leaf_field),
+                )
+                self.assertNotEqual(
+                    changed.qualification_digest,
+                    baseline.qualification_digest,
+                )
+
+        document = _fixture_value()
+        document["candidates"][0]["provenance_id"] = (
+            "operator-corpus-changed"
+        )
+        attestation_changed = derive(
+            load_experiment_input(canonical_bytes(document))
+        )
+        self.assertNotEqual(
+            attestation_changed.qualification_digest,
+            baseline.qualification_digest,
+        )
+        for field_name in (
+            "candidate_set_digest",
+            "selection_seed_digest",
+            "pilot_schedule_digest",
+            "reference_result_digest",
+            "mutation_sensitivity_digest",
+            "difficulty_assignment_digest",
+        ):
+            with self.subTest(operator_record_non_leaf=field_name):
+                self.assertEqual(
+                    getattr(attestation_changed, field_name),
+                    getattr(baseline, field_name),
+                )
+
+    def test_static_evidence_revalidates_exact_input_dataclass(self):
+        derive = experiment_plan_module.derive_static_evidence_digests
+        forged_digest = replace(
+            self.experiment_input,
+            input_digest=_digest("forged-input"),
+        )
+        with self.assertRaises(ExperimentPlanError):
+            derive(forged_digest)
+
+        subclass = _CanonicalExperimentInputSubclass(
+            canonical_bytes=self.experiment_input.canonical_bytes,
+            value=self.experiment_input.value,
+            input_digest=self.experiment_input.input_digest,
+        )
+        with self.assertRaises(ExperimentPlanError):
+            derive(subclass)
+
+        extra_field = load_experiment_input(VALID_INPUT.read_bytes())
+        object.__setattr__(extra_field, "unexpected", "field")
+        with self.assertRaises(ExperimentPlanError):
+            derive(extra_field)
+
+        with self.assertRaises(ExperimentPlanError):
+            derive(object())
+
+    def test_static_evidence_rejects_malformed_order_without_normalizing(self):
+        derive = experiment_plan_module.derive_static_evidence_digests
+        unordered_documents = []
+
+        candidate_order = _fixture_value()
+        candidate_order["candidates"].reverse()
+        unordered_documents.append(candidate_order)
+
+        allowed_write_order = _fixture_value()
+        allowed_write_order["candidates"][0][
+            "allowed_write_paths"
+        ].reverse()
+        unordered_documents.append(allowed_write_order)
+
+        for document in unordered_documents:
+            with self.subTest(
+                first_task=document["candidates"][0]["task_id"],
+                paths=document["candidates"][0]["allowed_write_paths"],
+            ):
+                encoded = canonical_bytes(document)
+                forged = CanonicalExperimentInput(
+                    canonical_bytes=encoded,
+                    value=document,
+                    input_digest=sha256_bytes(encoded),
+                )
+                with self.assertRaises(ExperimentPlanError):
+                    derive(forged)
 
     def test_fixed_v1_documents_are_exact_immutable_and_digest_bound(self):
         documents = (
@@ -1534,9 +2217,9 @@ class ExperimentPlanTests(unittest.TestCase):
             plan.plan_document["candidates"][0]["task_id"] = "changed"
         with self.assertRaises((AttributeError, TypeError)):
             plan.pilot_schedule.append("changed")
-        with self.assertRaises((AttributeError, TypeError)):
-            plan.pilot_invocation_plans[0].tool_read_root_identity_digests.append(
-                "changed"
+        with self.assertRaises(FrozenInstanceError):
+            plan.pilot_invocation_plans[0].allowed_write_policy_digest = (
+                _digest("changed")
             )
 
     def test_durable_plan_has_no_local_path_or_runtime_secret_values(self):
@@ -1630,10 +2313,12 @@ class ExperimentPlanTests(unittest.TestCase):
                     canary_templates=(template, self.templates[1])
                 )
 
-    def test_pilot_plans_require_exact_schedule_ordinals_and_four_capability_sets(self):
+    def test_pilot_plans_require_exact_schedule_and_policy_bindings(self):
         original = self.pilot_plans[0]
-        unsorted_reads = tuple(
-            reversed(original.tool_read_root_identity_digests)
+        other_profile_digest = (
+            self.lean_profile_digest
+            if original.run.condition == "current"
+            else self.current_profile_digest
         )
         invalid_plans = (
             replace(original, ordinal=4),
@@ -1642,28 +2327,14 @@ class ExperimentPlanTests(unittest.TestCase):
             replace(original, sandbox="danger-full-access"),
             replace(original, provider_transport_allowed=1),
             replace(original, tool_network_disabled=False),
-            replace(original, tool_read_root_identity_digests=()),
             replace(
                 original,
-                tool_read_root_identity_digests=unsorted_reads,
+                base_profile_digest=other_profile_digest,
             ),
             replace(
                 original,
-                tool_read_root_identity_digests=(
-                    original.task_root_identity_digest,
-                    original.task_root_identity_digest,
-                ),
-            ),
-            replace(
-                original,
-                tool_write_root_identity_digests=(
-                    original.temp_root_identity_digest,
-                ),
-            ),
-            replace(
-                original,
-                validator_write_root_identity_digests=(
-                    original.task_root_identity_digest,
+                root_capability_policy_digest=_digest(
+                    "wrong-root-capability-policy"
                 ),
             ),
             replace(original, output_schema_digest=_digest("wrong-schema")),
@@ -1675,32 +2346,123 @@ class ExperimentPlanTests(unittest.TestCase):
                 )
 
         arguments = asdict(original)
-        del arguments["validator_write_root_identity_digests"]
+        del arguments["root_capability_policy_digest"]
         with self.assertRaises(TypeError):
             PilotInvocationPlan(**arguments)
 
-    def test_pilot_snapshot_receipts_are_condition_independent_and_plan_bound(self):
+    def test_pilot_child_schema_replaces_runtime_roots_with_policy_digests(self):
+        expected_fields = (
+            "ordinal",
+            "run",
+            "snapshot_receipt_digest",
+            "allowed_write_policy_digest",
+            "base_profile_digest",
+            "root_capability_policy_digest",
+            "model_id",
+            "reasoning_effort",
+            "sandbox",
+            "approval_policy",
+            "provider_transport_allowed",
+            "tool_network_disabled",
+            "child_process_policy",
+            "validator_policy",
+            "output_schema_digest",
+            "environment_policy_digest",
+            "argv_template_digest",
+            "containment_policy_version",
+        )
+        self.assertEqual(
+            tuple(item.name for item in fields(PilotInvocationPlan)),
+            expected_fields,
+        )
+        expected_document_fields = set(expected_fields).difference({"run"}).union(
+            {"document_type", "run", "schema_version"}
+        )
+        document = experiment_plan_module._pilot_invocation_plan_document(
+            self.pilot_plans[0]
+        )
+        self.assertEqual(set(document), expected_document_fields)
+
+        for forbidden in (
+            "codex_home_identity_digest",
+            "task_root_identity_digest",
+            "temp_root_identity_digest",
+            "tool_read_root_identity_digests",
+            "tool_write_root_identity_digests",
+            "validator_read_root_identity_digests",
+            "validator_write_root_identity_digests",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, document)
+                arguments = asdict(self.pilot_plans[0])
+                arguments[forbidden] = _digest(forbidden)
+                with self.assertRaises(TypeError):
+                    PilotInvocationPlan(**arguments)
+
+    def test_pilot_snapshot_and_allowed_write_receipts_are_task_bound(self):
         plan = self.build()
-        snapshot_field_names = tuple(
+        child_field_names = tuple(
             item.name for item in fields(PilotInvocationPlan)
         )
         self.assertEqual(
-            snapshot_field_names[
-                snapshot_field_names.index("run") :
-                snapshot_field_names.index("run") + 2
+            child_field_names[
+                child_field_names.index("run") :
+                child_field_names.index("run") + 5
             ],
-            ("run", "snapshot_receipt_digest"),
+            (
+                "run",
+                "snapshot_receipt_digest",
+                "allowed_write_policy_digest",
+                "base_profile_digest",
+                "root_capability_policy_digest",
+            ),
         )
 
-        by_task = {}
+        snapshots_by_task = {}
+        allowed_writes_by_task = {}
         for child in plan.pilot_invocation_plans:
-            by_task.setdefault(child.run.task_id, set()).add(
+            snapshots_by_task.setdefault(child.run.task_id, set()).add(
                 child.snapshot_receipt_digest
             )
-        self.assertEqual(len(by_task), 4)
-        self.assertTrue(all(len(values) == 1 for values in by_task.values()))
+            allowed_writes_by_task.setdefault(child.run.task_id, set()).add(
+                child.allowed_write_policy_digest
+            )
+            self.assertEqual(
+                child.base_profile_digest,
+                (
+                    self.current_profile_digest
+                    if child.run.condition == "current"
+                    else self.lean_profile_digest
+                ),
+            )
+            self.assertEqual(
+                child.root_capability_policy_digest,
+                ROOT_CAPABILITY_POLICY_DIGEST,
+            )
+        self.assertEqual(len(snapshots_by_task), 4)
+        self.assertEqual(len(allowed_writes_by_task), 4)
+        self.assertTrue(
+            all(len(values) == 1 for values in snapshots_by_task.values())
+        )
+        self.assertTrue(
+            all(len(values) == 1 for values in allowed_writes_by_task.values())
+        )
         self.assertEqual(
-            len({next(iter(values)) for values in by_task.values()}),
+            len(
+                {
+                    next(iter(values))
+                    for values in snapshots_by_task.values()
+                }
+            ),
+            4,
+        )
+        self.assertEqual(
+            len(
+                {
+                    next(iter(values))
+                    for values in allowed_writes_by_task.values()
+                }
+            ),
             4,
         )
 
@@ -1718,11 +2480,24 @@ class ExperimentPlanTests(unittest.TestCase):
                 for child in plan.pilot_invocation_plans
             ),
         )
+        self.assertEqual(
+            tuple(
+                document["allowed_write_policy_digest"]
+                for document in expected_documents
+            ),
+            tuple(
+                child.allowed_write_policy_digest
+                for child in plan.pilot_invocation_plans
+            ),
+        )
 
         task_id = plan.pilot_invocation_plans[0].run.task_id
-        changed_digest = _digest("replacement-snapshot")
+        changed_snapshot_digest = _digest("replacement-snapshot")
         changed_children = tuple(
-            replace(child, snapshot_receipt_digest=changed_digest)
+            replace(
+                child,
+                snapshot_receipt_digest=changed_snapshot_digest,
+            )
             if child.run.task_id == task_id
             else child
             for child in self.pilot_plans
@@ -1734,7 +2509,24 @@ class ExperimentPlanTests(unittest.TestCase):
             plan.plan_document["pilot_invocation_plan_digests"],
         )
 
-    def test_pilot_snapshot_receipts_reject_pair_mismatch_and_cross_task_reuse(self):
+        changed_allowed_digest = _digest("replacement-allowed-write")
+        changed_children = tuple(
+            replace(
+                child,
+                allowed_write_policy_digest=changed_allowed_digest,
+            )
+            if child.run.task_id == task_id
+            else child
+            for child in self.pilot_plans
+        )
+        changed_plan = self.build(pilot_invocation_plans=changed_children)
+        self.assertNotEqual(changed_plan.plan_digest, plan.plan_digest)
+        self.assertNotEqual(
+            changed_plan.plan_document["pilot_invocation_plan_digests"],
+            plan.plan_document["pilot_invocation_plan_digests"],
+        )
+
+    def test_pilot_task_digests_reject_pair_mismatch_and_cross_task_reuse(self):
         first = self.pilot_plans[0]
         matching_index = next(
             index
@@ -1767,18 +2559,46 @@ class ExperimentPlanTests(unittest.TestCase):
         )
         self.assertPlanInvalid(pilot_invocation_plans=cross_task)
 
-    def test_builder_rejects_snapshot_receipt_digest_string_subclass(self):
-        forged_children = list(self.pilot_plans)
-        forged_children[0] = replace(
-            forged_children[0],
-            snapshot_receipt_digest=_StringSubclass(
-                forged_children[0].snapshot_receipt_digest
+        mismatched_pair = list(self.pilot_plans)
+        mismatched_pair[matching_index] = replace(
+            mismatched_pair[matching_index],
+            allowed_write_policy_digest=_digest(
+                "mismatched-allowed-write"
             ),
         )
+        self.assertPlanInvalid(pilot_invocation_plans=tuple(mismatched_pair))
 
-        self.assertPlanInvalid(
-            pilot_invocation_plans=tuple(forged_children)
+        cross_task = tuple(
+            replace(
+                child,
+                allowed_write_policy_digest=first.allowed_write_policy_digest,
+            )
+            if child.run.task_id == other_task_id
+            else child
+            for child in self.pilot_plans
         )
+        self.assertPlanInvalid(pilot_invocation_plans=cross_task)
+
+    def test_builder_rejects_string_subclasses_for_pilot_policy_digests(self):
+        for field_name in (
+            "snapshot_receipt_digest",
+            "allowed_write_policy_digest",
+            "base_profile_digest",
+            "root_capability_policy_digest",
+        ):
+            forged_children = list(self.pilot_plans)
+            forged_children[0] = replace(
+                forged_children[0],
+                **{
+                    field_name: _StringSubclass(
+                        getattr(forged_children[0], field_name)
+                    )
+                },
+            )
+            with self.subTest(field_name=field_name):
+                self.assertPlanInvalid(
+                    pilot_invocation_plans=tuple(forged_children)
+                )
 
     def test_builder_rejects_string_subclasses_across_plan_digest_fields(self):
         forged_template = replace(
@@ -1789,8 +2609,8 @@ class ExperimentPlanTests(unittest.TestCase):
         )
         forged_pilot = replace(
             self.pilot_plans[0],
-            codex_home_identity_digest=_StringSubclass(
-                self.pilot_plans[0].codex_home_identity_digest
+            allowed_write_policy_digest=_StringSubclass(
+                self.pilot_plans[0].allowed_write_policy_digest
             ),
         )
         cases = (
@@ -1821,28 +2641,6 @@ class ExperimentPlanTests(unittest.TestCase):
         for overrides in cases:
             with self.subTest(field=next(iter(overrides))):
                 self.assertPlanInvalid(**overrides)
-
-    def test_explicit_capability_sets_may_be_empty_or_partial(self):
-        restrictive = replace(
-            self.pilot_plans[0],
-            tool_read_root_identity_digests=(),
-            tool_write_root_identity_digests=(),
-            validator_read_root_identity_digests=(),
-            validator_write_root_identity_digests=(),
-        )
-
-        plan = self.build(
-            pilot_invocation_plans=(restrictive,) + self.pilot_plans[1:]
-        )
-
-        self.assertEqual(
-            plan.pilot_invocation_plans[0].tool_read_root_identity_digests,
-            (),
-        )
-        self.assertEqual(
-            plan.pilot_invocation_plans[0].validator_write_root_identity_digests,
-            (),
-        )
 
     def test_builder_accepts_opaque_nfc_policy_identifiers(self):
         value = _fixture_value()

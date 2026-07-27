@@ -155,12 +155,6 @@ _TRUE_INVOCATION_KEYS = (
     "hooks_disabled",
     "skills_disabled",
 )
-_CAPABILITY_SET_FIELDS = (
-    "tool_read_root_identity_digests",
-    "tool_write_root_identity_digests",
-    "validator_read_root_identity_digests",
-    "validator_write_root_identity_digests",
-)
 _EFFICIENCY_METRICS = (
     "reported_tokens",
     "wall_time_milliseconds",
@@ -405,6 +399,17 @@ class CanonicalExperimentInput:
 
 
 @dataclass(frozen=True)
+class StaticEvidenceDigests:
+    candidate_set_digest: str
+    selection_seed_digest: str
+    pilot_schedule_digest: str
+    qualification_digest: str
+    reference_result_digest: str
+    mutation_sensitivity_digest: str
+    difficulty_assignment_digest: str
+
+
+@dataclass(frozen=True)
 class PlannedRun:
     ordinal: int
     task_id: str
@@ -438,29 +443,21 @@ class PilotInvocationPlan:
     ordinal: int
     run: PlannedRun
     snapshot_receipt_digest: str
+    allowed_write_policy_digest: str
+    base_profile_digest: str
+    root_capability_policy_digest: str
     model_id: str
     reasoning_effort: str
     sandbox: str
     approval_policy: str
     provider_transport_allowed: bool
     tool_network_disabled: bool
-    codex_home_identity_digest: str
-    task_root_identity_digest: str
-    temp_root_identity_digest: str
-    tool_read_root_identity_digests: Tuple[str, ...]
-    tool_write_root_identity_digests: Tuple[str, ...]
-    validator_read_root_identity_digests: Tuple[str, ...]
-    validator_write_root_identity_digests: Tuple[str, ...]
     child_process_policy: str
     validator_policy: str
     output_schema_digest: str
     environment_policy_digest: str
     argv_template_digest: str
     containment_policy_version: str
-
-    def __post_init__(self) -> None:
-        for name in _CAPABILITY_SET_FIELDS:
-            object.__setattr__(self, name, tuple(getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -1143,6 +1140,227 @@ def _planned_run_document(run: PlannedRun) -> Mapping[str, object]:
     }
 
 
+def _static_candidate_set_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "candidates": [
+            {
+                "allowed_write_paths": list(
+                    candidate["allowed_write_paths"]
+                ),
+                "commit_oid": candidate["commit_oid"],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "document_type": "harness-experiment-candidate-set-v1",
+        "schema_version": 1,
+    }
+
+
+def _static_selection_seed_document(
+    selection_seed: str,
+) -> Mapping[str, object]:
+    return {
+        "document_type": "harness-experiment-selection-seed-v1",
+        "schema_version": 1,
+        "selection_seed": selection_seed,
+    }
+
+
+def _static_pilot_schedule_document(
+    schedule: Sequence[PlannedRun],
+) -> Mapping[str, object]:
+    return {
+        "document_type": "harness-experiment-pilot-schedule-v1",
+        "pilot_schedule": [
+            _planned_run_document(run) for run in schedule
+        ],
+        "schema_version": 1,
+    }
+
+
+def _static_reference_result_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "document_type": "harness-experiment-reference-results-v1",
+        "reference_results": [
+            {
+                "reference_result": candidate["reference_result"],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "schema_version": 1,
+    }
+
+
+def _static_mutation_sensitivity_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "candidate_mutation_evidence": [
+            {
+                "assertion_digest": candidate["assertion_digest"],
+                "behavior_mutants": [
+                    {
+                        "category": mutant["category"],
+                        "mutant_digest": mutant["mutant_digest"],
+                        "result": mutant["result"],
+                    }
+                    for mutant in candidate["behavior_mutants"]
+                ],
+                "negative_controls": [
+                    {
+                        "control_id": control["control_id"],
+                        "result": control["result"],
+                    }
+                    for control in candidate["negative_controls"]
+                ],
+                "task_id": candidate["task_id"],
+                "validator_digest": candidate["validator_digest"],
+            }
+            for candidate in candidates
+        ],
+        "document_type": (
+            "harness-experiment-mutation-sensitivity-v1"
+        ),
+        "schema_version": 1,
+    }
+
+
+def _static_difficulty_assignment_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "difficulty_assignments": [
+            {
+                "difficulty": candidate["difficulty"],
+                "difficulty_rubric_digest": candidate[
+                    "difficulty_rubric_digest"
+                ],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "document_type": (
+            "harness-experiment-difficulty-assignments-v1"
+        ),
+        "schema_version": 1,
+    }
+
+
+def _static_qualification_document(
+    candidates: Sequence[Mapping[str, object]],
+    *,
+    candidate_set_digest: str,
+    difficulty_assignment_digest: str,
+    mutation_sensitivity_digest: str,
+    reference_result_digest: str,
+) -> Mapping[str, object]:
+    return {
+        "candidate_qualification_records": [
+            {
+                "absolute_safety_assertion_ids": list(
+                    candidate["absolute_safety_assertion_ids"]
+                ),
+                "exclusion_rule_ids": list(
+                    candidate["exclusion_rule_ids"]
+                ),
+                "inclusion_rule_ids": list(
+                    candidate["inclusion_rule_ids"]
+                ),
+                "local_clone_policy": candidate["local_clone_policy"],
+                "offline_executable": candidate["offline_executable"],
+                "operator_attested": candidate["operator_attested"],
+                "provenance_id": candidate["provenance_id"],
+                "source_provisioning_class": candidate[
+                    "source_provisioning_class"
+                ],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "candidate_set_digest": candidate_set_digest,
+        "difficulty_assignment_digest": difficulty_assignment_digest,
+        "document_type": "harness-experiment-qualification-v1",
+        "mutation_sensitivity_digest": mutation_sensitivity_digest,
+        "qualification_evidence_classification": (
+            "operator_attested_static"
+        ),
+        "reference_result_digest": reference_result_digest,
+        "schema_version": 1,
+    }
+
+
+def _static_document_digest(document: Mapping[str, object]) -> str:
+    return sha256_bytes(canonical_bytes(document))
+
+
+def derive_static_evidence_digests(
+    experiment_input: CanonicalExperimentInput,
+) -> StaticEvidenceDigests:
+    """Derive the seven static-evidence digests from revalidated input."""
+    if not _dataclass_has_exact_fields(
+        experiment_input, CanonicalExperimentInput
+    ):
+        _raise_input_error()
+    try:
+        authoritative = experiment_input_bytes(experiment_input)
+        verified = load_experiment_input(authoritative)
+    except (ExperimentPlanError, TypeError):
+        _raise_input_error()
+    if (
+        type(experiment_input.canonical_bytes) is not bytes
+        or type(experiment_input.input_digest) is not str
+        or experiment_input.canonical_bytes != verified.canonical_bytes
+        or experiment_input.input_digest != verified.input_digest
+    ):
+        _raise_input_error()
+
+    candidates = tuple(verified.value["candidates"])
+    selection_seed = verified.value["selection_seed"]
+    schedule = build_pilot_schedule(selection_seed, candidates)
+    candidate_set_digest = _static_document_digest(
+        _static_candidate_set_document(candidates)
+    )
+    selection_seed_digest = _static_document_digest(
+        _static_selection_seed_document(selection_seed)
+    )
+    pilot_schedule_digest = _static_document_digest(
+        _static_pilot_schedule_document(schedule)
+    )
+    reference_result_digest = _static_document_digest(
+        _static_reference_result_document(candidates)
+    )
+    mutation_sensitivity_digest = _static_document_digest(
+        _static_mutation_sensitivity_document(candidates)
+    )
+    difficulty_assignment_digest = _static_document_digest(
+        _static_difficulty_assignment_document(candidates)
+    )
+    qualification_digest = _static_document_digest(
+        _static_qualification_document(
+            candidates,
+            candidate_set_digest=candidate_set_digest,
+            difficulty_assignment_digest=difficulty_assignment_digest,
+            mutation_sensitivity_digest=mutation_sensitivity_digest,
+            reference_result_digest=reference_result_digest,
+        )
+    )
+    return StaticEvidenceDigests(
+        candidate_set_digest=candidate_set_digest,
+        selection_seed_digest=selection_seed_digest,
+        pilot_schedule_digest=pilot_schedule_digest,
+        qualification_digest=qualification_digest,
+        reference_result_digest=reference_result_digest,
+        mutation_sensitivity_digest=mutation_sensitivity_digest,
+        difficulty_assignment_digest=difficulty_assignment_digest,
+    )
+
+
 def _canary_template_document(
     template: CanaryInvocationTemplate,
 ) -> Mapping[str, object]:
@@ -1175,10 +1393,11 @@ def _pilot_invocation_plan_document(
     plan: PilotInvocationPlan,
 ) -> Mapping[str, object]:
     return {
+        "allowed_write_policy_digest": plan.allowed_write_policy_digest,
         "approval_policy": plan.approval_policy,
         "argv_template_digest": plan.argv_template_digest,
+        "base_profile_digest": plan.base_profile_digest,
         "child_process_policy": plan.child_process_policy,
-        "codex_home_identity_digest": plan.codex_home_identity_digest,
         "containment_policy_version": plan.containment_policy_version,
         "document_type": "pilot_invocation_plan",
         "environment_policy_digest": plan.environment_policy_digest,
@@ -1191,22 +1410,11 @@ def _pilot_invocation_plan_document(
         "sandbox": plan.sandbox,
         "schema_version": 1,
         "snapshot_receipt_digest": plan.snapshot_receipt_digest,
-        "task_root_identity_digest": plan.task_root_identity_digest,
-        "temp_root_identity_digest": plan.temp_root_identity_digest,
+        "root_capability_policy_digest": (
+            plan.root_capability_policy_digest
+        ),
         "tool_network_disabled": plan.tool_network_disabled,
-        "tool_read_root_identity_digests": list(
-            plan.tool_read_root_identity_digests
-        ),
-        "tool_write_root_identity_digests": list(
-            plan.tool_write_root_identity_digests
-        ),
         "validator_policy": plan.validator_policy,
-        "validator_read_root_identity_digests": list(
-            plan.validator_read_root_identity_digests
-        ),
-        "validator_write_root_identity_digests": list(
-            plan.validator_write_root_identity_digests
-        ),
     }
 
 
@@ -1285,7 +1493,9 @@ def _validate_pilot_plans(
     schedule: Tuple[PlannedRun, ...],
     model: ABCMapping,
     invocation_policy: ABCMapping,
-    containment_policy_version: object
+    containment_policy_version: object,
+    current_profile_digest: str,
+    lean_profile_digest: str
 ) -> Tuple[PilotInvocationPlan, ...]:
     if (
         not isinstance(values, ABCSequence)
@@ -1297,11 +1507,17 @@ def _validate_pilot_plans(
         _raise_plan_error()
     snapshot_by_task = {}
     snapshot_tasks_by_digest = {}
+    allowed_write_by_task = {}
+    allowed_write_tasks_by_digest = {}
     for plan, run in zip(plans, schedule):
         if not _dataclass_has_exact_fields(plan, PilotInvocationPlan):
             _raise_plan_error()
         if not _dataclass_has_exact_fields(plan.run, PlannedRun):
             _raise_plan_error()
+        expected_profile_digest = {
+            "current": current_profile_digest,
+            "lean": lean_profile_digest,
+        }.get(run.condition)
         if (
             not isinstance(plan.ordinal, int)
             or isinstance(plan.ordinal, bool)
@@ -1317,6 +1533,9 @@ def _validate_pilot_plans(
             or not isinstance(plan.tool_network_disabled, bool)
             or plan.tool_network_disabled
             is not invocation_policy["tool_network_disabled"]
+            or plan.base_profile_digest != expected_profile_digest
+            or plan.root_capability_policy_digest
+            != ROOT_CAPABILITY_POLICY_DIGEST
             or plan.child_process_policy
             != invocation_policy["child_process_policy"]
             or plan.validator_policy != invocation_policy["validator_policy"]
@@ -1327,11 +1546,6 @@ def _validate_pilot_plans(
         ):
             _raise_plan_error()
 
-        identities = {
-            _require_plan_digest(plan.codex_home_identity_digest),
-            _require_plan_digest(plan.task_root_identity_digest),
-            _require_plan_digest(plan.temp_root_identity_digest),
-        }
         snapshot_digest = _require_plan_digest(
             plan.snapshot_receipt_digest
         )
@@ -1345,38 +1559,24 @@ def _validate_pilot_plans(
         )
         if other_task != run.task_id:
             _raise_plan_error()
-        if len(identities) != 3:
-            _raise_plan_error()
-        capability_sets = {
-            name: _require_plan_sorted_digests(
-                getattr(plan, name), nonempty=False
-            )
-            for name in _CAPABILITY_SET_FIELDS
-        }
-        if any(
-            not set(values).issubset(identities)
-            for values in capability_sets.values()
-        ):
-            _raise_plan_error()
-        tool_read = set(
-            capability_sets["tool_read_root_identity_digests"]
+
+        allowed_write_digest = _require_plan_digest(
+            plan.allowed_write_policy_digest
         )
-        tool_write = set(
-            capability_sets["tool_write_root_identity_digests"]
+        expected_allowed_write = allowed_write_by_task.setdefault(
+            run.task_id, allowed_write_digest
         )
-        validator_read = set(
-            capability_sets["validator_read_root_identity_digests"]
+        if expected_allowed_write != allowed_write_digest:
+            _raise_plan_error()
+        allowed_write_task = allowed_write_tasks_by_digest.setdefault(
+            allowed_write_digest, run.task_id
         )
-        validator_write = set(
-            capability_sets["validator_write_root_identity_digests"]
-        )
-        if not tool_write.issubset(tool_read):
+        if allowed_write_task != run.task_id:
             _raise_plan_error()
-        if not validator_write.issubset(validator_read):
-            _raise_plan_error()
-        if tool_write.intersection(validator_write):
-            _raise_plan_error()
+
         for name in (
+            "base_profile_digest",
+            "root_capability_policy_digest",
             "output_schema_digest",
             "environment_policy_digest",
             "argv_template_digest",
@@ -1452,6 +1652,8 @@ def _build_experiment_plan(
         model=validated["model"],
         invocation_policy=validated["invocation_policy"],
         containment_policy_version=validated["containment_policy_version"],
+        current_profile_digest=current_profile,
+        lean_profile_digest=lean_profile,
     )
 
     template_digests = tuple(

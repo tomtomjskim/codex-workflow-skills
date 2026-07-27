@@ -2023,11 +2023,22 @@ and runtime capability sets. The authoritative repository-relative paths
 remain in the existing canonical input preserved and digest-bound by
 `ExperimentPlan`. Absolute and host-local paths remain forbidden.
 
+The exact canonical static-evidence/base-profile documents, result presence
+masks, and acquisition-publication linearization are normative in
+`docs/superpowers/specs/2026-07-23-harness-experiment-task8-binding.md`.
+That binding also supersedes the earlier claim that production
+`experiment_receipts.py` remains unchanged: its public schema and
+five-argument static-validator signature remain stable, while validation must
+recompute all seven evidence digests from authoritative input.
+
 **Files:**
 
 - Modify: `scripts/live_eval/experiment_plan.py`
+- Modify: `scripts/live_eval/experiment_receipts.py`
 - Modify: `tests/test_live_eval_experiment_plan.py`
 - Modify: `tests/test_live_eval_experiment_receipts.py`
+- Modify: `docs/superpowers/specs/2026-07-23-harness-experiment-task7-binding.md`
+- Create: `docs/superpowers/specs/2026-07-23-harness-experiment-task8-binding.md`
 - Create: `scripts/live_eval/experiment.py`
 - Create: `tests/test_live_eval_experiment.py`
 
@@ -2061,6 +2072,13 @@ remain in the existing canonical input preserved and digest-bound by
     ancestry-disjoint in both directions from bundle, skill, every selected
     task source, and every selected `.git`, including case/Unicode aliases;
   - source, bundle, plan, or materialized-tree mutation blocks;
+  - every absolute path chain rejects untrusted writable ancestors and is
+    reopened before path-based materialization or harness verification;
+  - a directly created directory publishes only its captured exact-empty leaf,
+    never an injected descendant or replacement;
+  - returned task pairs independently reproduce captured modes, sizes, bytes,
+    materialized-tree digest, snapshot receipt, and root-identity digest while
+    making zero immediate public `verify()` calls;
   - cleanup pre-inspects the whole owned tree; a replacement or inspection
     failure causes no chmod/delete and produces `cleanup_required`;
   - success produces the existing success-only preflight receipt, while
@@ -2158,6 +2176,8 @@ post-plan cleanup alternative retains every final digest and uses
 `reason_code=task_snapshot_cleanup_required` exactly as specified by Task 7
 binding Section 11.2. It also requires `preflight_receipt_digest=None`; no
 blocked `PreflightReceipt` exists.
+`cleanup_state=not_started` is valid only before any digest is available
+(`000000`); all nonzero digest masks prove that `phase-a` creation began.
 
 ### Step 4: Compose preflight in one direction
 
@@ -2174,7 +2194,10 @@ load current and lean harness source identities
 materialize, verify, and seal two base homes
 for each selected task: create a fresh single-task materializer
 prepare/capture once and materialize one distinct current/lean pair
-use the pair's two independent full verifications and digest the allowed-write policy
+independently verify both returned roots descriptor-relatively against the
+captured tree and returned receipt/identity fields without calling the public
+TaskSnapshotMaterializer.verify()
+digest the allowed-write policy
 in finally close the materializer and drop capture/snapshot references
 collect one source-trust and one snapshot receipt per selected task
 build selection and corpus receipts
@@ -2217,9 +2240,11 @@ project the public result
   actual root identities and capability sets in versioned runtime
   containment/child evidence before reservation.
 - [ ] Keep existing preflight receipt validation and replay success-only:
-  exactly `verified/removed`. Fixture updates in
-  `tests/test_live_eval_experiment_receipts.py` cover the amended invocation
-  plan shape; production `experiment_receipts.py` does not change.
+  exactly `verified/removed`. Update
+  `tests/test_live_eval_experiment_receipts.py` for the amended invocation
+  plan shape and canonical static evidence. Production
+  `experiment_receipts.py` keeps its public receipt schema and validator
+  signature, but independently recomputes all seven static-evidence digests.
 - [ ] After identity-aware cleanup, emit a success `PreflightReceipt` only for
   `verified/removed`. A cleanup-required public result retains completed
   path-free digests but has `preflight_receipt_digest=None`. A failure before
@@ -2231,6 +2256,13 @@ project the public result
   descriptor traversal, require exact mode `0700` and an empty inventory, and
   retain its descriptor. Never infer `/tmp`, `TMPDIR`, or another ambient
   parent.
+- [ ] Require every opened ancestor to be root- or current-user-owned and
+  non-writable by group/other, except for a root-owned sticky-parent
+  transition to a current-user-owned non-writable child. Reopen and compare
+  the complete chain before every path-based materialization or harness
+  verification boundary. Bind stable `dev/ino/uid/gid/kind/mode`, not mutable
+  shared-ancestor inventory size/timestamps; keep full-entry validation for
+  the exclusive terminal.
 - [ ] Before creating `phase-a`, physically traverse `bundle_root`,
   `skill_repo`, every selected task source root, and every exact `.git`.
   Compare terminal `(dev, ino, kind)` identities against opened ancestor
@@ -2241,6 +2273,10 @@ project the public result
   `kind`) and expected component inventory when created or acquired; never
   establish ownership from a cleanup-time scan or maintain latest-mutation
   identity records.
+- [ ] Acquire a Task 8-created directory only as its captured exact-empty
+  leaf. Reject an injected descendant or post-capture replacement without
+  publishing cleanup authority. Treat the portable `mkdir`-to-first-open
+  same-UID race as an explicit private-parent residual.
 - [ ] Before mutation, inspect the whole owned `phase-a` tree
   descriptor-relatively. If every inventory, token, kind, and single-link-file
   check passes, `fchmod(0700)` directories top-down and delete entries
@@ -2277,7 +2313,7 @@ git diff --check
 - [ ] Commit:
 
 ```bash
-git add scripts/live_eval/experiment_plan.py scripts/live_eval/experiment.py tests/test_live_eval_experiment_plan.py tests/test_live_eval_experiment_receipts.py tests/test_live_eval_experiment.py
+git add scripts/live_eval/experiment_plan.py scripts/live_eval/experiment_receipts.py scripts/live_eval/experiment.py tests/test_live_eval_experiment_plan.py tests/test_live_eval_experiment_receipts.py tests/test_live_eval_experiment.py docs/superpowers/specs/2026-07-23-harness-experiment-task7-binding.md docs/superpowers/specs/2026-07-23-harness-experiment-task8-binding.md docs/superpowers/plans/2026-07-23-harness-experiment-readiness-plan.md
 git commit -m "feat(eval): orchestrate zero-call experiment preflight"
 ```
 

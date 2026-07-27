@@ -8,6 +8,7 @@ from pathlib import Path
 from types import MappingProxyType
 import unittest
 
+import scripts.live_eval.experiment_plan as experiment_plan_module
 from scripts.live_eval.experiment_plan import (
     CANARY_ARGV_TEMPLATE_DIGEST,
     CANARY_OVERLAY_RECIPE_DIGEST,
@@ -141,6 +142,11 @@ def _static_receipts(experiment_input=None):
     if experiment_input is None:
         experiment_input = load_experiment_input(VALID_INPUT.read_bytes())
     candidates = tuple(experiment_input.value["candidates"])
+    static_digests = (
+        experiment_plan_module.derive_static_evidence_digests(
+            experiment_input
+        )
+    )
     sources = tuple(
         make_receipt(
             "task_source_trust",
@@ -167,13 +173,19 @@ def _static_receipts(experiment_input=None):
         None,
         None,
         {
-            "candidate_set_digest": _digest("candidate-set"),
+            "candidate_set_digest": (
+                static_digests.candidate_set_digest
+            ),
             "selection_rule": "sha256-rank-paired-v1",
-            "selection_seed_digest": _digest("selection-seed"),
+            "selection_seed_digest": (
+                static_digests.selection_seed_digest
+            ),
             "selected_task_ids": [
                 candidate["task_id"] for candidate in candidates
             ],
-            "pilot_schedule_digest": _digest("pilot-schedule"),
+            "pilot_schedule_digest": (
+                static_digests.pilot_schedule_digest
+            ),
         },
     )
     corpus = make_receipt(
@@ -189,7 +201,9 @@ def _static_receipts(experiment_input=None):
             "selected_snapshot_receipt_digests": [
                 snapshot.receipt_digest for snapshot in snapshots
             ],
-            "qualification_digest": _digest("qualification"),
+            "qualification_digest": (
+                static_digests.qualification_digest
+            ),
             "qualification_evidence_classification": (
                 "operator_attested_static"
             ),
@@ -202,16 +216,61 @@ def _static_receipts(experiment_input=None):
             "assertion_digests": [
                 candidate["assertion_digest"] for candidate in candidates
             ],
-            "reference_result_digest": _digest("reference-result"),
-            "mutation_sensitivity_digest": _digest(
-                "mutation-sensitivity"
+            "reference_result_digest": (
+                static_digests.reference_result_digest
             ),
-            "difficulty_assignment_digest": _digest(
-                "difficulty-assignment"
+            "mutation_sensitivity_digest": (
+                static_digests.mutation_sensitivity_digest
+            ),
+            "difficulty_assignment_digest": (
+                static_digests.difficulty_assignment_digest
             ),
         },
     )
     return experiment_input, sources, snapshots, selection, corpus
+
+
+def _rebuild_static_digest_forgery(
+    experiment_input,
+    selection,
+    corpus,
+    forged_fields,
+):
+    selection_fields = {
+        "candidate_set_digest",
+        "selection_seed_digest",
+        "pilot_schedule_digest",
+    }
+    selection_payload = thaw_json_value(selection.payload)
+    corpus_payload = thaw_json_value(corpus.payload)
+    for field_name in forged_fields:
+        forged = _digest("unrelated-static-{}".format(field_name))
+        if field_name in selection_fields:
+            selection_payload[field_name] = forged
+        else:
+            corpus_payload[field_name] = forged
+    rebuilt_selection = make_receipt(
+        "task_selection",
+        experiment_input.input_digest,
+        None,
+        None,
+        selection_payload,
+    )
+    corpus_payload["selection_receipt_digest"] = (
+        rebuilt_selection.receipt_digest
+    )
+    if "candidate_set_digest" in forged_fields:
+        corpus_payload["candidate_set_digest"] = selection_payload[
+            "candidate_set_digest"
+        ]
+    rebuilt_corpus = make_receipt(
+        "task_corpus",
+        experiment_input.input_digest,
+        None,
+        None,
+        corpus_payload,
+    )
+    return rebuilt_selection, rebuilt_corpus
 
 
 def _build_plan(experiment_input, sources, snapshots, selection, corpus):
@@ -269,31 +328,28 @@ def _build_plan(experiment_input, sources, snapshots, selection, corpus):
         experiment_input.value["selection_seed"],
         experiment_input.value["candidates"],
     ):
-        codex_home = _digest("codex-home-{}".format(run.ordinal))
-        task_root = _digest("task-root-{}".format(run.ordinal))
-        temp_root = _digest("temp-root-{}".format(run.ordinal))
         pilot_plans.append(
             PilotInvocationPlan(
                 ordinal=run.ordinal + 2,
                 run=run,
                 snapshot_receipt_digest=snapshot_by_task[run.task_id],
+                allowed_write_policy_digest=_digest(
+                    "allowed-write-{}".format(run.task_id)
+                ),
+                base_profile_digest=(
+                    current_profile_digest
+                    if run.condition == "current"
+                    else lean_profile_digest
+                ),
+                root_capability_policy_digest=(
+                    ROOT_CAPABILITY_POLICY_DIGEST
+                ),
                 model_id=model["model_id"],
                 reasoning_effort=model["reasoning_effort"],
                 sandbox="workspace-write",
                 approval_policy="never",
                 provider_transport_allowed=True,
                 tool_network_disabled=True,
-                codex_home_identity_digest=codex_home,
-                task_root_identity_digest=task_root,
-                temp_root_identity_digest=temp_root,
-                tool_read_root_identity_digests=tuple(
-                    sorted((codex_home, task_root), key=str.encode)
-                ),
-                tool_write_root_identity_digests=(task_root,),
-                validator_read_root_identity_digests=tuple(
-                    sorted((task_root, temp_root), key=str.encode)
-                ),
-                validator_write_root_identity_digests=(temp_root,),
                 child_process_policy=invocation["child_process_policy"],
                 validator_policy=invocation["validator_policy"],
                 output_schema_digest=PILOT_RESPONSE_SCHEMA_DIGEST,
@@ -3163,6 +3219,95 @@ class StaticReceiptTests(unittest.TestCase):
         self.assertIs(type(raised.exception), ExperimentReceiptError)
         self.assertEqual(
             str(raised.exception), "experiment_receipt_invalid"
+        )
+
+    def assertRebuiltStaticDigestForgeryRejected(self, *forged_fields):
+        experiment_input, sources, snapshots, selection, corpus = (
+            _static_receipts()
+        )
+        rebuilt_selection, rebuilt_corpus = (
+            _rebuild_static_digest_forgery(
+                experiment_input,
+                selection,
+                corpus,
+                forged_fields,
+            )
+        )
+        if any(
+            field_name
+            in {
+                "candidate_set_digest",
+                "selection_seed_digest",
+                "pilot_schedule_digest",
+            }
+            for field_name in forged_fields
+        ):
+            self.assertNotEqual(
+                rebuilt_selection.receipt_digest,
+                selection.receipt_digest,
+            )
+        else:
+            self.assertEqual(
+                rebuilt_selection.receipt_digest,
+                selection.receipt_digest,
+            )
+        self.assertNotEqual(
+            rebuilt_corpus.receipt_digest,
+            corpus.receipt_digest,
+        )
+        self.assertReceiptInvalid(
+            validate_static_receipt_graph,
+            experiment_input,
+            sources,
+            snapshots,
+            rebuilt_selection,
+            rebuilt_corpus,
+        )
+
+    def test_rebuilt_candidate_set_digest_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "candidate_set_digest"
+        )
+
+    def test_rebuilt_selection_seed_digest_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "selection_seed_digest"
+        )
+
+    def test_rebuilt_pilot_schedule_digest_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "pilot_schedule_digest"
+        )
+
+    def test_rebuilt_qualification_digest_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "qualification_digest"
+        )
+
+    def test_rebuilt_reference_result_digest_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "reference_result_digest"
+        )
+
+    def test_rebuilt_mutation_sensitivity_digest_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "mutation_sensitivity_digest"
+        )
+
+    def test_rebuilt_difficulty_assignment_digest_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "difficulty_assignment_digest"
+        )
+
+    def test_rebuilt_all_static_digests_forgery_is_rejected(self):
+        self.assertRebuiltStaticDigestForgeryRejected(
+            "candidate_set_digest",
+            "selection_seed_digest",
+            "pilot_schedule_digest",
+            "qualification_digest",
+            "reference_result_digest",
+            "mutation_sensitivity_digest",
+            "difficulty_assignment_digest",
         )
 
     def test_envelope_fields_error_type_and_canonical_digest_are_exact(self):

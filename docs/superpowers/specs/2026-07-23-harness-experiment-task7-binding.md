@@ -1263,8 +1263,11 @@ cleanup_state=removed
 
 The existing `PreflightReceipt` constructor, validator, runtime replay, and
 analysis projection remain success-only and continue to require
-`materialization_result=verified` and `cleanup_state=removed`. Task 8 makes no
-production schema change to `experiment_receipts.py`.
+`materialization_result=verified` and `cleanup_state=removed`. The Task 8
+binding keeps that receipt schema unchanged but supersedes the earlier
+implementation restriction: static-graph validation in
+`experiment_receipts.py` must independently recompute all seven canonical
+static-evidence digests.
 
 If final cleanup cannot safely remove every owned entry, construct no
 `PreflightReceipt`. The public result retains every already completed,
@@ -1315,13 +1318,15 @@ applies to a harness home: descendants created before
 an ordinary partial-return failure with a non-empty home requires whole-tree
 preservation, while a non-`Exception` interruption produces no public result.
 
-Task 8 modifies and tests `experiment_plan.py` and creates the orchestrator.
-`tests/test_live_eval_experiment_receipts.py` may require fixture updates for
-the amended `PilotInvocationPlan`, but production
-`experiment_receipts.py` is unchanged. Source-trust receipts remain one per
-task, snapshot receipts remain one per task rather than one per condition,
-and pilot invocation plans remain one per scheduled condition with stable
-content/policy bindings rather than local baseline identities.
+Task 8 modifies and tests `experiment_plan.py`, updates static-graph
+validation in `experiment_receipts.py`, and creates the orchestrator. The
+public receipt schema and `validate_static_receipt_graph()` signature remain
+unchanged. Source-trust receipts remain one per task, snapshot receipts remain
+one per task rather than one per condition, and pilot invocation plans remain
+one per scheduled condition with stable content/policy bindings rather than
+local baseline identities. Exact Task 8 digest documents, result masks, and
+acquisition linearization are normative in
+`2026-07-23-harness-experiment-task8-binding.md`.
 
 ## 12. Required TDD and checkpoint
 

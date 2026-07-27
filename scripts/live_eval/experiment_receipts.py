@@ -20,6 +20,7 @@ from scripts.live_eval.experiment_plan import (
     analyze_pairs,
     build_analysis_contract,
     build_experiment_plan,
+    derive_static_evidence_digests,
     experiment_input_bytes,
     freeze_json_value,
     load_experiment_input,
@@ -1098,6 +1099,7 @@ def _validate_static_receipt_graph(
     verified_input = load_experiment_input(authoritative)
     if not _exact_projection_matches(experiment_input, verified_input):
         _raise_receipt_invalid()
+    static_digests = derive_static_evidence_digests(experiment_input)
 
     sources = _receipt_sequence(
         source_trust_receipts,
@@ -1120,7 +1122,7 @@ def _validate_static_receipt_graph(
         corpus_receipt,
     )
     if any(
-        receipt.input_digest != experiment_input.input_digest
+        receipt.input_digest != verified_input.input_digest
         for receipt in all_receipts
     ):
         _raise_receipt_invalid()
@@ -1129,7 +1131,7 @@ def _validate_static_receipt_graph(
     if len({receipt.receipt_digest for receipt in snapshots}) != 4:
         _raise_receipt_invalid()
 
-    candidates = tuple(experiment_input.value["candidates"])
+    candidates = tuple(verified_input.value["candidates"])
     task_ids = tuple(candidate["task_id"] for candidate in candidates)
     for candidate, source, snapshot in zip(
         candidates, sources, snapshots
@@ -1159,9 +1161,17 @@ def _validate_static_receipt_graph(
     if (
         tuple(selection_payload["selected_task_ids"]) != task_ids
         or selection_payload["selection_rule"]
-        != experiment_input.value["selection_rule"]
+        != verified_input.value["selection_rule"]
+        or selection_payload["candidate_set_digest"]
+        != static_digests.candidate_set_digest
+        or selection_payload["selection_seed_digest"]
+        != static_digests.selection_seed_digest
+        or selection_payload["pilot_schedule_digest"]
+        != static_digests.pilot_schedule_digest
         or corpus_payload["candidate_set_digest"]
         != selection_payload["candidate_set_digest"]
+        or corpus_payload["candidate_set_digest"]
+        != static_digests.candidate_set_digest
         or corpus_payload["selection_receipt_digest"]
         != selection_receipt.receipt_digest
         or tuple(
@@ -1174,6 +1184,14 @@ def _validate_static_receipt_graph(
         != tuple(candidate["validator_digest"] for candidate in candidates)
         or tuple(corpus_payload["assertion_digests"])
         != tuple(candidate["assertion_digest"] for candidate in candidates)
+        or corpus_payload["qualification_digest"]
+        != static_digests.qualification_digest
+        or corpus_payload["reference_result_digest"]
+        != static_digests.reference_result_digest
+        or corpus_payload["mutation_sensitivity_digest"]
+        != static_digests.mutation_sensitivity_digest
+        or corpus_payload["difficulty_assignment_digest"]
+        != static_digests.difficulty_assignment_digest
     ):
         _raise_receipt_invalid()
 
