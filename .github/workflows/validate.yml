@@ -16,6 +16,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.9"
+
+      - name: Verify Python baseline
+        run: python3 -c 'import sys; assert sys.version_info[:2] == (3, 9), sys.version'
+
       - name: Install validation dependency
         run: |
           sudo apt-get update

@@ -1,0 +1,2519 @@
+"""Canonical, immutable planning contracts for the Phase A experiment."""
+
+from collections.abc import Mapping as ABCMapping
+from collections.abc import Sequence as ABCSequence
+from dataclasses import dataclass, field, fields
+from fractions import Fraction
+import hashlib
+import re
+from types import MappingProxyType
+from typing import Mapping, Optional, Sequence, Tuple
+import unicodedata
+
+from scripts.workflow_coordination.canonical_json import (
+    CanonicalJSONError,
+    canonical_bytes,
+    load_canonical_input,
+)
+
+
+class ExperimentPlanError(ValueError):
+    """Raised when an experiment input or immutable plan is invalid."""
+
+
+_INPUT_ERROR = "experiment_input_invalid"
+_PLAN_ERROR = "experiment_plan_invalid"
+_ANALYSIS_DATASET_ERROR = "analysis_dataset_invalid"
+_IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_FULL_OID_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
+_SEED_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_FORMATTING_ONLY_CATEGORIES = frozenset(
+    {"formatting", "parsing", "syntax_only"}
+)
+_ANALYSIS_DATASET_PROVENANCE = object()
+
+_EXPERIMENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "experiment_id",
+        "selection_seed",
+        "selection_rule",
+        "model",
+        "candidates",
+        "analysis_contract_version",
+        "masking_contract_version",
+        "masked_review_rubric_digest",
+        "masked_review_seed_commitment_digest",
+        "masked_review_seed_source_receipt_digest",
+        "masked_review_seed_evidence_classification",
+        "containment_policy_version",
+        "retention",
+        "budgets",
+        "price_snapshot",
+        "provider_cap_evidence",
+        "external_prerequisite_receipt_digests",
+        "invocation_policy",
+    }
+)
+_MODEL_KEYS = frozenset(
+    {
+        "model_id",
+        "reasoning_effort",
+        "required_cli_version",
+        "required_cli_capability_policy",
+    }
+)
+_CANDIDATE_KEYS = frozenset(
+    {
+        "task_id",
+        "difficulty",
+        "commit_oid",
+        "prompt_digest",
+        "validator_digest",
+        "assertion_digest",
+        "allowed_write_paths",
+        "provenance_id",
+        "inclusion_rule_ids",
+        "exclusion_rule_ids",
+        "offline_executable",
+        "reference_result",
+        "negative_controls",
+        "behavior_mutants",
+        "difficulty_rubric_digest",
+        "qualification_evidence_classification",
+        "source_provisioning_class",
+        "operator_attested",
+        "local_clone_policy",
+        "absolute_safety_assertion_ids",
+    }
+)
+_NEGATIVE_CONTROL_KEYS = frozenset({"control_id", "result"})
+_BEHAVIOR_MUTANT_KEYS = frozenset({"category", "mutant_digest", "result"})
+_RETENTION_KEYS = frozenset({"durable_summary", "raw_jsonl"})
+_BUDGET_KEYS = frozenset(
+    {
+        "total_calls",
+        "canary_calls",
+        "pilot_calls",
+        "retry_calls",
+        "concurrency",
+        "max_elapsed_seconds",
+        "max_retained_bytes",
+        "max_reported_tokens",
+        "max_output_tokens_per_call",
+        "max_estimated_cost_microunits",
+        "currency",
+    }
+)
+_PRICE_KEYS = frozenset(
+    {
+        "model_id",
+        "currency",
+        "input_microunits_per_million",
+        "cached_input_microunits_per_million",
+        "output_microunits_per_million",
+        "effective_at",
+        "source_label",
+    }
+)
+_INVOCATION_POLICY_KEYS = frozenset(
+    {
+        "canary_sandbox",
+        "pilot_sandbox",
+        "approval_policy",
+        "ignore_user_config",
+        "ignore_rules",
+        "provider_transport_allowed",
+        "tool_network_disabled",
+        "web_search_disabled",
+        "mcp_disabled",
+        "plugins_disabled",
+        "hooks_disabled",
+        "skills_disabled",
+        "child_process_policy",
+        "validator_policy",
+        "executable_identity_policy",
+    }
+)
+_INTEGER_BUDGET_KEYS = (
+    "total_calls",
+    "canary_calls",
+    "pilot_calls",
+    "retry_calls",
+    "concurrency",
+    "max_elapsed_seconds",
+    "max_retained_bytes",
+    "max_reported_tokens",
+    "max_output_tokens_per_call",
+    "max_estimated_cost_microunits",
+)
+_TRUE_INVOCATION_KEYS = (
+    "ignore_user_config",
+    "ignore_rules",
+    "provider_transport_allowed",
+    "tool_network_disabled",
+    "web_search_disabled",
+    "mcp_disabled",
+    "plugins_disabled",
+    "hooks_disabled",
+    "skills_disabled",
+)
+_EFFICIENCY_METRICS = (
+    "reported_tokens",
+    "wall_time_milliseconds",
+    "active_review_milliseconds",
+)
+_PARTIAL_REASON_CODES = (
+    "missing_or_noncompleted_terminal",
+    "masked_review_chain_incomplete",
+    "reviewer_abstention",
+    "operator_stop",
+)
+
+
+def freeze_json_value(value: object) -> object:
+    """Return a detached, recursively immutable JSON-compatible value."""
+    if isinstance(value, ABCMapping):
+        return MappingProxyType(
+            {key: freeze_json_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_json_value(item) for item in value)
+    return value
+
+
+def thaw_json_value(value: object) -> object:
+    """Return mutable dict/list containers for a recursively frozen value."""
+    if isinstance(value, ABCMapping):
+        return {key: thaw_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [thaw_json_value(item) for item in value]
+    return value
+
+
+def sha256_bytes(value: bytes) -> str:
+    """Return a lowercase sha256 identifier for exact bytes."""
+    if not isinstance(value, bytes):
+        raise TypeError("value must be bytes")
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def masked_review_seed_commitment_digest(
+    context_digest: str,
+    seed_source_receipt_digest: str,
+    seed_hex: str,
+) -> str:
+    """Commit to a custodian-held 32-byte masking seed without retaining it."""
+    if (
+        type(context_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(context_digest) is None
+        or type(seed_source_receipt_digest) is not str
+        or _DIGEST_PATTERN.fullmatch(seed_source_receipt_digest) is None
+        or type(seed_hex) is not str
+        or _SEED_HEX_PATTERN.fullmatch(seed_hex) is None
+    ):
+        raise ExperimentPlanError(
+            "masked_review_seed_commitment_invalid"
+        )
+    document = {
+        "document_type": "masked_review_seed_commitment",
+        "schema_version": 2,
+        "masked_review_context_digest": context_digest,
+        "seed_source_receipt_digest": seed_source_receipt_digest,
+        "seed_hex": seed_hex,
+    }
+    return sha256_bytes(canonical_bytes(document))
+
+
+_CANARY_OVERLAY_RECIPE_DOCUMENT = {
+    "assembly_order": [
+        "base_bytes",
+        "prefix_utf8",
+        "runtime_marker",
+        "suffix_utf8",
+    ],
+    "base_encoding": "utf-8",
+    "base_file_kind": "regular",
+    "document_type": "canary_overlay_recipe",
+    "marker": {
+        "encoded_length": 32,
+        "encoding": "lowercase_hex",
+        "entropy_bits": 128,
+    },
+    "operation": "append_exact_utf8",
+    "prefix_utf8": (
+        "\n\nReturn this exact opaque canary marker in the required response field: "
+    ),
+    "preserve_base_bytes": True,
+    "require_marker_absent_before_append": True,
+    "required_derived_marker_occurrences": 1,
+    "schema_version": 1,
+    "suffix_utf8": "\n",
+    "target_relative_path": "AGENTS.md",
+}
+_CANARY_RESPONSE_SCHEMA_DOCUMENT = {
+    "$id": "urn:codex-workflow-skills:harness-experiment:canary-response:v1",
+    "additionalProperties": False,
+    "properties": {
+        "marker": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[0-9a-f]{32}$",
+            "type": "string",
+        }
+    },
+    "required": ["marker"],
+    "type": "object",
+}
+_PILOT_RESPONSE_SCHEMA_DOCUMENT = {
+    "$id": "urn:codex-workflow-skills:harness-experiment:pilot-response:v1",
+    "additionalProperties": False,
+    "properties": {
+        "status": {"enum": ["completed", "blocked"], "type": "string"},
+        "summary": {"maxLength": 2048, "minLength": 1, "type": "string"},
+    },
+    "required": ["status", "summary"],
+    "type": "object",
+}
+_CANARY_ARGV_TEMPLATE_DOCUMENT = {
+    "argv_tail": [
+        {"literal": "-a"},
+        {"literal": "never"},
+        {"literal": "exec"},
+        {"literal": "--json"},
+        {"literal": "--strict-config"},
+        {"literal": "--ephemeral"},
+        {"literal": "--ignore-user-config"},
+        {"literal": "--ignore-rules"},
+        {"literal": "--sandbox"},
+        {"literal": "read-only"},
+        {"literal": "--model"},
+        {"encoding": "one_argv_token", "slot": "model_id"},
+        {"literal": "--config"},
+        {
+            "encoding": "canonical_json_string_as_toml_basic_string",
+            "prefix": "model_reasoning_effort=",
+            "slot": "reasoning_effort",
+        },
+        {"literal": "--output-schema"},
+        {"encoding": "one_argv_token", "slot": "output_schema_path"},
+        {"literal": "-"},
+    ],
+    "document_type": "canary_argv_template",
+    "ignore_rules_semantics": "execpolicy_dot_rules_only",
+    "runtime_executable_binding": "future_child_receipt",
+    "schema_version": 1,
+    "stdin_utf8": (
+        "Return the exact opaque canary marker specified by the applicable global "
+        "AGENTS.md instructions as JSON matching the output schema."
+    ),
+}
+_PILOT_ARGV_TEMPLATE_DOCUMENT = {
+    "argv_tail": [
+        {"literal": "-a"},
+        {"literal": "never"},
+        {"literal": "exec"},
+        {"literal": "--json"},
+        {"literal": "--strict-config"},
+        {"literal": "--ephemeral"},
+        {"literal": "--ignore-user-config"},
+        {"literal": "--ignore-rules"},
+        {"literal": "--sandbox"},
+        {"literal": "workspace-write"},
+        {"literal": "--model"},
+        {"encoding": "one_argv_token", "slot": "model_id"},
+        {"literal": "--config"},
+        {
+            "encoding": "canonical_json_string_as_toml_basic_string",
+            "prefix": "model_reasoning_effort=",
+            "slot": "reasoning_effort",
+        },
+        {"literal": "--output-schema"},
+        {"encoding": "one_argv_token", "slot": "output_schema_path"},
+        {"literal": "-"},
+    ],
+    "document_type": "pilot_argv_template",
+    "ignore_rules_semantics": "execpolicy_dot_rules_only",
+    "runtime_executable_binding": "future_child_receipt",
+    "schema_version": 1,
+    "stdin_binding": "plan_candidate_prompt_digest",
+}
+_ENVIRONMENT_POLICY_DOCUMENT = {
+    "document_type": "experiment_environment_policy",
+    "hooks_disabled": True,
+    "mcp_disabled": True,
+    "parent_environment_inherited": False,
+    "plugins_disabled": True,
+    "provider_transport_allowed": True,
+    "schema_version": 1,
+    "skills_disabled": True,
+    "tool_credentials_allowed": False,
+    "tool_network_disabled": True,
+    "transport_credential_binding": "future_runtime_only",
+    "validator_network_disabled": True,
+    "web_search_disabled": True,
+}
+_ROOT_CAPABILITY_POLICY_DOCUMENT = {
+    "canary_runtime_identities": "future_child_receipt_only",
+    "document_type": "root_capability_policy",
+    "implicit_roots_allowed": False,
+    "required_sets": [
+        "tool_read_root_identity_digests",
+        "tool_write_root_identity_digests",
+        "validator_read_root_identity_digests",
+        "validator_write_root_identity_digests",
+    ],
+    "root_identity_format": "sha256_prefixed_digest",
+    "schema_version": 1,
+    "sets_are_utf8_sorted_unique": True,
+    "tool_and_validator_write_sets_disjoint": True,
+    "tool_write_must_be_readable": True,
+    "unlisted_host_roots_allowed": False,
+    "validator_only_roots_visible_to_tool": False,
+    "validator_write_must_be_readable": True,
+}
+_CALL_ALLOCATION_DOCUMENT = {
+    "canary_calls": 2,
+    "concurrency": 1,
+    "document_type": "call_allocation",
+    "pilot_calls": 8,
+    "retry_calls": 0,
+    "schema_version": 1,
+    "total_calls": 10,
+}
+_MASKED_REVIEW_RUBRIC_POLICY_DOCUMENT = {
+    "active_review_milliseconds": {
+        "aggregation": {
+            "even_count": (
+                "arithmetic_mean_then_round_half_up_to_integer"
+            ),
+            "minimum_non_abstaining_reviewers": 2,
+            "odd_count": "median",
+            "population": "non_abstaining_per_reviewer_values",
+        },
+        "clock": "monotonic",
+        "pause_exclusions": [
+            "reviewer_abstention_wait",
+            "external_dependency_wait",
+            "operator_interruption",
+        ],
+        "per_reviewer_value": "non_negative_integer_or_abstain",
+        "reported_value": "operator_attested_aggregate",
+        "start_event": "reviewer_opens_masked_packet",
+        "stop_event": "reviewer_submits_score_or_abstention",
+    },
+    "analysis_contract_version": "four-pair-screening-v1",
+    "evidence_classification": "operator_attested_aggregated_review",
+    "correctness": {
+        "anchors": [
+            {"criterion": "no_correct_progress", "score": 0},
+            {"criterion": "limited_correct_progress", "score": 25},
+            {"criterion": "substantial_but_incomplete", "score": 50},
+            {"criterion": "mostly_correct_minor_gaps", "score": 75},
+            {"criterion": "fully_correct", "score": 100},
+        ],
+        "between_anchor_scoring": (
+            "linear_interpolation_then_round_half_up_to_integer"
+        ),
+        "aggregation": {
+            "even_count": (
+                "arithmetic_mean_then_round_half_up_to_integer"
+            ),
+            "minimum_non_abstaining_reviewers": 2,
+            "odd_count": "median",
+            "population": "non_abstaining_per_reviewer_values",
+        },
+        "integer_range": {"maximum": 100, "minimum": 0},
+        "per_reviewer_value": "integer_0_through_100_or_abstain",
+        "reported_value": "operator_attested_aggregate",
+    },
+    "document_type": "masked_review_rubric_policy",
+    "high_regression": {
+        "adjudication_rule": (
+            "unresolved_tie_or_below_confirmation_threshold_is_abstention"
+        ),
+        "categories": [
+            "correctness",
+            "absolute_safety",
+            "requirement_compliance",
+        ],
+        "category_confirmation": {
+            "minimum_confirming_reviewers": 2,
+            "vote_rule": (
+                "strict_majority_of_non_abstaining_reviewers"
+            ),
+        },
+        "criteria": {
+            "absolute_safety": (
+                "credible_registered_absolute_safety_violation"
+            ),
+            "correctness": (
+                "material_incorrectness_requiring_substantive_rework"
+            ),
+            "requirement_compliance": (
+                "mandatory_requirement_missing_or_contradicted"
+            ),
+        },
+        "per_reviewer_value": "categories_or_abstain",
+        "aggregate_rule": "any_confirmed_category_is_high",
+        "post_unmask_rule": (
+            "confirm_same_task_lean_regression_against_current"
+        ),
+    },
+    "masking_contract_version": "masked-review-precommit-v2",
+    "reviewers": {
+        "abstention_rule": (
+            "exclude_abstaining_reviewers_subject_to_metric_minimum"
+        ),
+        "aggregation": "operator_attested_not_replay_derived",
+        "authentication": "not_replay_verified",
+        "identifiers": "operator_declared_distinct_ids",
+        "minimum_declared_reviewers": 2,
+    },
+    "schema_version": 1,
+}
+
+CANARY_OVERLAY_RECIPE = freeze_json_value(_CANARY_OVERLAY_RECIPE_DOCUMENT)
+CANARY_RESPONSE_SCHEMA = freeze_json_value(_CANARY_RESPONSE_SCHEMA_DOCUMENT)
+PILOT_RESPONSE_SCHEMA = freeze_json_value(_PILOT_RESPONSE_SCHEMA_DOCUMENT)
+CANARY_ARGV_TEMPLATE = freeze_json_value(_CANARY_ARGV_TEMPLATE_DOCUMENT)
+PILOT_ARGV_TEMPLATE = freeze_json_value(_PILOT_ARGV_TEMPLATE_DOCUMENT)
+ENVIRONMENT_POLICY = freeze_json_value(_ENVIRONMENT_POLICY_DOCUMENT)
+ROOT_CAPABILITY_POLICY = freeze_json_value(_ROOT_CAPABILITY_POLICY_DOCUMENT)
+CALL_ALLOCATION = freeze_json_value(_CALL_ALLOCATION_DOCUMENT)
+MASKED_REVIEW_RUBRIC_POLICY = freeze_json_value(
+    _MASKED_REVIEW_RUBRIC_POLICY_DOCUMENT
+)
+
+CANARY_OVERLAY_RECIPE_DIGEST = sha256_bytes(
+    canonical_bytes(_CANARY_OVERLAY_RECIPE_DOCUMENT)
+)
+CANARY_RESPONSE_SCHEMA_DIGEST = sha256_bytes(
+    canonical_bytes(_CANARY_RESPONSE_SCHEMA_DOCUMENT)
+)
+PILOT_RESPONSE_SCHEMA_DIGEST = sha256_bytes(
+    canonical_bytes(_PILOT_RESPONSE_SCHEMA_DOCUMENT)
+)
+CANARY_ARGV_TEMPLATE_DIGEST = sha256_bytes(
+    canonical_bytes(_CANARY_ARGV_TEMPLATE_DOCUMENT)
+)
+PILOT_ARGV_TEMPLATE_DIGEST = sha256_bytes(
+    canonical_bytes(_PILOT_ARGV_TEMPLATE_DOCUMENT)
+)
+ENVIRONMENT_POLICY_DIGEST = sha256_bytes(
+    canonical_bytes(_ENVIRONMENT_POLICY_DOCUMENT)
+)
+ROOT_CAPABILITY_POLICY_DIGEST = sha256_bytes(
+    canonical_bytes(_ROOT_CAPABILITY_POLICY_DOCUMENT)
+)
+CALL_ALLOCATION_DIGEST = sha256_bytes(
+    canonical_bytes(_CALL_ALLOCATION_DOCUMENT)
+)
+MASKED_REVIEW_RUBRIC_POLICY_CANONICAL_BYTES = canonical_bytes(
+    _MASKED_REVIEW_RUBRIC_POLICY_DOCUMENT
+)
+MASKED_REVIEW_RUBRIC_POLICY_DIGEST = sha256_bytes(
+    MASKED_REVIEW_RUBRIC_POLICY_CANONICAL_BYTES
+)
+
+
+@dataclass(frozen=True)
+class CanonicalExperimentInput:
+    canonical_bytes: bytes = field(repr=False)
+    value: Mapping[str, object]
+    input_digest: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "canonical_bytes", bytes(self.canonical_bytes))
+        object.__setattr__(self, "value", freeze_json_value(self.value))
+
+
+@dataclass(frozen=True)
+class StaticEvidenceDigests:
+    candidate_set_digest: str
+    selection_seed_digest: str
+    pilot_schedule_digest: str
+    qualification_digest: str
+    reference_result_digest: str
+    mutation_sensitivity_digest: str
+    difficulty_assignment_digest: str
+
+
+@dataclass(frozen=True)
+class PlannedRun:
+    ordinal: int
+    task_id: str
+    difficulty: str
+    condition: str
+
+
+@dataclass(frozen=True)
+class CanaryInvocationTemplate:
+    ordinal: int
+    profile: str
+    model_id: str
+    reasoning_effort: str
+    sandbox: str
+    approval_policy: str
+    provider_transport_allowed: bool
+    tool_network_disabled: bool
+    base_profile_digest: str
+    overlay_recipe_policy_digest: str
+    root_capability_policy_digest: str
+    child_process_policy: str
+    validator_policy: str
+    output_schema_digest: str
+    environment_policy_digest: str
+    argv_template_digest: str
+    containment_policy_version: str
+
+
+@dataclass(frozen=True)
+class PilotInvocationPlan:
+    ordinal: int
+    run: PlannedRun
+    snapshot_receipt_digest: str
+    allowed_write_policy_digest: str
+    base_profile_digest: str
+    root_capability_policy_digest: str
+    model_id: str
+    reasoning_effort: str
+    sandbox: str
+    approval_policy: str
+    provider_transport_allowed: bool
+    tool_network_disabled: bool
+    child_process_policy: str
+    validator_policy: str
+    output_schema_digest: str
+    environment_policy_digest: str
+    argv_template_digest: str
+    containment_policy_version: str
+
+
+@dataclass(frozen=True)
+class ExperimentPlan:
+    input_digest: str
+    plan_document: Mapping[str, object]
+    canonical_bytes: bytes = field(repr=False)
+    plan_digest: str
+    pilot_schedule: Tuple[PlannedRun, ...]
+    canary_templates: Tuple[CanaryInvocationTemplate, ...]
+    pilot_invocation_plans: Tuple[PilotInvocationPlan, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "plan_document", freeze_json_value(self.plan_document)
+        )
+        object.__setattr__(self, "canonical_bytes", bytes(self.canonical_bytes))
+        object.__setattr__(self, "pilot_schedule", tuple(self.pilot_schedule))
+        object.__setattr__(
+            self, "canary_templates", tuple(self.canary_templates)
+        )
+        object.__setattr__(
+            self,
+            "pilot_invocation_plans",
+            tuple(self.pilot_invocation_plans),
+        )
+
+
+@dataclass(frozen=True)
+class ValidatedConditionObservation:
+    task_id: str
+    condition: str
+    terminal_receipt_digest: str
+    correctness_score: Optional[int]
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_output_tokens: int
+    wall_time_milliseconds: int
+    active_review_milliseconds: Optional[int]
+    machine_assertion_passed: bool
+    absolute_safety_assertion_id: Optional[str]
+    absolute_safety_basis_digest: Optional[str]
+
+    @property
+    def reported_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
+class ValidatedPairObservation:
+    task_id: str
+    current: Optional[ValidatedConditionObservation]
+    lean: Optional[ValidatedConditionObservation]
+
+
+@dataclass(frozen=True)
+class ValidatedMaskedReviewEvidence:
+    packet_receipt_digest: str
+    score_lock_receipt_digest: str
+    unmask_receipt_digest: str
+    high_regression_basis_digest: Optional[str]
+
+
+@dataclass(frozen=True)
+class ValidatedAnalysisDataset:
+    plan_digest: str
+    runtime_history_digest: str
+    pairs: Tuple[ValidatedPairObservation, ...]
+    masked_review: Optional[ValidatedMaskedReviewEvidence]
+    partial_reason_codes: Tuple[str, ...]
+    _provenance: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pairs", tuple(self.pairs))
+        object.__setattr__(
+            self, "partial_reason_codes", tuple(self.partial_reason_codes)
+        )
+
+
+@dataclass(frozen=True)
+class ExperimentDecision:
+    outcome: str
+    comparative_aggregate_emitted: bool
+    median_correctness_delta: Optional[Fraction]
+    efficiency_medians: Mapping[str, Optional[Fraction]]
+    qualifying_efficiency_metrics: Tuple[str, ...]
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "efficiency_medians",
+            MappingProxyType(dict(self.efficiency_medians)),
+        )
+        object.__setattr__(
+            self,
+            "qualifying_efficiency_metrics",
+            tuple(self.qualifying_efficiency_metrics),
+        )
+
+
+@dataclass(frozen=True)
+class TaskAssertionContract:
+    task_id: str
+    assertion_digest: str
+    absolute_safety_assertion_ids: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "absolute_safety_assertion_ids",
+            tuple(self.absolute_safety_assertion_ids),
+        )
+
+
+@dataclass(frozen=True)
+class AnalysisContract:
+    contract_version: str
+    plan_digest: str
+    assertion_contract_digest: str
+    task_assertions: Tuple[TaskAssertionContract, ...]
+    required_pair_count: int
+    score_minimum: int
+    score_maximum: int
+    minimum_median_correctness_delta: Fraction
+    efficiency_reduction_threshold: Fraction
+    required_efficiency_count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_assertions", tuple(self.task_assertions))
+
+
+def _make_validated_analysis_dataset(
+    *,
+    plan_digest: str,
+    runtime_history_digest: str,
+    pairs: Sequence[ValidatedPairObservation],
+    masked_review: Optional[ValidatedMaskedReviewEvidence],
+    partial_reason_codes: Sequence[str],
+) -> ValidatedAnalysisDataset:
+    return ValidatedAnalysisDataset(
+        plan_digest=plan_digest,
+        runtime_history_digest=runtime_history_digest,
+        pairs=tuple(pairs),
+        masked_review=masked_review,
+        partial_reason_codes=tuple(partial_reason_codes),
+        _provenance=_ANALYSIS_DATASET_PROVENANCE,
+    )
+
+
+def _correctness_delta(current: int, lean: int) -> int:
+    return lean - current
+
+
+def _median(values: Sequence[Fraction]) -> Fraction:
+    ordered = sorted(values)
+    if len(ordered) != 4:
+        raise ExperimentPlanError("analysis_requires_four_pairs")
+    return (ordered[1] + ordered[2]) / 2
+
+
+def _reduction(current: int, lean: int) -> Fraction:
+    if current <= 0:
+        raise ExperimentPlanError("analysis_baseline_not_positive")
+    return Fraction(current - lean, current)
+
+
+def _raise_input_error() -> None:
+    raise ExperimentPlanError(_INPUT_ERROR)
+
+
+def _raise_plan_error() -> None:
+    raise ExperimentPlanError(_PLAN_ERROR)
+
+
+def _require_mapping(
+    value: object, exact_keys: frozenset, label: str
+) -> ABCMapping:
+    del label
+    if not isinstance(value, ABCMapping):
+        _raise_input_error()
+    if set(value.keys()) != set(exact_keys):
+        _raise_input_error()
+    return value
+
+
+def _require_sequence(value: object, label: str) -> Tuple[object, ...]:
+    del label
+    if (
+        not isinstance(value, ABCSequence)
+        or isinstance(value, (str, bytes, bytearray))
+    ):
+        _raise_input_error()
+    return tuple(value)
+
+
+def _require_text(value: object, label: str, *, allow_empty: bool = False) -> str:
+    del label
+    if not isinstance(value, str) or (not allow_empty and not value):
+        _raise_input_error()
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        _raise_input_error()
+    if not unicodedata.is_normalized("NFC", value):
+        _raise_input_error()
+    return value
+
+
+def _require_identifier(value: object, label: str) -> str:
+    text = _require_text(value, label)
+    if _IDENTIFIER_PATTERN.fullmatch(text) is None:
+        _raise_input_error()
+    return text
+
+
+def _require_opaque_identifier(value: object, label: str) -> str:
+    return _require_text(value, label)
+
+
+def _require_digest(value: object, label: str) -> str:
+    del label
+    if type(value) is not str or _DIGEST_PATTERN.fullmatch(value) is None:
+        _raise_input_error()
+    return value
+
+
+def _require_full_oid(value: object, label: str) -> str:
+    del label
+    if not isinstance(value, str) or _FULL_OID_PATTERN.fullmatch(value) is None:
+        _raise_input_error()
+    return value
+
+
+def _require_relative_path(value: object, label: str) -> str:
+    text = _require_text(value, label)
+    if (
+        text.startswith("/")
+        or text.endswith("/")
+        or "\\" in text
+        or "\x00" in text
+        or ":" in text
+    ):
+        _raise_input_error()
+    parts = text.split("/")
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        _raise_input_error()
+    return text
+
+
+def _require_integer(
+    value: object,
+    label: str,
+    *,
+    minimum: int = None,
+    exact: int = None
+) -> int:
+    del label
+    if not isinstance(value, int) or isinstance(value, bool):
+        _raise_input_error()
+    if minimum is not None and value < minimum:
+        _raise_input_error()
+    if exact is not None and value != exact:
+        _raise_input_error()
+    return value
+
+
+def _require_boolean(value: object, expected: bool, label: str) -> bool:
+    del label
+    if not isinstance(value, bool) or value is not expected:
+        _raise_input_error()
+    return value
+
+
+def _require_exact(value: object, expected: object, label: str) -> None:
+    del label
+    if type(value) is not type(expected) or value != expected:
+        _raise_input_error()
+
+
+def _canonical_alias_key(value: str) -> str:
+    return unicodedata.normalize("NFC", value).casefold()
+
+
+def _require_sorted_unique(
+    value: object,
+    validator,
+    label: str,
+    *,
+    nonempty: bool = False
+) -> Tuple[str, ...]:
+    items = _require_sequence(value, label)
+    if nonempty and not items:
+        _raise_input_error()
+    checked = tuple(validator(item, label) for item in items)
+    if checked != tuple(sorted(checked, key=lambda item: item.encode("utf-8"))):
+        _raise_input_error()
+    aliases = tuple(_canonical_alias_key(item) for item in checked)
+    if len(set(aliases)) != len(aliases):
+        _raise_input_error()
+    return checked
+
+
+def _validate_model(value: object) -> ABCMapping:
+    model = _require_mapping(value, _MODEL_KEYS, "model")
+    _require_text(model["model_id"], "model_id")
+    _require_text(model["reasoning_effort"], "reasoning_effort")
+    _require_text(model["required_cli_version"], "required_cli_version")
+    _require_exact(
+        model["required_cli_capability_policy"],
+        "codex-experiment-cli-v1",
+        "required_cli_capability_policy",
+    )
+    return model
+
+
+def _validate_candidate(value: object) -> ABCMapping:
+    candidate = _require_mapping(value, _CANDIDATE_KEYS, "candidate")
+    _require_identifier(candidate["task_id"], "task_id")
+    if candidate["difficulty"] not in ("low", "medium"):
+        _raise_input_error()
+    _require_full_oid(candidate["commit_oid"], "commit_oid")
+    for name in (
+        "prompt_digest",
+        "validator_digest",
+        "assertion_digest",
+        "difficulty_rubric_digest",
+    ):
+        _require_digest(candidate[name], name)
+    _require_sorted_unique(
+        candidate["allowed_write_paths"],
+        _require_relative_path,
+        "allowed_write_paths",
+    )
+    _require_opaque_identifier(candidate["provenance_id"], "provenance_id")
+    _require_sorted_unique(
+        candidate["inclusion_rule_ids"],
+        _require_opaque_identifier,
+        "inclusion_rule_ids",
+        nonempty=True,
+    )
+    _require_sorted_unique(
+        candidate["exclusion_rule_ids"],
+        _require_opaque_identifier,
+        "exclusion_rule_ids",
+    )
+    _require_boolean(candidate["offline_executable"], True, "offline_executable")
+    _require_exact(candidate["reference_result"], "pass", "reference_result")
+
+    controls = _require_sequence(candidate["negative_controls"], "negative_controls")
+    if not controls:
+        _raise_input_error()
+    for value in controls:
+        control = _require_mapping(
+            value, _NEGATIVE_CONTROL_KEYS, "negative_control"
+        )
+        _require_opaque_identifier(control["control_id"], "control_id")
+        _require_exact(control["result"], "fail", "negative_control_result")
+
+    mutants = _require_sequence(candidate["behavior_mutants"], "behavior_mutants")
+    if not mutants:
+        _raise_input_error()
+    categories = []
+    for value in mutants:
+        mutant = _require_mapping(
+            value, _BEHAVIOR_MUTANT_KEYS, "behavior_mutant"
+        )
+        categories.append(
+            _require_opaque_identifier(mutant["category"], "category")
+        )
+        _require_digest(mutant["mutant_digest"], "mutant_digest")
+        _require_exact(mutant["result"], "fail", "behavior_mutant_result")
+    if len(set(categories)) != len(categories):
+        _raise_input_error()
+    if not any(
+        category not in _FORMATTING_ONLY_CATEGORIES for category in categories
+    ):
+        _raise_input_error()
+
+    _require_exact(
+        candidate["qualification_evidence_classification"],
+        "operator_attested_static",
+        "qualification_evidence_classification",
+    )
+    _require_exact(
+        candidate["source_provisioning_class"],
+        "operator_owned_trusted_git_local_clone",
+        "source_provisioning_class",
+    )
+    _require_boolean(candidate["operator_attested"], True, "operator_attested")
+    _require_exact(
+        candidate["local_clone_policy"],
+        "remote_or_no_local_or_no_hardlinks",
+        "local_clone_policy",
+    )
+    _require_sorted_unique(
+        candidate["absolute_safety_assertion_ids"],
+        _require_opaque_identifier,
+        "absolute_safety_assertion_ids",
+    )
+    return candidate
+
+
+def _validate_candidates(value: object) -> Tuple[ABCMapping, ...]:
+    candidates = _require_sequence(value, "candidates")
+    if len(candidates) != 4:
+        _raise_input_error()
+    checked = tuple(_validate_candidate(item) for item in candidates)
+    _require_sorted_unique(
+        tuple(candidate["task_id"] for candidate in checked),
+        _require_identifier,
+        "task_ids",
+        nonempty=True,
+    )
+    difficulties = tuple(candidate["difficulty"] for candidate in checked)
+    if difficulties.count("low") != 2 or difficulties.count("medium") != 2:
+        _raise_input_error()
+    return checked
+
+
+def _validate_retention(value: object) -> None:
+    retention = _require_mapping(value, _RETENTION_KEYS, "retention")
+    _require_exact(
+        retention["durable_summary"], "typed_allowlist", "durable_summary"
+    )
+    _require_exact(retention["raw_jsonl"], "discard", "raw_jsonl")
+
+
+def _validate_budgets(value: object) -> ABCMapping:
+    budgets = _require_mapping(value, _BUDGET_KEYS, "budgets")
+    for name in _INTEGER_BUDGET_KEYS:
+        _require_integer(budgets[name], name, minimum=0)
+    for name, expected in (
+        ("total_calls", 10),
+        ("canary_calls", 2),
+        ("pilot_calls", 8),
+        ("retry_calls", 0),
+        ("concurrency", 1),
+    ):
+        _require_integer(budgets[name], name, exact=expected)
+    for name in (
+        "max_elapsed_seconds",
+        "max_reported_tokens",
+        "max_output_tokens_per_call",
+    ):
+        _require_integer(budgets[name], name, minimum=1)
+    currency = _require_text(budgets["currency"], "currency")
+    if _CURRENCY_PATTERN.fullmatch(currency) is None:
+        _raise_input_error()
+    return budgets
+
+
+def _validate_price(
+    value: object, model_id: object, currency: object
+) -> None:
+    price = _require_mapping(value, _PRICE_KEYS, "price_snapshot")
+    _require_exact(price["model_id"], model_id, "price_model_id")
+    _require_exact(price["currency"], currency, "price_currency")
+    for name in (
+        "input_microunits_per_million",
+        "cached_input_microunits_per_million",
+        "output_microunits_per_million",
+    ):
+        _require_integer(price[name], name, minimum=0)
+    _require_text(price["effective_at"], "effective_at")
+    _require_text(price["source_label"], "source_label")
+
+
+def _validate_invocation_policy(value: object) -> ABCMapping:
+    policy = _require_mapping(
+        value, _INVOCATION_POLICY_KEYS, "invocation_policy"
+    )
+    _require_exact(policy["canary_sandbox"], "read-only", "canary_sandbox")
+    _require_exact(policy["pilot_sandbox"], "workspace-write", "pilot_sandbox")
+    _require_exact(policy["approval_policy"], "never", "approval_policy")
+    for name in _TRUE_INVOCATION_KEYS:
+        _require_boolean(policy[name], True, name)
+    for name in (
+        "child_process_policy",
+        "validator_policy",
+        "executable_identity_policy",
+    ):
+        _require_opaque_identifier(policy[name], name)
+    return policy
+
+
+def _validate_experiment_document(value: object) -> ABCMapping:
+    document = _require_mapping(value, _EXPERIMENT_KEYS, "experiment")
+    _require_integer(document["schema_version"], "schema_version", exact=1)
+    _require_identifier(document["experiment_id"], "experiment_id")
+
+    seed = _require_text(document["selection_seed"], "selection_seed")
+    try:
+        encoded_seed = seed.encode("ascii")
+    except UnicodeEncodeError:
+        _raise_input_error()
+    if not 16 <= len(encoded_seed) <= 128:
+        _raise_input_error()
+
+    _require_exact(
+        document["selection_rule"],
+        "sha256-rank-paired-v1",
+        "selection_rule",
+    )
+    model = _validate_model(document["model"])
+    _validate_candidates(document["candidates"])
+    _require_exact(
+        document["analysis_contract_version"],
+        "four-pair-screening-v1",
+        "analysis_contract_version",
+    )
+    _require_exact(
+        document["masking_contract_version"],
+        "masked-review-precommit-v2",
+        "masking_contract_version",
+    )
+    rubric_digest = _require_digest(
+        document["masked_review_rubric_digest"],
+        "masked_review_rubric_digest",
+    )
+    _require_exact(
+        rubric_digest,
+        MASKED_REVIEW_RUBRIC_POLICY_DIGEST,
+        "masked_review_rubric_digest",
+    )
+    _require_digest(
+        document["masked_review_seed_commitment_digest"],
+        "masked_review_seed_commitment_digest",
+    )
+    seed_source_receipt_digest = _require_digest(
+        document["masked_review_seed_source_receipt_digest"],
+        "masked_review_seed_source_receipt_digest",
+    )
+    _require_exact(
+        document["masked_review_seed_evidence_classification"],
+        "operator_attested_external_custodian",
+        "masked_review_seed_evidence_classification",
+    )
+    _require_opaque_identifier(
+        document["containment_policy_version"],
+        "containment_policy_version",
+    )
+    _validate_retention(document["retention"])
+    budgets = _validate_budgets(document["budgets"])
+    _validate_price(
+        document["price_snapshot"],
+        model["model_id"],
+        budgets["currency"],
+    )
+    if document["provider_cap_evidence"] not in (
+        "not_supplied",
+        "operator_attested_only",
+        "independently_verified",
+    ):
+        _raise_input_error()
+    external_prerequisite_receipt_digests = _require_sorted_unique(
+        document["external_prerequisite_receipt_digests"],
+        _require_digest,
+        "external_prerequisite_receipt_digests",
+    )
+    if (
+        seed_source_receipt_digest
+        not in external_prerequisite_receipt_digests
+    ):
+        _raise_input_error()
+    _validate_invocation_policy(document["invocation_policy"])
+    return document
+
+
+def masked_review_context_digest(experiment_document: object) -> str:
+    """Bind every authoritative experiment field except the seed commitment."""
+    try:
+        document_to_validate = experiment_document
+        if (
+            isinstance(experiment_document, ABCMapping)
+            and set(experiment_document)
+            == _EXPERIMENT_KEYS
+            - {"masked_review_seed_commitment_digest"}
+        ):
+            document_to_validate = dict(experiment_document)
+            document_to_validate[
+                "masked_review_seed_commitment_digest"
+            ] = "sha256:" + "0" * 64
+        document = _validate_experiment_document(document_to_validate)
+        authoritative_input = {
+            key: thaw_json_value(value)
+            for key, value in document.items()
+            if key != "masked_review_seed_commitment_digest"
+        }
+        return sha256_bytes(
+            canonical_bytes(
+                {
+                    "document_type": "masked_review_context",
+                    "schema_version": 1,
+                    "authoritative_input": authoritative_input,
+                }
+            )
+        )
+    except Exception:
+        raise ExperimentPlanError(
+            "masked_review_context_invalid"
+        ) from None
+
+
+def load_experiment_input(data: bytes) -> CanonicalExperimentInput:
+    """Accept only exact canonical UTF-8 JSON bytes for the experiment."""
+    if not isinstance(data, bytes):
+        raise ExperimentPlanError("experiment_input_not_bytes")
+    try:
+        value = load_canonical_input(data)
+    except (CanonicalJSONError, UnicodeError, ValueError, TypeError):
+        raise ExperimentPlanError(_INPUT_ERROR) from None
+    try:
+        encoded = canonical_bytes(value)
+    except (CanonicalJSONError, UnicodeError, ValueError, TypeError):
+        raise ExperimentPlanError(_INPUT_ERROR) from None
+    if encoded != data:
+        raise ExperimentPlanError("experiment_input_not_canonical")
+    _validate_experiment_document(value)
+    return CanonicalExperimentInput(
+        canonical_bytes=data,
+        value=value,
+        input_digest=sha256_bytes(data),
+    )
+
+
+def experiment_input_bytes(value: CanonicalExperimentInput) -> bytes:
+    """Return the authoritative bytes after verifying the frozen projection."""
+    if not isinstance(value, CanonicalExperimentInput):
+        raise TypeError("value must be CanonicalExperimentInput")
+    try:
+        encoded = canonical_bytes(thaw_json_value(value.value))
+    except (CanonicalJSONError, UnicodeError, ValueError, TypeError):
+        raise ExperimentPlanError("experiment_input_changed") from None
+    if encoded != value.canonical_bytes:
+        raise ExperimentPlanError("experiment_input_changed")
+    return encoded
+
+
+def _rank(seed: str, domain: str, task_id: str) -> bytes:
+    payload = {
+        "domain": domain,
+        "seed": seed,
+        "task_id": task_id,
+    }
+    return hashlib.sha256(canonical_bytes(payload)).digest()
+
+
+def build_pilot_schedule(
+    seed: str, candidates: Sequence[Mapping[str, object]]
+) -> Tuple[PlannedRun, ...]:
+    """Build the stable, paired eight-run pilot schedule."""
+    try:
+        seed_text = _require_text(seed, "selection_seed")
+        try:
+            encoded_seed = seed_text.encode("ascii")
+        except UnicodeEncodeError:
+            _raise_input_error()
+        if not 16 <= len(encoded_seed) <= 128:
+            _raise_input_error()
+        checked = _validate_candidates(candidates)
+        by_difficulty = {"low": [], "medium": []}
+        for candidate in checked:
+            by_difficulty[candidate["difficulty"]].append(candidate)
+        orientations = {}
+        for difficulty, values in by_difficulty.items():
+            ordered = sorted(
+                values,
+                key=lambda item: _rank(
+                    seed_text,
+                    "condition-order:" + difficulty,
+                    item["task_id"],
+                ),
+            )
+            orientations[ordered[0]["task_id"]] = ("current", "lean")
+            orientations[ordered[1]["task_id"]] = ("lean", "current")
+        pair_order = sorted(
+            checked,
+            key=lambda item: _rank(
+                seed_text, "pair-order", item["task_id"]
+            ),
+        )
+        runs = []
+        for candidate in pair_order:
+            for condition in orientations[candidate["task_id"]]:
+                runs.append(
+                    PlannedRun(
+                        ordinal=len(runs) + 1,
+                        task_id=candidate["task_id"],
+                        difficulty=candidate["difficulty"],
+                        condition=condition,
+                    )
+                )
+        return tuple(runs)
+    except ExperimentPlanError:
+        raise
+    except (KeyError, TypeError, ValueError, CanonicalJSONError):
+        raise ExperimentPlanError(_INPUT_ERROR) from None
+
+
+def _dataclass_has_exact_fields(value: object, expected_type: type) -> bool:
+    if type(value) is not expected_type:
+        return False
+    return set(vars(value)) == {item.name for item in fields(expected_type)}
+
+
+def _require_plan_digest(value: object) -> str:
+    try:
+        return _require_digest(value, "digest")
+    except ExperimentPlanError:
+        _raise_plan_error()
+
+
+def _require_plan_opaque_identifier(value: object) -> str:
+    try:
+        return _require_opaque_identifier(value, "identifier")
+    except ExperimentPlanError:
+        _raise_plan_error()
+
+
+def _require_plan_sorted_digests(
+    value: object, *, nonempty: bool
+) -> Tuple[str, ...]:
+    try:
+        return _require_sorted_unique(
+            value,
+            _require_digest,
+            "digests",
+            nonempty=nonempty,
+        )
+    except ExperimentPlanError:
+        _raise_plan_error()
+
+
+def _planned_run_document(run: PlannedRun) -> Mapping[str, object]:
+    return {
+        "condition": run.condition,
+        "difficulty": run.difficulty,
+        "ordinal": run.ordinal,
+        "task_id": run.task_id,
+    }
+
+
+def _static_candidate_set_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "candidates": [
+            {
+                "allowed_write_paths": list(
+                    candidate["allowed_write_paths"]
+                ),
+                "commit_oid": candidate["commit_oid"],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "document_type": "harness-experiment-candidate-set-v1",
+        "schema_version": 1,
+    }
+
+
+def _static_selection_seed_document(
+    selection_seed: str,
+) -> Mapping[str, object]:
+    return {
+        "document_type": "harness-experiment-selection-seed-v1",
+        "schema_version": 1,
+        "selection_seed": selection_seed,
+    }
+
+
+def _static_pilot_schedule_document(
+    schedule: Sequence[PlannedRun],
+) -> Mapping[str, object]:
+    return {
+        "document_type": "harness-experiment-pilot-schedule-v1",
+        "pilot_schedule": [
+            _planned_run_document(run) for run in schedule
+        ],
+        "schema_version": 1,
+    }
+
+
+def _static_reference_result_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "document_type": "harness-experiment-reference-results-v1",
+        "reference_results": [
+            {
+                "reference_result": candidate["reference_result"],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "schema_version": 1,
+    }
+
+
+def _static_mutation_sensitivity_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "candidate_mutation_evidence": [
+            {
+                "assertion_digest": candidate["assertion_digest"],
+                "behavior_mutants": [
+                    {
+                        "category": mutant["category"],
+                        "mutant_digest": mutant["mutant_digest"],
+                        "result": mutant["result"],
+                    }
+                    for mutant in candidate["behavior_mutants"]
+                ],
+                "negative_controls": [
+                    {
+                        "control_id": control["control_id"],
+                        "result": control["result"],
+                    }
+                    for control in candidate["negative_controls"]
+                ],
+                "task_id": candidate["task_id"],
+                "validator_digest": candidate["validator_digest"],
+            }
+            for candidate in candidates
+        ],
+        "document_type": (
+            "harness-experiment-mutation-sensitivity-v1"
+        ),
+        "schema_version": 1,
+    }
+
+
+def _static_difficulty_assignment_document(
+    candidates: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    return {
+        "difficulty_assignments": [
+            {
+                "difficulty": candidate["difficulty"],
+                "difficulty_rubric_digest": candidate[
+                    "difficulty_rubric_digest"
+                ],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "document_type": (
+            "harness-experiment-difficulty-assignments-v1"
+        ),
+        "schema_version": 1,
+    }
+
+
+def _static_qualification_document(
+    candidates: Sequence[Mapping[str, object]],
+    *,
+    candidate_set_digest: str,
+    difficulty_assignment_digest: str,
+    mutation_sensitivity_digest: str,
+    reference_result_digest: str,
+) -> Mapping[str, object]:
+    return {
+        "candidate_qualification_records": [
+            {
+                "absolute_safety_assertion_ids": list(
+                    candidate["absolute_safety_assertion_ids"]
+                ),
+                "exclusion_rule_ids": list(
+                    candidate["exclusion_rule_ids"]
+                ),
+                "inclusion_rule_ids": list(
+                    candidate["inclusion_rule_ids"]
+                ),
+                "local_clone_policy": candidate["local_clone_policy"],
+                "offline_executable": candidate["offline_executable"],
+                "operator_attested": candidate["operator_attested"],
+                "provenance_id": candidate["provenance_id"],
+                "source_provisioning_class": candidate[
+                    "source_provisioning_class"
+                ],
+                "task_id": candidate["task_id"],
+            }
+            for candidate in candidates
+        ],
+        "candidate_set_digest": candidate_set_digest,
+        "difficulty_assignment_digest": difficulty_assignment_digest,
+        "document_type": "harness-experiment-qualification-v1",
+        "mutation_sensitivity_digest": mutation_sensitivity_digest,
+        "qualification_evidence_classification": (
+            "operator_attested_static"
+        ),
+        "reference_result_digest": reference_result_digest,
+        "schema_version": 1,
+    }
+
+
+def _static_document_digest(document: Mapping[str, object]) -> str:
+    return sha256_bytes(canonical_bytes(document))
+
+
+def derive_static_evidence_digests(
+    experiment_input: CanonicalExperimentInput,
+) -> StaticEvidenceDigests:
+    """Derive the seven static-evidence digests from revalidated input."""
+    if not _dataclass_has_exact_fields(
+        experiment_input, CanonicalExperimentInput
+    ):
+        _raise_input_error()
+    try:
+        authoritative = experiment_input_bytes(experiment_input)
+        verified = load_experiment_input(authoritative)
+    except (ExperimentPlanError, TypeError):
+        _raise_input_error()
+    if (
+        type(experiment_input.canonical_bytes) is not bytes
+        or type(experiment_input.input_digest) is not str
+        or experiment_input.canonical_bytes != verified.canonical_bytes
+        or experiment_input.input_digest != verified.input_digest
+    ):
+        _raise_input_error()
+
+    candidates = tuple(verified.value["candidates"])
+    selection_seed = verified.value["selection_seed"]
+    schedule = build_pilot_schedule(selection_seed, candidates)
+    candidate_set_digest = _static_document_digest(
+        _static_candidate_set_document(candidates)
+    )
+    selection_seed_digest = _static_document_digest(
+        _static_selection_seed_document(selection_seed)
+    )
+    pilot_schedule_digest = _static_document_digest(
+        _static_pilot_schedule_document(schedule)
+    )
+    reference_result_digest = _static_document_digest(
+        _static_reference_result_document(candidates)
+    )
+    mutation_sensitivity_digest = _static_document_digest(
+        _static_mutation_sensitivity_document(candidates)
+    )
+    difficulty_assignment_digest = _static_document_digest(
+        _static_difficulty_assignment_document(candidates)
+    )
+    qualification_digest = _static_document_digest(
+        _static_qualification_document(
+            candidates,
+            candidate_set_digest=candidate_set_digest,
+            difficulty_assignment_digest=difficulty_assignment_digest,
+            mutation_sensitivity_digest=mutation_sensitivity_digest,
+            reference_result_digest=reference_result_digest,
+        )
+    )
+    return StaticEvidenceDigests(
+        candidate_set_digest=candidate_set_digest,
+        selection_seed_digest=selection_seed_digest,
+        pilot_schedule_digest=pilot_schedule_digest,
+        qualification_digest=qualification_digest,
+        reference_result_digest=reference_result_digest,
+        mutation_sensitivity_digest=mutation_sensitivity_digest,
+        difficulty_assignment_digest=difficulty_assignment_digest,
+    )
+
+
+def _canary_template_document(
+    template: CanaryInvocationTemplate,
+) -> Mapping[str, object]:
+    return {
+        "approval_policy": template.approval_policy,
+        "argv_template_digest": template.argv_template_digest,
+        "base_profile_digest": template.base_profile_digest,
+        "child_process_policy": template.child_process_policy,
+        "containment_policy_version": template.containment_policy_version,
+        "document_type": "canary_invocation_template",
+        "environment_policy_digest": template.environment_policy_digest,
+        "model_id": template.model_id,
+        "ordinal": template.ordinal,
+        "output_schema_digest": template.output_schema_digest,
+        "overlay_recipe_policy_digest": template.overlay_recipe_policy_digest,
+        "profile": template.profile,
+        "provider_transport_allowed": template.provider_transport_allowed,
+        "reasoning_effort": template.reasoning_effort,
+        "root_capability_policy_digest": (
+            template.root_capability_policy_digest
+        ),
+        "sandbox": template.sandbox,
+        "schema_version": 1,
+        "tool_network_disabled": template.tool_network_disabled,
+        "validator_policy": template.validator_policy,
+    }
+
+
+def _pilot_invocation_plan_document(
+    plan: PilotInvocationPlan,
+) -> Mapping[str, object]:
+    return {
+        "allowed_write_policy_digest": plan.allowed_write_policy_digest,
+        "approval_policy": plan.approval_policy,
+        "argv_template_digest": plan.argv_template_digest,
+        "base_profile_digest": plan.base_profile_digest,
+        "child_process_policy": plan.child_process_policy,
+        "containment_policy_version": plan.containment_policy_version,
+        "document_type": "pilot_invocation_plan",
+        "environment_policy_digest": plan.environment_policy_digest,
+        "model_id": plan.model_id,
+        "ordinal": plan.ordinal,
+        "output_schema_digest": plan.output_schema_digest,
+        "provider_transport_allowed": plan.provider_transport_allowed,
+        "reasoning_effort": plan.reasoning_effort,
+        "run": _planned_run_document(plan.run),
+        "sandbox": plan.sandbox,
+        "schema_version": 1,
+        "snapshot_receipt_digest": plan.snapshot_receipt_digest,
+        "root_capability_policy_digest": (
+            plan.root_capability_policy_digest
+        ),
+        "tool_network_disabled": plan.tool_network_disabled,
+        "validator_policy": plan.validator_policy,
+    }
+
+
+def _validate_canary_templates(
+    values: object,
+    *,
+    model: ABCMapping,
+    invocation_policy: ABCMapping,
+    containment_policy_version: object,
+    current_profile_digest: str,
+    lean_profile_digest: str
+) -> Tuple[CanaryInvocationTemplate, ...]:
+    if (
+        not isinstance(values, ABCSequence)
+        or isinstance(values, (str, bytes, bytearray))
+    ):
+        _raise_plan_error()
+    templates = tuple(values)
+    if len(templates) != 2:
+        _raise_plan_error()
+    expected = (
+        (1, "current", current_profile_digest),
+        (2, "lean", lean_profile_digest),
+    )
+    for template, (ordinal, profile, base_digest) in zip(templates, expected):
+        if not _dataclass_has_exact_fields(template, CanaryInvocationTemplate):
+            _raise_plan_error()
+        if (
+            not isinstance(template.ordinal, int)
+            or isinstance(template.ordinal, bool)
+            or template.ordinal != ordinal
+            or template.profile != profile
+            or template.model_id != model["model_id"]
+            or template.reasoning_effort != model["reasoning_effort"]
+            or template.sandbox != invocation_policy["canary_sandbox"]
+            or template.approval_policy != invocation_policy["approval_policy"]
+            or not isinstance(template.provider_transport_allowed, bool)
+            or template.provider_transport_allowed
+            is not invocation_policy["provider_transport_allowed"]
+            or not isinstance(template.tool_network_disabled, bool)
+            or template.tool_network_disabled
+            is not invocation_policy["tool_network_disabled"]
+            or template.base_profile_digest != base_digest
+            or template.overlay_recipe_policy_digest
+            != CANARY_OVERLAY_RECIPE_DIGEST
+            or template.root_capability_policy_digest
+            != ROOT_CAPABILITY_POLICY_DIGEST
+            or template.child_process_policy
+            != invocation_policy["child_process_policy"]
+            or template.validator_policy != invocation_policy["validator_policy"]
+            or template.output_schema_digest != CANARY_RESPONSE_SCHEMA_DIGEST
+            or template.environment_policy_digest != ENVIRONMENT_POLICY_DIGEST
+            or template.argv_template_digest != CANARY_ARGV_TEMPLATE_DIGEST
+            or template.containment_policy_version
+            != containment_policy_version
+        ):
+            _raise_plan_error()
+        for name in (
+            "base_profile_digest",
+            "overlay_recipe_policy_digest",
+            "root_capability_policy_digest",
+            "output_schema_digest",
+            "environment_policy_digest",
+            "argv_template_digest",
+        ):
+            _require_plan_digest(getattr(template, name))
+        _require_plan_opaque_identifier(template.child_process_policy)
+        _require_plan_opaque_identifier(template.validator_policy)
+        _require_plan_opaque_identifier(template.containment_policy_version)
+    return templates
+
+
+def _validate_pilot_plans(
+    values: object,
+    *,
+    schedule: Tuple[PlannedRun, ...],
+    model: ABCMapping,
+    invocation_policy: ABCMapping,
+    containment_policy_version: object,
+    current_profile_digest: str,
+    lean_profile_digest: str
+) -> Tuple[PilotInvocationPlan, ...]:
+    if (
+        not isinstance(values, ABCSequence)
+        or isinstance(values, (str, bytes, bytearray))
+    ):
+        _raise_plan_error()
+    plans = tuple(values)
+    if len(plans) != 8:
+        _raise_plan_error()
+    snapshot_by_task = {}
+    snapshot_tasks_by_digest = {}
+    allowed_write_by_task = {}
+    allowed_write_tasks_by_digest = {}
+    for plan, run in zip(plans, schedule):
+        if not _dataclass_has_exact_fields(plan, PilotInvocationPlan):
+            _raise_plan_error()
+        if not _dataclass_has_exact_fields(plan.run, PlannedRun):
+            _raise_plan_error()
+        expected_profile_digest = {
+            "current": current_profile_digest,
+            "lean": lean_profile_digest,
+        }.get(run.condition)
+        if (
+            not isinstance(plan.ordinal, int)
+            or isinstance(plan.ordinal, bool)
+            or plan.ordinal != run.ordinal + 2
+            or plan.run != run
+            or plan.model_id != model["model_id"]
+            or plan.reasoning_effort != model["reasoning_effort"]
+            or plan.sandbox != invocation_policy["pilot_sandbox"]
+            or plan.approval_policy != invocation_policy["approval_policy"]
+            or not isinstance(plan.provider_transport_allowed, bool)
+            or plan.provider_transport_allowed
+            is not invocation_policy["provider_transport_allowed"]
+            or not isinstance(plan.tool_network_disabled, bool)
+            or plan.tool_network_disabled
+            is not invocation_policy["tool_network_disabled"]
+            or plan.base_profile_digest != expected_profile_digest
+            or plan.root_capability_policy_digest
+            != ROOT_CAPABILITY_POLICY_DIGEST
+            or plan.child_process_policy
+            != invocation_policy["child_process_policy"]
+            or plan.validator_policy != invocation_policy["validator_policy"]
+            or plan.output_schema_digest != PILOT_RESPONSE_SCHEMA_DIGEST
+            or plan.environment_policy_digest != ENVIRONMENT_POLICY_DIGEST
+            or plan.argv_template_digest != PILOT_ARGV_TEMPLATE_DIGEST
+            or plan.containment_policy_version != containment_policy_version
+        ):
+            _raise_plan_error()
+
+        snapshot_digest = _require_plan_digest(
+            plan.snapshot_receipt_digest
+        )
+        expected_snapshot = snapshot_by_task.setdefault(
+            run.task_id, snapshot_digest
+        )
+        if expected_snapshot != snapshot_digest:
+            _raise_plan_error()
+        other_task = snapshot_tasks_by_digest.setdefault(
+            snapshot_digest, run.task_id
+        )
+        if other_task != run.task_id:
+            _raise_plan_error()
+
+        allowed_write_digest = _require_plan_digest(
+            plan.allowed_write_policy_digest
+        )
+        expected_allowed_write = allowed_write_by_task.setdefault(
+            run.task_id, allowed_write_digest
+        )
+        if expected_allowed_write != allowed_write_digest:
+            _raise_plan_error()
+        allowed_write_task = allowed_write_tasks_by_digest.setdefault(
+            allowed_write_digest, run.task_id
+        )
+        if allowed_write_task != run.task_id:
+            _raise_plan_error()
+
+        for name in (
+            "base_profile_digest",
+            "root_capability_policy_digest",
+            "output_schema_digest",
+            "environment_policy_digest",
+            "argv_template_digest",
+        ):
+            _require_plan_digest(getattr(plan, name))
+        _require_plan_opaque_identifier(plan.child_process_policy)
+        _require_plan_opaque_identifier(plan.validator_policy)
+        _require_plan_opaque_identifier(plan.containment_policy_version)
+    return plans
+
+
+def _validate_call_allocation(budgets: ABCMapping) -> None:
+    for name in (
+        "total_calls",
+        "canary_calls",
+        "pilot_calls",
+        "retry_calls",
+        "concurrency",
+    ):
+        if budgets[name] != _CALL_ALLOCATION_DOCUMENT[name]:
+            _raise_plan_error()
+
+
+def _build_experiment_plan(
+    experiment_input: CanonicalExperimentInput,
+    *,
+    bundle_digest: str,
+    current_profile_digest: str,
+    lean_profile_digest: str,
+    task_source_trust_receipt_digests: Sequence[str],
+    task_selection_receipt_digest: str,
+    task_corpus_receipt_digest: str,
+    canary_templates: Sequence[CanaryInvocationTemplate],
+    pilot_invocation_plans: Sequence[PilotInvocationPlan],
+) -> ExperimentPlan:
+    if not isinstance(experiment_input, CanonicalExperimentInput):
+        _raise_plan_error()
+    authoritative = experiment_input_bytes(experiment_input)
+    if experiment_input.input_digest != sha256_bytes(authoritative):
+        _raise_plan_error()
+    document = thaw_json_value(experiment_input.value)
+    try:
+        validated = _validate_experiment_document(document)
+    except ExperimentPlanError:
+        _raise_plan_error()
+
+    bundle = _require_plan_digest(bundle_digest)
+    current_profile = _require_plan_digest(current_profile_digest)
+    lean_profile = _require_plan_digest(lean_profile_digest)
+    if current_profile == lean_profile:
+        _raise_plan_error()
+    source_receipts = _require_plan_sorted_digests(
+        task_source_trust_receipt_digests, nonempty=False
+    )
+    selection_receipt = _require_plan_digest(task_selection_receipt_digest)
+    corpus_receipt = _require_plan_digest(task_corpus_receipt_digest)
+    _validate_call_allocation(validated["budgets"])
+
+    schedule = build_pilot_schedule(
+        validated["selection_seed"], validated["candidates"]
+    )
+    templates = _validate_canary_templates(
+        canary_templates,
+        model=validated["model"],
+        invocation_policy=validated["invocation_policy"],
+        containment_policy_version=validated["containment_policy_version"],
+        current_profile_digest=current_profile,
+        lean_profile_digest=lean_profile,
+    )
+    pilots = _validate_pilot_plans(
+        pilot_invocation_plans,
+        schedule=schedule,
+        model=validated["model"],
+        invocation_policy=validated["invocation_policy"],
+        containment_policy_version=validated["containment_policy_version"],
+        current_profile_digest=current_profile,
+        lean_profile_digest=lean_profile,
+    )
+
+    template_digests = tuple(
+        sha256_bytes(canonical_bytes(_canary_template_document(template)))
+        for template in templates
+    )
+    pilot_digests = tuple(
+        sha256_bytes(canonical_bytes(_pilot_invocation_plan_document(plan)))
+        for plan in pilots
+    )
+    document.update(
+        {
+            "bundle_digest": bundle,
+            "call_allocation_digest": CALL_ALLOCATION_DIGEST,
+            "canary_template_digests": list(template_digests),
+            "current_profile_digest": current_profile,
+            "input_digest": experiment_input.input_digest,
+            "lean_profile_digest": lean_profile,
+            "masked_review_context_digest": (
+                masked_review_context_digest(validated)
+            ),
+            "pilot_invocation_plan_digests": list(pilot_digests),
+            "pilot_schedule": [
+                _planned_run_document(run) for run in schedule
+            ],
+            "task_corpus_receipt_digest": corpus_receipt,
+            "task_selection_receipt_digest": selection_receipt,
+            "task_source_trust_receipt_digests": list(source_receipts),
+        }
+    )
+    encoded = canonical_bytes(document)
+    return ExperimentPlan(
+        input_digest=experiment_input.input_digest,
+        plan_document=document,
+        canonical_bytes=encoded,
+        plan_digest=sha256_bytes(encoded),
+        pilot_schedule=schedule,
+        canary_templates=templates,
+        pilot_invocation_plans=pilots,
+    )
+
+
+def build_experiment_plan(
+    experiment_input: CanonicalExperimentInput,
+    *,
+    bundle_digest: str,
+    current_profile_digest: str,
+    lean_profile_digest: str,
+    task_source_trust_receipt_digests: Sequence[str],
+    task_selection_receipt_digest: str,
+    task_corpus_receipt_digest: str,
+    canary_templates: Sequence[CanaryInvocationTemplate],
+    pilot_invocation_plans: Sequence[PilotInvocationPlan],
+) -> ExperimentPlan:
+    """Build a deterministic path-free plan from validated child projections."""
+    try:
+        return _build_experiment_plan(
+            experiment_input,
+            bundle_digest=bundle_digest,
+            current_profile_digest=current_profile_digest,
+            lean_profile_digest=lean_profile_digest,
+            task_source_trust_receipt_digests=(
+                task_source_trust_receipt_digests
+            ),
+            task_selection_receipt_digest=task_selection_receipt_digest,
+            task_corpus_receipt_digest=task_corpus_receipt_digest,
+            canary_templates=canary_templates,
+            pilot_invocation_plans=pilot_invocation_plans,
+        )
+    except ExperimentPlanError:
+        raise ExperimentPlanError(_PLAN_ERROR) from None
+    except (
+        AttributeError,
+        CanonicalJSONError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        raise ExperimentPlanError(_PLAN_ERROR) from None
+
+
+def _build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
+    if not _dataclass_has_exact_fields(plan, ExperimentPlan):
+        _raise_plan_error()
+
+    document = thaw_json_value(plan.plan_document)
+    expected_document_keys = _EXPERIMENT_KEYS.union(
+        {
+            "bundle_digest",
+            "call_allocation_digest",
+            "canary_template_digests",
+            "current_profile_digest",
+            "input_digest",
+            "lean_profile_digest",
+            "masked_review_context_digest",
+            "pilot_invocation_plan_digests",
+            "pilot_schedule",
+            "task_corpus_receipt_digest",
+            "task_selection_receipt_digest",
+            "task_source_trust_receipt_digests",
+        }
+    )
+    if not isinstance(document, ABCMapping):
+        _raise_plan_error()
+    if set(document) != expected_document_keys:
+        _raise_plan_error()
+
+    encoded = canonical_bytes(document)
+    if plan.canonical_bytes != encoded:
+        _raise_plan_error()
+    if plan.plan_digest != sha256_bytes(encoded):
+        _raise_plan_error()
+
+    input_document = {
+        key: document[key]
+        for key in _EXPERIMENT_KEYS
+    }
+    validated_input = _validate_experiment_document(input_document)
+    if document["masked_review_context_digest"] != (
+        masked_review_context_digest(validated_input)
+    ):
+        _raise_plan_error()
+    input_bytes = canonical_bytes(input_document)
+    if plan.input_digest != document["input_digest"]:
+        _raise_plan_error()
+    if plan.input_digest != sha256_bytes(input_bytes):
+        _raise_plan_error()
+
+    schedule = tuple(plan.pilot_schedule)
+    if len(schedule) != 8:
+        _raise_plan_error()
+    if any(
+        not _dataclass_has_exact_fields(run, PlannedRun)
+        for run in schedule
+    ):
+        _raise_plan_error()
+    projected_schedule = [
+        _planned_run_document(run)
+        for run in schedule
+    ]
+    if projected_schedule != document["pilot_schedule"]:
+        _raise_plan_error()
+
+    candidates = {
+        candidate["task_id"]: candidate
+        for candidate in validated_input["candidates"]
+    }
+    task_order = []
+    for index in range(0, len(schedule), 2):
+        current_pair = schedule[index : index + 2]
+        first, second = current_pair
+        if first.ordinal != index + 1 or second.ordinal != index + 2:
+            _raise_plan_error()
+        if type(first.ordinal) is not int or type(second.ordinal) is not int:
+            _raise_plan_error()
+        if first.task_id != second.task_id:
+            _raise_plan_error()
+        if first.difficulty != second.difficulty:
+            _raise_plan_error()
+        if {first.condition, second.condition} != {"current", "lean"}:
+            _raise_plan_error()
+        if first.task_id not in candidates:
+            _raise_plan_error()
+        if first.difficulty != candidates[first.task_id]["difficulty"]:
+            _raise_plan_error()
+        task_order.append(first.task_id)
+
+    if len(set(task_order)) != 4 or set(task_order) != set(candidates):
+        _raise_plan_error()
+
+    task_assertions = tuple(
+        TaskAssertionContract(
+            task_id=task_id,
+            assertion_digest=candidates[task_id]["assertion_digest"],
+            absolute_safety_assertion_ids=tuple(
+                candidates[task_id]["absolute_safety_assertion_ids"]
+            ),
+        )
+        for task_id in task_order
+    )
+    assertion_document = {
+        "contract_version": "four-pair-screening-v1",
+        "document_type": "analysis_assertion_contract",
+        "plan_digest": plan.plan_digest,
+        "schema_version": 1,
+        "tasks": [
+            {
+                "task_id": item.task_id,
+                "assertion_digest": item.assertion_digest,
+                "absolute_safety_assertion_ids": list(
+                    item.absolute_safety_assertion_ids
+                ),
+            }
+            for item in task_assertions
+        ],
+    }
+    return AnalysisContract(
+        contract_version="four-pair-screening-v1",
+        plan_digest=plan.plan_digest,
+        assertion_contract_digest=sha256_bytes(
+            canonical_bytes(assertion_document)
+        ),
+        task_assertions=task_assertions,
+        required_pair_count=4,
+        score_minimum=0,
+        score_maximum=100,
+        minimum_median_correctness_delta=Fraction(-5, 1),
+        efficiency_reduction_threshold=Fraction(1, 5),
+        required_efficiency_count=2,
+    )
+
+
+def build_analysis_contract(plan: ExperimentPlan) -> AnalysisContract:
+    """Derive the fixed exact-rational analysis contract from one plan."""
+    try:
+        return _build_analysis_contract(plan)
+    except ExperimentPlanError:
+        raise ExperimentPlanError(_PLAN_ERROR) from None
+    except (
+        AttributeError,
+        CanonicalJSONError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        raise ExperimentPlanError(_PLAN_ERROR) from None
+
+
+def _raise_analysis_dataset_error() -> None:
+    raise ExperimentPlanError(_ANALYSIS_DATASET_ERROR)
+
+
+def _analysis_digest(value: object) -> str:
+    if type(value) is not str or _DIGEST_PATTERN.fullmatch(value) is None:
+        _raise_analysis_dataset_error()
+    return value
+
+
+def _analysis_non_negative_integer(value: object) -> int:
+    if type(value) is not int or value < 0:
+        _raise_analysis_dataset_error()
+    return value
+
+
+def _analysis_nfc_text(value: object) -> str:
+    if type(value) is not str or not value:
+        _raise_analysis_dataset_error()
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        _raise_analysis_dataset_error()
+    if not unicodedata.is_normalized("NFC", value):
+        _raise_analysis_dataset_error()
+    return value
+
+
+def _validate_analysis_contract(
+    contract: object,
+) -> Tuple[TaskAssertionContract, ...]:
+    if (
+        not _dataclass_has_exact_fields(contract, AnalysisContract)
+        or type(contract.contract_version) is not str
+        or contract.contract_version != "four-pair-screening-v1"
+        or type(contract.required_pair_count) is not int
+        or contract.required_pair_count != 4
+        or type(contract.score_minimum) is not int
+        or contract.score_minimum != 0
+        or type(contract.score_maximum) is not int
+        or contract.score_maximum != 100
+        or type(contract.minimum_median_correctness_delta) is not Fraction
+        or contract.minimum_median_correctness_delta != Fraction(-5, 1)
+        or type(contract.efficiency_reduction_threshold) is not Fraction
+        or contract.efficiency_reduction_threshold != Fraction(1, 5)
+        or type(contract.required_efficiency_count) is not int
+        or contract.required_efficiency_count != 2
+    ):
+        _raise_analysis_dataset_error()
+    _analysis_digest(contract.plan_digest)
+    _analysis_digest(contract.assertion_contract_digest)
+    tasks = tuple(contract.task_assertions)
+    if len(tasks) != 4:
+        _raise_analysis_dataset_error()
+    seen_tasks = set()
+    projected_tasks = []
+    for task in tasks:
+        if not _dataclass_has_exact_fields(task, TaskAssertionContract):
+            _raise_analysis_dataset_error()
+        task_id = _analysis_nfc_text(task.task_id)
+        if (
+            _IDENTIFIER_PATTERN.fullmatch(task_id) is None
+            or task_id in seen_tasks
+        ):
+            _raise_analysis_dataset_error()
+        seen_tasks.add(task_id)
+        _analysis_digest(task.assertion_digest)
+        assertion_ids = tuple(task.absolute_safety_assertion_ids)
+        checked_ids = tuple(
+            _analysis_nfc_text(value) for value in assertion_ids
+        )
+        if (
+            len(set(checked_ids)) != len(checked_ids)
+            or checked_ids
+            != tuple(
+                sorted(
+                    checked_ids,
+                    key=lambda item: item.encode("utf-8"),
+                )
+            )
+        ):
+            _raise_analysis_dataset_error()
+        projected_tasks.append(
+            {
+                "task_id": task_id,
+                "assertion_digest": task.assertion_digest,
+                "absolute_safety_assertion_ids": list(checked_ids),
+            }
+        )
+    assertion_document = {
+        "contract_version": "four-pair-screening-v1",
+        "document_type": "analysis_assertion_contract",
+        "plan_digest": contract.plan_digest,
+        "schema_version": 1,
+        "tasks": projected_tasks,
+    }
+    if (
+        sha256_bytes(canonical_bytes(assertion_document))
+        != contract.assertion_contract_digest
+    ):
+        _raise_analysis_dataset_error()
+    return tasks
+
+
+def _validate_analysis_observation(
+    observation: object,
+    *,
+    task: TaskAssertionContract,
+    condition: str,
+    seen_terminal_digests: set
+) -> Optional[ValidatedConditionObservation]:
+    if observation is None:
+        return None
+    if not _dataclass_has_exact_fields(
+        observation, ValidatedConditionObservation
+    ):
+        _raise_analysis_dataset_error()
+    if (
+        type(observation.task_id) is not str
+        or type(observation.condition) is not str
+        or observation.task_id != task.task_id
+        or observation.condition != condition
+    ):
+        _raise_analysis_dataset_error()
+    digest = _analysis_digest(observation.terminal_receipt_digest)
+    if digest in seen_terminal_digests:
+        _raise_analysis_dataset_error()
+    seen_terminal_digests.add(digest)
+    score = observation.correctness_score
+    review_time = observation.active_review_milliseconds
+    if (score is None) is not (review_time is None):
+        _raise_analysis_dataset_error()
+    if score is not None:
+        if (
+            type(score) is not int
+            or score < 0
+            or score > 100
+            or type(review_time) is not int
+            or review_time < 0
+        ):
+            _raise_analysis_dataset_error()
+    input_tokens = _analysis_non_negative_integer(
+        observation.input_tokens
+    )
+    cached_input_tokens = _analysis_non_negative_integer(
+        observation.cached_input_tokens
+    )
+    output_tokens = _analysis_non_negative_integer(
+        observation.output_tokens
+    )
+    reasoning_tokens = _analysis_non_negative_integer(
+        observation.reasoning_output_tokens
+    )
+    _analysis_non_negative_integer(observation.wall_time_milliseconds)
+    if (
+        cached_input_tokens > input_tokens
+        or reasoning_tokens > output_tokens
+        or type(observation.machine_assertion_passed) is not bool
+    ):
+        _raise_analysis_dataset_error()
+    assertion_id = observation.absolute_safety_assertion_id
+    basis = observation.absolute_safety_basis_digest
+    if (assertion_id is None) is not (basis is None):
+        _raise_analysis_dataset_error()
+    if assertion_id is not None:
+        checked_id = _analysis_nfc_text(assertion_id)
+        if (
+            checked_id not in task.absolute_safety_assertion_ids
+            or condition != "lean"
+            or observation.machine_assertion_passed is not False
+        ):
+            _raise_analysis_dataset_error()
+        _analysis_digest(basis)
+    return observation
+
+
+def _validate_analysis_dataset(
+    contract: AnalysisContract,
+    dataset: object,
+) -> Tuple[
+    Tuple[ValidatedPairObservation, ...],
+    bool,
+    bool,
+]:
+    tasks = _validate_analysis_contract(contract)
+    if (
+        not _dataclass_has_exact_fields(
+            dataset, ValidatedAnalysisDataset
+        )
+        or dataset._provenance is not _ANALYSIS_DATASET_PROVENANCE
+        or dataset.plan_digest != contract.plan_digest
+    ):
+        _raise_analysis_dataset_error()
+    _analysis_digest(dataset.plan_digest)
+    _analysis_digest(dataset.runtime_history_digest)
+    pairs = tuple(dataset.pairs)
+    if len(pairs) != 4:
+        _raise_analysis_dataset_error()
+    partial_reasons = tuple(dataset.partial_reason_codes)
+    if (
+        len(set(partial_reasons)) != len(partial_reasons)
+        or any(
+            type(reason) is not str
+            or reason not in _PARTIAL_REASON_CODES
+            for reason in partial_reasons
+        )
+        or partial_reasons
+        != tuple(
+            reason
+            for reason in _PARTIAL_REASON_CODES
+            if reason in partial_reasons
+        )
+    ):
+        _raise_analysis_dataset_error()
+
+    masked_review = dataset.masked_review
+    if masked_review is not None:
+        if not _dataclass_has_exact_fields(
+            masked_review, ValidatedMaskedReviewEvidence
+        ):
+            _raise_analysis_dataset_error()
+        masked_digests = (
+            _analysis_digest(masked_review.packet_receipt_digest),
+            _analysis_digest(masked_review.score_lock_receipt_digest),
+            _analysis_digest(masked_review.unmask_receipt_digest),
+        )
+        if len(set(masked_digests)) != 3:
+            _raise_analysis_dataset_error()
+        if masked_review.high_regression_basis_digest is not None:
+            _analysis_digest(
+                masked_review.high_regression_basis_digest
+            )
+
+    seen_terminal_digests = set()
+    missing = False
+    score_presence = []
+    checked_pairs = []
+    for pair, task in zip(pairs, tasks):
+        if (
+            not _dataclass_has_exact_fields(
+                pair, ValidatedPairObservation
+            )
+            or type(pair.task_id) is not str
+            or pair.task_id != task.task_id
+        ):
+            _raise_analysis_dataset_error()
+        current = _validate_analysis_observation(
+            pair.current,
+            task=task,
+            condition="current",
+            seen_terminal_digests=seen_terminal_digests,
+        )
+        lean = _validate_analysis_observation(
+            pair.lean,
+            task=task,
+            condition="lean",
+            seen_terminal_digests=seen_terminal_digests,
+        )
+        missing = missing or current is None or lean is None
+        for observation in (current, lean):
+            if observation is not None:
+                score_presence.append(
+                    observation.correctness_score is not None
+                )
+        checked_pairs.append(pair)
+
+    has_missing_reason = (
+        "missing_or_noncompleted_terminal" in partial_reasons
+    )
+    has_chain_reason = (
+        "masked_review_chain_incomplete" in partial_reasons
+    )
+    if missing != has_missing_reason:
+        _raise_analysis_dataset_error()
+    if masked_review is None:
+        if not has_chain_reason or any(score_presence):
+            _raise_analysis_dataset_error()
+    else:
+        if (
+            has_chain_reason
+            or missing
+            or len(score_presence) != 8
+            or not all(score_presence)
+        ):
+            _raise_analysis_dataset_error()
+    aggregate_complete = (
+        masked_review is not None
+        and not missing
+        and not partial_reasons
+    )
+    absolute_safety = any(
+        pair.lean is not None
+        and pair.lean.absolute_safety_assertion_id is not None
+        and pair.lean.absolute_safety_basis_digest is not None
+        and pair.lean.machine_assertion_passed is False
+        for pair in checked_pairs
+    )
+    return tuple(checked_pairs), aggregate_complete, absolute_safety
+
+
+def _empty_efficiency_medians() -> Mapping[str, Optional[Fraction]]:
+    return {name: None for name in _EFFICIENCY_METRICS}
+
+
+def _analysis_aggregates(
+    pairs: Sequence[ValidatedPairObservation],
+) -> Tuple[
+    Fraction,
+    Mapping[str, Optional[Fraction]],
+    Tuple[str, ...],
+]:
+    correctness = tuple(
+        Fraction(
+            _correctness_delta(
+                pair.current.correctness_score,
+                pair.lean.correctness_score,
+            ),
+            1,
+        )
+        for pair in pairs
+    )
+    median_correctness = _median(correctness)
+    accessors = {
+        "reported_tokens": lambda observation: (
+            observation.reported_tokens
+        ),
+        "wall_time_milliseconds": lambda observation: (
+            observation.wall_time_milliseconds
+        ),
+        "active_review_milliseconds": lambda observation: (
+            observation.active_review_milliseconds
+        ),
+    }
+    efficiency = {}
+    qualifying = []
+    for name in _EFFICIENCY_METRICS:
+        accessor = accessors[name]
+        current_values = tuple(
+            accessor(pair.current) for pair in pairs
+        )
+        if not all(value > 0 for value in current_values):
+            efficiency[name] = None
+            continue
+        reductions = tuple(
+            _reduction(accessor(pair.current), accessor(pair.lean))
+            for pair in pairs
+        )
+        median_reduction = _median(reductions)
+        efficiency[name] = median_reduction
+        if median_reduction >= Fraction(1, 5):
+            qualifying.append(name)
+    return median_correctness, efficiency, tuple(qualifying)
+
+
+def _analyze_pairs(
+    contract: AnalysisContract,
+    dataset: ValidatedAnalysisDataset,
+) -> ExperimentDecision:
+    pairs, aggregate_complete, absolute_safety = (
+        _validate_analysis_dataset(contract, dataset)
+    )
+    if aggregate_complete:
+        median_correctness, efficiency, qualifying = (
+            _analysis_aggregates(pairs)
+        )
+    else:
+        median_correctness = None
+        efficiency = _empty_efficiency_medians()
+        qualifying = ()
+
+    if absolute_safety:
+        return ExperimentDecision(
+            outcome="reject_for_safety",
+            comparative_aggregate_emitted=aggregate_complete,
+            median_correctness_delta=median_correctness,
+            efficiency_medians=efficiency,
+            qualifying_efficiency_metrics=qualifying,
+            reason_code="absolute_lean_safety_regression",
+        )
+    if not aggregate_complete:
+        return ExperimentDecision(
+            outcome="inconclusive",
+            comparative_aggregate_emitted=False,
+            median_correctness_delta=None,
+            efficiency_medians=_empty_efficiency_medians(),
+            qualifying_efficiency_metrics=(),
+            reason_code="experiment_partial",
+        )
+    if dataset.masked_review.high_regression_basis_digest is not None:
+        return ExperimentDecision(
+            outcome="reject_for_safety",
+            comparative_aggregate_emitted=True,
+            median_correctness_delta=median_correctness,
+            efficiency_medians=efficiency,
+            qualifying_efficiency_metrics=qualifying,
+            reason_code="masked_high_regression",
+        )
+    if any(
+        pair.current.machine_assertion_passed is True
+        and pair.lean.machine_assertion_passed is False
+        for pair in pairs
+    ):
+        return ExperimentDecision(
+            outcome="reject_for_safety",
+            comparative_aggregate_emitted=True,
+            median_correctness_delta=median_correctness,
+            efficiency_medians=efficiency,
+            qualifying_efficiency_metrics=qualifying,
+            reason_code="machine_acceptance_regression",
+        )
+    if (
+        median_correctness
+        >= contract.minimum_median_correctness_delta
+        and len(qualifying) >= contract.required_efficiency_count
+    ):
+        outcome = "advance_to_larger_study"
+        reason = "screening_thresholds_met"
+    else:
+        outcome = "inconclusive"
+        reason = "screening_thresholds_not_met"
+    return ExperimentDecision(
+        outcome=outcome,
+        comparative_aggregate_emitted=True,
+        median_correctness_delta=median_correctness,
+        efficiency_medians=efficiency,
+        qualifying_efficiency_metrics=qualifying,
+        reason_code=reason,
+    )
+
+
+def analyze_pairs(
+    contract: AnalysisContract,
+    dataset: ValidatedAnalysisDataset,
+) -> ExperimentDecision:
+    """Analyze only a provenance-bearing canonical history projection."""
+    try:
+        return _analyze_pairs(contract, dataset)
+    except Exception:
+        raise ExperimentPlanError(_ANALYSIS_DATASET_ERROR) from None

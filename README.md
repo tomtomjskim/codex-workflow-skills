@@ -347,7 +347,7 @@ Forward-test behavior with the scenarios in `tests/acceptance-scenarios.md` befo
 
 See [forward-test-report.md](docs/forward-test-report.md) for the latest recorded forward-test and smoke-test notes.
 
-### Live evaluation runner
+### Legacy live evaluation runner
 
 The deterministic dry-run validates the scenario corpus and selection plan only. It does not require an API key, Codex executable, temporary runtime directory, capability probe, checkout installation, subprocess, or network access:
 
@@ -380,6 +380,30 @@ python3 scripts/run_live_eval.py --release-suite --dry-run
 A live release suite is a separate operator-approved action and requires both `--release-suite` and `--approve-release-suite`. Omitting the approval flag blocks before credential or executable checks. The flag is invalid without release-suite selection.
 
 Without `--dry-run`, the runner is an explicit live operation. It refuses execution unless `OPENAI_API_KEY` is present and a `codex` executable is available. Live execution creates a private isolated runtime, installs and seals the exact clean-HEAD skill checkout, and performs a final isolation recheck inside every model-call budget lease. Production execution remains blocked when the runtime cannot prove the required network, MCP, plugin, hook, and unexpected-skill isolation capabilities. Blocked runs without retained evidence clean up their owned runtime; assertion or completed runs retain only redacted mode-0600 JSONL output artifacts and report `manual_cleanup_required=true` with the artifact path. Repository tests and `scripts/validate_repo.sh` never perform a live model call.
+
+### Phase A harness experiment preflight
+
+The separate Phase A experiment CLI validates one canonical four-task experiment input, both fixed harness profiles, four operator-attested Git task sources, the static receipt graph, and the deterministic plan. It does not extend the legacy runner:
+
+```bash
+python3 scripts/run_harness_experiment.py preflight \
+  --input /path/to/canonical-plan.json \
+  --bundle-root /path/to/private/harness-bundle \
+  --skill-repo /path/to/clean/skill-repository \
+  --temp-parent /path/to/private/empty-temp-parent \
+  --task-source low-alpha=/path/to/task-low-alpha \
+  --task-source low-beta=/path/to/task-low-beta \
+  --task-source medium-alpha=/path/to/task-medium-alpha \
+  --task-source medium-beta=/path/to/task-medium-beta
+```
+
+The input must be exact canonical UTF-8 JSON no larger than 1 MiB. The four task IDs must match the selected task set exactly, each source must be an absolute operator-attested trusted local Git clone at the input's full commit OID, and the caller must provide an exclusive empty private temporary parent.
+
+Success exits `0` with `status=static_only`, `materialization_result=verified`, `cleanup_state=removed`, `reason_code=static_preflight_verified`, and `model_calls=0`. Any blocked result exits `2`. CLI or input rejection uses a fixed all-null result; a later preflight block may retain only the typed path-free digest prefix and cleanup state reached before the block.
+
+This is zero-model-call static evidence. It does not launch or probe Codex, prove that Codex consumed the materialized files, independently execute task qualification, validate a containment backend, compare model quality, or select a winning profile. Live canary, pilot, approval, credential, executable, network, and live-ledger commands are intentionally unavailable in Phase A.
+
+Expected result JSON and sanitized argument-error output retain no host-local absolute paths or raw input. The required paths are still command-line arguments, so shell history and local process listings are outside this output guarantee.
 
 `scripts/validate_repo.sh` always runs full repository-owned test discovery. External shared-agent contract and adapter audits are reported as `not_run` unless `SHARED_AGENTS_ROOT` is explicitly configured; the environment-independent reviewer mutation tests still run on every validation.
 
