@@ -543,7 +543,8 @@ class RepositoryValidationTests(unittest.TestCase):
         root = Path(__file__).parents[1]
         workflow = (root / ".github" / "workflows" / "validate.yml")
         source = workflow.read_text(encoding="utf-8")
-        checkout = source.index("uses: actions/checkout@v4")
+        self.assertEqual(source.count("uses: actions/checkout@v6"), 1)
+        checkout = source.index("uses: actions/checkout@v6")
         setup = source.index("uses: actions/setup-python@v7")
         baseline = source.index('python-version: "3.9"')
         assertion = source.index(
