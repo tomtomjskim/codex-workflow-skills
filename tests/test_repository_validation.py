@@ -539,12 +539,12 @@ class RepositoryValidationTests(unittest.TestCase):
                     1,
                 )
 
-    def test_ci_pins_and_checks_the_python_39_baseline_once(self):
+    def test_ci_checks_out_before_the_python_39_validation(self):
         root = Path(__file__).parents[1]
         workflow = (root / ".github" / "workflows" / "validate.yml")
         source = workflow.read_text(encoding="utf-8")
-        self.assertEqual(source.count("uses: actions/checkout@v6"), 1)
-        checkout = source.index("uses: actions/checkout@v6")
+        self.assertEqual(source.count("uses: actions/checkout@"), 1)
+        checkout = source.index("uses: actions/checkout@")
         setup = source.index("uses: actions/setup-python@v7")
         baseline = source.index('python-version: "3.9"')
         assertion = source.index(

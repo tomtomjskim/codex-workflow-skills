@@ -80,6 +80,9 @@ require_file tests/test_live_eval_experiment_telemetry.py
 require_file tests/test_live_eval_task_snapshot.py
 require_file tests/fixtures/harness_experiment/valid-plan-input.json
 require_file tests/fixtures/harness_experiment/valid-terminal.jsonl
+require_file .github/dependabot.yml
+require_file scripts/validate_ci_maintenance.py
+require_file tests/test_validate_ci_maintenance.py
 
 if [ ! -x scripts/workflow ]; then
   printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2
@@ -102,6 +105,7 @@ else
 fi
 
 run git diff --check
+run python3 scripts/validate_ci_maintenance.py
 run python3 scripts/validate_policy_contracts.py --repo-root .
 run python3 -m unittest tests.test_policy_contracts -v
 run python3 -m unittest tests.test_git_changes -v
