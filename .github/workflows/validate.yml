@@ -24,6 +24,9 @@ jobs:
       - name: Verify Python baseline
         run: python3 -c 'import sys; assert sys.version_info[:2] == (3, 9), sys.version'
 
+      - name: Install Python validation dependencies
+        run: python3 -m pip install --disable-pip-version-check -r requirements-ci.txt
+
       - name: Install validation dependency
         run: |
           sudo apt-get update
