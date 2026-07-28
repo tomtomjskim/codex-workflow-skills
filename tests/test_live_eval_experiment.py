@@ -542,6 +542,13 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                 handoff = _begin_handoff(
                     ledger, (("homes", "current"),)
                 )
+                self.assertEqual(
+                    tuple(pin.path for pin in handoff.pins),
+                    (("homes", "current"),),
+                )
+                pinned_descriptors = tuple(
+                    pin.owner.descriptor for pin in handoff.pins
+                )
                 target = (
                     temp_parent / "phase-a" / "homes" / "current"
                 )
@@ -562,6 +569,9 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                 self.assertIsInstance(entry.mtime_ns, int)
                 self.assertIsInstance(entry.ctime_ns, int)
                 self.assertFalse(ledger.has_pending_handoffs)
+                for descriptor in pinned_descriptors:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
                 self.assertTrue(_cleanup_owned_phase(ledger))
                 self.assertFalse((temp_parent / "phase-a").exists())
                 self.assertTrue(temp_parent.is_dir())
@@ -577,6 +587,9 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                 ledger = _create_phase_ledger(gate)
                 _create_owned_directory(ledger, ("home",))
                 handoff = _begin_handoff(ledger, (("home",),))
+                pinned_descriptors = tuple(
+                    pin.owner.descriptor for pin in handoff.pins
+                )
                 target = temp_parent / "phase-a" / "home"
                 (target / "partial").write_text("data")
                 with self.assertRaisesRegex(RuntimeError, "^verify failed$"):
@@ -588,6 +601,10 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                         ),
                     )
                 before_mode = stat.S_IMODE(target.stat().st_mode)
+                self.assertEqual(handoff.phase, "quarantined")
+                for descriptor in pinned_descriptors:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
                 with mock.patch(
                     "scripts.live_eval.experiment.os.unlink"
                 ) as unlink, mock.patch(
@@ -670,8 +687,8 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                 _create_owned_directory(ledger, ("home",))
                 target = temp_parent / "phase-a" / "home"
                 file_path = target / "sealed"
-                file_path.write_text("first")
                 handoff = _begin_handoff(ledger, (("home",),))
+                file_path.write_text("first")
 
                 def mutate_during_verification():
                     file_path.write_text("later")
@@ -689,6 +706,29 @@ class OwnershipAndCleanupTests(unittest.TestCase):
             finally:
                 gate.close()
 
+    def test_handoff_rejects_boundary_drift_before_begin(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("home",))
+                transient = (
+                    temp_parent / "phase-a" / "home" / "transient"
+                )
+                transient.write_text("x")
+                transient.unlink()
+                with self.assertRaisesRegex(
+                    ExperimentPreflightError,
+                    "^task_snapshot_preflight_blocked$",
+                ):
+                    _begin_handoff(ledger, (("home",),))
+                self.assertFalse(ledger.has_pending_handoffs)
+                self.assertFalse(_cleanup_owned_phase(ledger))
+            finally:
+                gate.close()
+
     def test_empty_handoff_does_not_rebaseline_changed_directory_metadata(self):
         with tempfile.TemporaryDirectory() as root:
             base = Path(root).resolve()
@@ -698,12 +738,19 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                 ledger = _create_phase_ledger(gate)
                 _create_owned_directory(ledger, ("home",))
                 handoff = _begin_handoff(ledger, (("home",),))
+                pinned_descriptors = tuple(
+                    pin.owner.descriptor for pin in handoff.pins
+                )
                 transient = temp_parent / "phase-a" / "home" / "transient"
                 transient.write_text("x")
                 transient.unlink()
                 self.assertFalse(
                     _resolve_empty_handoff(ledger, handoff)
                 )
+                self.assertEqual(handoff.phase, "quarantined")
+                for descriptor in pinned_descriptors:
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
                 self.assertTrue(ledger.has_pending_handoffs)
                 self.assertFalse(_cleanup_owned_phase(ledger))
             finally:
@@ -719,7 +766,12 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                 _create_owned_directory(ledger, ("home",))
                 handoff = _begin_handoff(ledger, (("home",),))
                 target = temp_parent / "phase-a" / "home"
-                original_inode = target.stat().st_ino
+                self.assertEqual(
+                    tuple(pin.path for pin in handoff.pins),
+                    (("home",),),
+                )
+                pin_descriptor = handoff.pins[0].owner.descriptor
+                original_inode = os.fstat(pin_descriptor).st_ino
                 target.rmdir()
                 target.mkdir(mode=0o700)
                 os.chmod(target, 0o700)
@@ -731,9 +783,455 @@ class OwnershipAndCleanupTests(unittest.TestCase):
                     _complete_handoff(
                         ledger, handoff, lambda: None
                     )
+                self.assertEqual(handoff.phase, "quarantined")
+                with self.assertRaises(OSError):
+                    os.fstat(pin_descriptor)
                 self.assertTrue(ledger.has_pending_handoffs)
                 self.assertFalse(_cleanup_owned_phase(ledger))
                 self.assertTrue(target.is_dir())
+            finally:
+                gate.close()
+
+    def test_handoff_rejects_outer_ancestor_metadata_change(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("outer",))
+                _create_owned_directory(
+                    ledger,
+                    ("outer", "boundary"),
+                )
+                handoff = _begin_handoff(
+                    ledger,
+                    (("outer", "boundary"),),
+                )
+                outer = temp_parent / "phase-a" / "outer"
+                metadata = os.stat(outer)
+                os.utime(
+                    outer,
+                    ns=(
+                        metadata.st_atime_ns,
+                        metadata.st_mtime_ns + 1_000_000_000,
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    ExperimentPreflightError,
+                    "^task_snapshot_preflight_blocked$",
+                ):
+                    _complete_handoff(
+                        ledger, handoff, lambda: None
+                    )
+                self.assertEqual(handoff.phase, "quarantined")
+                self.assertTrue(ledger.has_pending_handoffs)
+                self.assertFalse(_cleanup_owned_phase(ledger))
+            finally:
+                gate.close()
+
+    def test_handoff_deduplicates_shared_boundary_and_releases_empty_resolution(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("tasks",))
+                _create_owned_directory(ledger, ("tasks", "task-1"))
+                handoff = _begin_handoff(
+                    ledger,
+                    (
+                        ("tasks", "task-1", "current"),
+                        ("tasks", "task-1", "lean"),
+                    ),
+                )
+                self.assertEqual(
+                    tuple(pin.path for pin in handoff.pins),
+                    (("tasks", "task-1"),),
+                )
+                descriptor = handoff.pins[0].owner.descriptor
+                self.assertTrue(_resolve_empty_handoff(ledger, handoff))
+                self.assertEqual(handoff.phase, "released")
+                self.assertFalse(ledger.has_pending_handoffs)
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+                self.assertTrue(_cleanup_owned_phase(ledger))
+            finally:
+                gate.close()
+
+    def test_handoff_releases_each_distinct_boundary_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("a",))
+                _create_owned_directory(ledger, ("b",))
+                handoff = _begin_handoff(
+                    ledger,
+                    (("a",), ("b",)),
+                )
+                pin_descriptors = tuple(
+                    pin.owner.descriptor for pin in handoff.pins
+                )
+                real_close = os.close
+                close_attempts = []
+
+                def record_pin_close(descriptor):
+                    if descriptor in pin_descriptors:
+                        close_attempts.append(descriptor)
+                    return real_close(descriptor)
+
+                with mock.patch(
+                    "scripts.live_eval.experiment.os.close",
+                    side_effect=record_pin_close,
+                ):
+                    self.assertTrue(
+                        _resolve_empty_handoff(ledger, handoff)
+                    )
+
+                for descriptor in pin_descriptors:
+                    self.assertEqual(
+                        close_attempts.count(descriptor),
+                        1,
+                    )
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+                self.assertFalse(ledger.has_pending_handoffs)
+                self.assertTrue(_cleanup_owned_phase(ledger))
+            finally:
+                gate.close()
+
+    def test_handoff_close_fault_stays_quarantined_without_descriptor_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            replacement_descriptor = -1
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("a",))
+                _create_owned_directory(ledger, ("b",))
+                handoff = _begin_handoff(
+                    ledger,
+                    (("a",), ("b",)),
+                )
+                pin_descriptors = {
+                    pin.path: pin.owner.descriptor
+                    for pin in handoff.pins
+                }
+                pin_descriptor = pin_descriptors[("b",)]
+                (
+                    temp_parent / "phase-a" / "a" / "sealed"
+                ).write_text("sealed")
+                real_close = os.close
+                close_attempts = []
+
+                def close_pin_then_fault(descriptor):
+                    if descriptor in pin_descriptors.values():
+                        close_attempts.append(descriptor)
+                    if descriptor == pin_descriptor:
+                        real_close(descriptor)
+                        raise RuntimeError("pin close fault")
+                    return real_close(descriptor)
+
+                with mock.patch(
+                    "scripts.live_eval.experiment.os.close",
+                    side_effect=close_pin_then_fault,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "^pin close fault$",
+                    ):
+                        _complete_handoff(
+                            ledger, handoff, lambda: None
+                        )
+
+                for descriptor in pin_descriptors.values():
+                    self.assertEqual(
+                        close_attempts.count(descriptor),
+                        1,
+                    )
+                self.assertEqual(handoff.phase, "close_uncertain")
+                self.assertTrue(ledger.has_pending_handoffs)
+                self.assertIn(("a", "sealed"), ledger.entries)
+                with self.assertRaises(OSError):
+                    os.fstat(pin_descriptors[("a",)])
+                replacement_descriptor = os.open(
+                    os.devnull,
+                    os.O_RDONLY,
+                )
+                if replacement_descriptor != pin_descriptor:
+                    os.dup2(replacement_descriptor, pin_descriptor)
+                    os.close(replacement_descriptor)
+                    replacement_descriptor = pin_descriptor
+                self.assertFalse(
+                    _resolve_empty_handoff(ledger, handoff)
+                )
+                os.fstat(replacement_descriptor)
+                self.assertFalse(_cleanup_owned_phase(ledger))
+            finally:
+                if replacement_descriptor >= 0:
+                    os.close(replacement_descriptor)
+                gate.close()
+
+    def test_handoff_allocation_failure_closes_unpublished_boundary(self):
+        for target in (
+            "_ResourceOwner",
+            "_HandoffPin",
+            "_HandoffCell",
+            "_LedgerState",
+        ):
+            with self.subTest(target=target):
+                with tempfile.TemporaryDirectory() as root:
+                    base = Path(root).resolve()
+                    temp_parent = self._directory(base, "temp")
+                    gate = _open_physical_directory_gate(temp_parent)
+                    try:
+                        ledger = _create_phase_ledger(gate)
+                        _create_owned_directory(ledger, ("home",))
+                        real_open_relative = (
+                            experiment_module
+                            ._open_relative_directory
+                        )
+                        opened = []
+                        serial = ledger._next_serial
+
+                        def record_boundary_open(
+                            root_descriptor,
+                            components,
+                        ):
+                            descriptor = real_open_relative(
+                                root_descriptor,
+                                components,
+                            )
+                            if components == ("phase-a", "home"):
+                                opened.append(descriptor)
+                            return descriptor
+
+                        with mock.patch(
+                            "scripts.live_eval.experiment."
+                            "_open_relative_directory",
+                            side_effect=record_boundary_open,
+                        ), mock.patch(
+                            "scripts.live_eval.experiment." + target,
+                            side_effect=MemoryError(
+                                "allocation fault"
+                            ),
+                        ):
+                            with self.assertRaisesRegex(
+                                ExperimentPreflightError,
+                                "^task_snapshot_preflight_blocked$",
+                            ):
+                                _begin_handoff(
+                                    ledger,
+                                    (("home",),),
+                                )
+
+                        self.assertEqual(len(opened), 1)
+                        with self.assertRaises(OSError):
+                            os.fstat(opened[0])
+                        self.assertFalse(
+                            ledger.has_pending_handoffs
+                        )
+                        self.assertEqual(
+                            ledger._next_serial,
+                            serial,
+                        )
+                        self.assertTrue(
+                            _cleanup_owned_phase(ledger)
+                        )
+                    finally:
+                        gate.close()
+
+    def test_pin_owner_transfer_alias_closes_descriptor_once(self):
+        descriptor = os.open(os.devnull, os.O_RDONLY)
+        real_close = os.close
+        close_attempts = []
+        try:
+            owner = experiment_module._ResourceOwner(descriptor)
+
+            def record_close(candidate):
+                if candidate == descriptor:
+                    close_attempts.append(candidate)
+                return real_close(candidate)
+
+            with mock.patch(
+                "scripts.live_eval.experiment.os.close",
+                side_effect=record_close,
+            ):
+                released, failure = (
+                    experiment_module._drain_pin_owners(
+                        (),
+                        extra_owner=owner,
+                        raw_descriptor=descriptor,
+                    )
+                )
+            self.assertTrue(released)
+            self.assertIsNone(failure)
+            self.assertEqual(close_attempts, [descriptor])
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    pass
+                else:
+                    real_close(descriptor)
+
+    def test_handoff_partial_pin_failure_closes_prior_boundary(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("a",))
+                _create_owned_directory(ledger, ("b",))
+                real_open_relative = (
+                    experiment_module._open_relative_directory
+                )
+                opened = []
+                serial = ledger._next_serial
+
+                def open_a_then_fail_b(root_descriptor, components):
+                    if components == ("phase-a", "b"):
+                        raise OSError("second boundary open fault")
+                    descriptor = real_open_relative(
+                        root_descriptor,
+                        components,
+                    )
+                    if components == ("phase-a", "a"):
+                        opened.append(descriptor)
+                    return descriptor
+
+                with mock.patch(
+                    "scripts.live_eval.experiment."
+                    "_open_relative_directory",
+                    side_effect=open_a_then_fail_b,
+                ):
+                    with self.assertRaisesRegex(
+                        ExperimentPreflightError,
+                        "^task_snapshot_preflight_blocked$",
+                    ):
+                        _begin_handoff(
+                            ledger,
+                            (("a",), ("b",)),
+                        )
+
+                self.assertEqual(len(opened), 1)
+                with self.assertRaises(OSError):
+                    os.fstat(opened[0])
+                self.assertFalse(ledger.has_pending_handoffs)
+                self.assertEqual(ledger._next_serial, serial)
+                self.assertTrue(_cleanup_owned_phase(ledger))
+            finally:
+                gate.close()
+
+    def test_handoff_post_open_validation_failure_closes_all_boundaries(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("a",))
+                _create_owned_directory(ledger, ("b",))
+                real_open_relative = (
+                    experiment_module._open_relative_directory
+                )
+                real_fstat = os.fstat
+                opened = {}
+                serial = ledger._next_serial
+
+                def record_boundary_open(
+                    root_descriptor,
+                    components,
+                ):
+                    descriptor = real_open_relative(
+                        root_descriptor,
+                        components,
+                    )
+                    if components in (
+                        ("phase-a", "a"),
+                        ("phase-a", "b"),
+                    ):
+                        opened[components[-1]] = descriptor
+                    return descriptor
+
+                def fail_second_boundary_fstat(descriptor):
+                    if descriptor == opened.get("b"):
+                        raise OSError("boundary fstat fault")
+                    return real_fstat(descriptor)
+
+                with mock.patch(
+                    "scripts.live_eval.experiment."
+                    "_open_relative_directory",
+                    side_effect=record_boundary_open,
+                ), mock.patch(
+                    "scripts.live_eval.experiment.os.fstat",
+                    side_effect=fail_second_boundary_fstat,
+                ):
+                    with self.assertRaisesRegex(
+                        ExperimentPreflightError,
+                        "^task_snapshot_preflight_blocked$",
+                    ):
+                        _begin_handoff(
+                            ledger,
+                            (("a",), ("b",)),
+                        )
+
+                self.assertEqual(set(opened), {"a", "b"})
+                for descriptor in opened.values():
+                    with self.assertRaises(OSError):
+                        os.fstat(descriptor)
+                self.assertFalse(ledger.has_pending_handoffs)
+                self.assertEqual(ledger._next_serial, serial)
+                self.assertTrue(_cleanup_owned_phase(ledger))
+            finally:
+                gate.close()
+
+    def test_handoff_rejects_nested_pending_and_unbounded_prefixes(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root).resolve()
+            temp_parent = self._directory(base, "temp")
+            gate = _open_physical_directory_gate(temp_parent)
+            try:
+                ledger = _create_phase_ledger(gate)
+                _create_owned_directory(ledger, ("home",))
+                handoff = _begin_handoff(ledger, (("home",),))
+                with mock.patch(
+                    "scripts.live_eval.experiment."
+                    "_open_relative_directory"
+                ) as open_relative:
+                    with self.assertRaisesRegex(
+                        ExperimentPreflightError,
+                        "^task_snapshot_preflight_blocked$",
+                    ):
+                        _begin_handoff(ledger, (("other",),))
+                open_relative.assert_not_called()
+                self.assertTrue(
+                    _resolve_empty_handoff(ledger, handoff)
+                )
+                with self.assertRaisesRegex(
+                    ExperimentPreflightError,
+                    "^task_snapshot_preflight_blocked$",
+                ):
+                    _begin_handoff(
+                        ledger,
+                        (
+                            ("one",),
+                            ("two",),
+                            ("three",),
+                        ),
+                    )
+                self.assertFalse(ledger.has_pending_handoffs)
+                self.assertTrue(_cleanup_owned_phase(ledger))
             finally:
                 gate.close()
 

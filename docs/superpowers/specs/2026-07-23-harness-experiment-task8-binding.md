@@ -417,6 +417,26 @@ before the callee call and ends only after:
 4. the complete acquisition record is published to the outer ownership
    ledger as one logical commit.
 
+Before invoking the callee, the outer ledger opens and retains the deepest
+already-owned directory boundary for each handoff prefix. Duplicate boundaries
+share one descriptor, and one handoff contains at most two prefixes. Before
+the handoff becomes pending, each opened boundary must still match its complete
+recorded entry; pre-handoff metadata drift is rejected. While those descriptors
+remain live, only the pinned boundary paths may change mutable directory
+metadata while retaining the recorded stable token and mode. Every other
+previously owned ancestor must retain its complete recorded entry. This
+prevents an unlinked boundary inode from being recycled into a replacement
+during acquisition without requiring persistent descriptors for the acquired
+descendants.
+
+After both acquisition scans pass, the ledger stages the new entries while
+the handoff remains pending, attempts each boundary-descriptor close exactly
+once, and removes the pending handoff only after every close succeeds. A close
+fault or uncertain close result keeps the staged tree quarantined and prevents
+cleanup mutation; the descriptor number is never retried. The
+TaskSnapshotMaterializer descriptor ceiling remains relative to its caller
+baseline and is unchanged by this outer-ledger boundary pin.
+
 Before that commit, cleanup-time scanning must not invent authority.
 
 - A directory created directly by Task 8 is acquired only as the exact empty
@@ -476,13 +496,16 @@ Task 8 is not complete without:
   fault injection;
 - unrelated shared-ancestor inventory mutation accepted without weakening
   stable identity, owner, or mode checks;
-- direct-directory descendant injection and post-capture leaf replacement;
+- direct-directory descendant injection, pinned-boundary inode-reuse
+  replacement, strict outer-ancestor mutation, and post-capture leaf
+  replacement;
 - same-length task content mutation and same-content/mode inode replacement,
   while retaining zero immediate public task `verify()` calls;
 - compare-equal forged snapshot scalars or non-canonical receipts rejected
   before acquisition publication;
 - descriptor close-fault injection proving exactly-once child close attempts
-  and guaranteed parent-close traversal;
+  and guaranteed parent-close traversal, plus boundary-pin close uncertainty
+  retaining pending quarantine without descriptor-number retry;
 - returned-home and returned-pair scan/publication fault injection;
 - ordinary-exception quarantine and non-`Exception` propagation tests;
 - poison pills proving zero model, network, authentication, executable

@@ -7642,17 +7642,20 @@ class TaskSnapshotMaterializedSurfaceTests(
                         "directory",
                     )
                 )
-                before_inode = os.lstat(leaf_target).st_ino
-                content = leaf_target.read_bytes()
-                os.chmod(nested_target, 0o700)
-                leaf_target.unlink()
-                leaf_target.write_bytes(content)
-                os.chmod(leaf_target, 0o444)
-                os.chmod(nested_target, 0o555)
-                self.assertNotEqual(
-                    before_inode,
-                    os.lstat(leaf_target).st_ino,
-                )
+                with leaf_target.open("rb") as original_leaf:
+                    before_inode = os.fstat(
+                        original_leaf.fileno()
+                    ).st_ino
+                    content = original_leaf.read()
+                    os.chmod(nested_target, 0o700)
+                    leaf_target.unlink()
+                    leaf_target.write_bytes(content)
+                    os.chmod(leaf_target, 0o444)
+                    os.chmod(nested_target, 0o555)
+                    self.assertNotEqual(
+                        before_inode,
+                        os.lstat(leaf_target).st_ino,
+                    )
                 self.assertEqual(
                     root_identity_before,
                     task_snapshot_module._identity(

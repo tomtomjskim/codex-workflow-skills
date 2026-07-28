@@ -101,6 +101,7 @@ _MAX_COMPONENT_BYTES = 255
 _MAX_RELATIVE_PATH_BYTES = 4096
 _MAX_TREE_DEPTH = 72
 _MAX_OWNED_LEDGER_ENTRIES = 1_000_000
+_MAX_HANDOFF_PREFIXES = 2
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -680,9 +681,18 @@ class _OwnedEntry:
 
 
 @dataclass(frozen=True)
+class _HandoffPin:
+    path: Tuple[str, ...]
+    entry: _OwnedEntry
+    owner: "_ResourceOwner" = field(repr=False, compare=False)
+
+
+@dataclass(eq=False)
 class _HandoffCell:
     serial: int
     prefixes: Tuple[Tuple[str, ...], ...]
+    pins: Tuple[_HandoffPin, ...] = field(repr=False)
+    phase: str = field(default="acquiring", repr=False)
 
 
 @dataclass(frozen=True)
@@ -706,6 +716,17 @@ class _ResourceOwner:
     @property
     def close_uncertain(self) -> bool:
         return self._close_uncertain
+
+    @property
+    def close_started(self) -> bool:
+        return self._close_started
+
+    def owns_descriptor(self, descriptor: int) -> bool:
+        return (
+            not self._close_started
+            and self._descriptor >= 0
+            and self._descriptor == descriptor
+        )
 
     def close(self) -> None:
         if self._descriptor < 0:
@@ -1317,23 +1338,85 @@ def _begin_handoff(
     if (
         type(ledger) is not _OwnershipLedger
         or ledger._removed
+        or ledger.has_pending_handoffs
         or not isinstance(prefixes, ABCSequence)
         or isinstance(prefixes, (str, bytes, bytearray))
     ):
         _fail("task_snapshot_preflight_blocked")
     checked = tuple(prefixes)
-    if not checked:
+    if not checked or len(checked) > _MAX_HANDOFF_PREFIXES:
         _fail("task_snapshot_preflight_blocked")
     for prefix in checked:
         _validate_owned_path(prefix)
     if len(set(checked)) != len(checked):
         _fail("task_snapshot_preflight_blocked")
-    cell = _HandoffCell(ledger._next_serial, checked)
-    ledger._next_serial += 1
-    ledger._state = _LedgerState(
-        entries=ledger.entries,
-        pending=ledger._state.pending + (cell,),
-    )
+
+    boundary_paths = set()
+    for prefix in checked:
+        if (
+            prefix in ledger.entries
+            and ledger.entries[prefix].token.kind != "directory"
+        ):
+            _fail("task_snapshot_preflight_blocked")
+        boundary = None
+        for length in range(len(prefix), -1, -1):
+            candidate = prefix[:length]
+            entry = ledger.entries.get(candidate)
+            if entry is not None and entry.token.kind == "directory":
+                boundary = candidate
+                break
+        if boundary is None:
+            _fail("task_snapshot_preflight_blocked")
+        boundary_paths.add(boundary)
+
+    pins = []
+    raw_descriptor = -1
+    current_owner = None
+    next_serial = ledger._next_serial + 1
+    try:
+        for path in sorted(boundary_paths, key=lambda item: (len(item), item)):
+            raw_descriptor = _open_relative_directory(
+                ledger.gate.descriptor,
+                ("phase-a",) + path,
+            )
+            current_owner = _ResourceOwner(raw_descriptor)
+            raw_descriptor = -1
+            expected = ledger.entries[path]
+            observed = _entry_from_stat(
+                path,
+                os.fstat(current_owner.descriptor),
+                expected.children,
+            )
+            if observed != expected:
+                _fail("task_snapshot_preflight_blocked")
+            pin = _HandoffPin(path, expected, current_owner)
+            pins.append(pin)
+            current_owner = None
+        cell = _HandoffCell(
+            ledger._next_serial,
+            checked,
+            tuple(pins),
+        )
+        next_state = _LedgerState(
+            entries=ledger.entries,
+            pending=ledger._state.pending + (cell,),
+        )
+    except BaseException as caught:
+        unused_released, close_failure = _drain_pin_owners(
+            pins,
+            extra_owner=current_owner,
+            raw_descriptor=raw_descriptor,
+        )
+        if close_failure is not None and isinstance(caught, Exception):
+            raise close_failure
+        if not isinstance(caught, Exception):
+            raise
+        if isinstance(caught, ExperimentPreflightError):
+            raise
+        _fail("task_snapshot_preflight_blocked")
+
+    ledger._next_serial = next_serial
+    ledger._state = next_state
     return cell
 
 
@@ -1344,11 +1427,126 @@ def _path_under(
     return len(path) >= len(prefix) and path[: len(prefix)] == prefix
 
 
-def _path_is_ancestor(
-    path: Tuple[str, ...],
-    prefix: Tuple[str, ...],
+def _drain_pin_owners(
+    pins: Sequence[_HandoffPin],
+    *,
+    extra_owner: Optional[_ResourceOwner] = None,
+    raw_descriptor: int = -1,
+) -> Tuple[bool, Optional[BaseException]]:
+    failure = None
+    uncertain = False
+    if (
+        raw_descriptor >= 0
+        and extra_owner is not None
+        and extra_owner.owns_descriptor(raw_descriptor)
+    ):
+        raw_descriptor = -1
+    if raw_descriptor >= 0:
+        try:
+            os.close(raw_descriptor)
+        except BaseException as caught:
+            uncertain = True
+            failure = caught
+
+    if extra_owner is not None:
+        if extra_owner.close_started:
+            uncertain = uncertain or extra_owner.close_uncertain
+        else:
+            try:
+                extra_owner.close()
+            except BaseException as caught:
+                uncertain = True
+                if failure is None or (
+                    isinstance(failure, Exception)
+                    and not isinstance(caught, Exception)
+                ):
+                    failure = caught
+
+    index = len(pins) - 1
+    while index >= 0:
+        owner = pins[index].owner
+        if owner.close_started:
+            uncertain = uncertain or owner.close_uncertain
+            index -= 1
+            continue
+        try:
+            owner.close()
+        except BaseException as caught:
+            uncertain = True
+            if failure is None or (
+                isinstance(failure, Exception)
+                and not isinstance(caught, Exception)
+            ):
+                failure = caught
+        index -= 1
+    return not uncertain, failure
+
+
+def _release_handoff_pins(
+    handoff: _HandoffCell,
+    *,
+    terminal_phase: str,
 ) -> bool:
-    return len(path) <= len(prefix) and prefix[: len(path)] == path
+    if (
+        type(handoff) is not _HandoffCell
+        or terminal_phase not in ("released", "quarantined")
+    ):
+        _fail("task_snapshot_preflight_blocked")
+    if handoff.phase == "close_uncertain":
+        return False
+    if handoff.phase in ("released", "quarantined"):
+        return True
+    if handoff.phase not in ("acquiring", "published"):
+        _fail("task_snapshot_preflight_blocked")
+
+    active = sys.exc_info()[1]
+    released, failure = _drain_pin_owners(handoff.pins)
+    handoff.phase = (
+        terminal_phase if released else "close_uncertain"
+    )
+    if failure is not None and not (
+        active is not None and not isinstance(active, Exception)
+    ):
+        raise failure
+    return released
+
+
+def _abandon_handoff(handoff: _HandoffCell) -> None:
+    if type(handoff) is not _HandoffCell:
+        _fail("task_snapshot_preflight_blocked")
+    if handoff.phase in ("acquiring", "published"):
+        _release_handoff_pins(
+            handoff,
+            terminal_phase="quarantined",
+        )
+
+
+def _validate_handoff_pins(
+    handoff: _HandoffCell,
+    scanned: Mapping[Tuple[str, ...], _OwnedEntry],
+) -> None:
+    if handoff.phase != "acquiring" or not handoff.pins:
+        _fail("task_snapshot_preflight_blocked")
+    for pin in handoff.pins:
+        try:
+            pinned = _entry_from_stat(
+                pin.path,
+                os.fstat(pin.owner.descriptor),
+                pin.entry.children,
+            )
+        except ExperimentPreflightError:
+            raise
+        except (OSError, TypeError, ValueError):
+            _fail("task_snapshot_preflight_blocked")
+        candidate = scanned.get(pin.path)
+        if (
+            candidate is None
+            or pinned.token != pin.entry.token
+            or pinned.mode != pin.entry.mode
+            or candidate.token != pin.entry.token
+            or candidate.mode != pin.entry.mode
+        ):
+            _fail("task_snapshot_preflight_blocked")
 
 
 def _validate_handoff_scan(
@@ -1358,19 +1556,17 @@ def _validate_handoff_scan(
 ) -> None:
     if handoff not in ledger._state.pending:
         _fail("task_snapshot_preflight_blocked")
+    _validate_handoff_pins(handoff, scanned)
     previous = ledger.entries
     if any(path not in scanned for path in previous):
         _fail("task_snapshot_preflight_blocked")
+    boundary_paths = {pin.path for pin in handoff.pins}
     for path, entry in previous.items():
         candidate = scanned[path]
         if candidate == entry:
             continue
-        is_ancestor = any(
-            _path_is_ancestor(path, prefix)
-            for prefix in handoff.prefixes
-        )
         if (
-            not is_ancestor
+            path not in boundary_paths
             or candidate.token != entry.token
             or candidate.mode != entry.mode
         ):
@@ -1394,37 +1590,61 @@ def _complete_handoff(
         Mapping[Tuple[str, ...], _OwnedEntry]
     ] = None,
 ) -> Mapping[Tuple[str, ...], _OwnedEntry]:
-    if not callable(verifier):
+    if not callable(verifier) or handoff.phase != "acquiring":
         _fail("task_snapshot_preflight_blocked")
-    first = _scan_phase_tree(ledger.gate)
-    _validate_handoff_scan(ledger, handoff, first)
-    _validate_expected_handoff_inventory(
-        first, handoff, expected_inventory
-    )
-    _validate_expected_handoff_entries(
-        first,
-        handoff,
-        expected_entries,
-    )
-    verifier()
-    second = _scan_phase_tree(ledger.gate)
-    _validate_handoff_scan(ledger, handoff, second)
-    _validate_expected_handoff_inventory(
-        second, handoff, expected_inventory
-    )
-    _validate_expected_handoff_entries(
-        second,
-        handoff,
-        expected_entries,
-    )
-    if first != second:
-        _fail("task_snapshot_preflight_blocked")
-    ledger._state = _LedgerState(
-        entries=MappingProxyType(dict(second)),
-        pending=tuple(
-            cell for cell in ledger._state.pending if cell is not handoff
-        ),
-    )
+    try:
+        first = _scan_phase_tree(ledger.gate)
+        _validate_handoff_scan(ledger, handoff, first)
+        _validate_expected_handoff_inventory(
+            first, handoff, expected_inventory
+        )
+        _validate_expected_handoff_entries(
+            first,
+            handoff,
+            expected_entries,
+        )
+        verifier()
+        second = _scan_phase_tree(ledger.gate)
+        _validate_handoff_scan(ledger, handoff, second)
+        _validate_expected_handoff_inventory(
+            second, handoff, expected_inventory
+        )
+        _validate_expected_handoff_entries(
+            second,
+            handoff,
+            expected_entries,
+        )
+        if first != second:
+            _fail("task_snapshot_preflight_blocked")
+    except BaseException:
+        _release_handoff_pins(
+            handoff,
+            terminal_phase="quarantined",
+        )
+        raise
+
+    try:
+        handoff.phase = "published"
+        ledger._state = _LedgerState(
+            entries=MappingProxyType(dict(second)),
+            pending=ledger._state.pending,
+        )
+        if not _release_handoff_pins(
+            handoff,
+            terminal_phase="released",
+        ):
+            _fail("task_snapshot_preflight_blocked")
+        ledger._state = _LedgerState(
+            entries=ledger.entries,
+            pending=tuple(
+                cell
+                for cell in ledger._state.pending
+                if cell is not handoff
+            ),
+        )
+    except BaseException:
+        _abandon_handoff(handoff)
+        raise
     return ledger.entries
 
 
@@ -1495,10 +1715,22 @@ def _resolve_empty_handoff(
     ledger: _OwnershipLedger,
     handoff: _HandoffCell,
 ) -> bool:
+    if (
+        type(ledger) is not _OwnershipLedger
+        or type(handoff) is not _HandoffCell
+        or handoff.phase != "acquiring"
+        or handoff not in ledger._state.pending
+    ):
+        return False
     try:
         scanned = _scan_phase_tree(ledger.gate)
         _validate_handoff_scan(ledger, handoff, scanned)
         if scanned != ledger.entries:
+            _fail("task_snapshot_preflight_blocked")
+        if not _release_handoff_pins(
+            handoff,
+            terminal_phase="released",
+        ):
             return False
         ledger._state = _LedgerState(
             entries=ledger.entries,
@@ -1507,7 +1739,17 @@ def _resolve_empty_handoff(
             ),
         )
         return True
-    except Exception:
+    except BaseException as caught:
+        try:
+            _abandon_handoff(handoff)
+        except BaseException as close_error:
+            if not isinstance(close_error, Exception):
+                raise
+            if not isinstance(caught, Exception):
+                raise caught
+            return False
+        if not isinstance(caught, Exception):
+            raise
         return False
 
 
@@ -1578,9 +1820,10 @@ def _create_owned_directory(
             MappingProxyType({path: expected_entry}),
         )
     except BaseException as caught:
-        if not isinstance(caught, Exception):
-            raise
-        _resolve_empty_handoff(ledger, handoff)
+        if isinstance(caught, Exception):
+            _resolve_empty_handoff(ledger, handoff)
+        else:
+            _abandon_handoff(handoff)
         raise
     finally:
         try:
@@ -2274,6 +2517,8 @@ def _materialize_acquired_harness(
     except BaseException as caught:
         if isinstance(caught, Exception):
             _resolve_empty_handoff(ledger, handoff)
+        else:
+            _abandon_handoff(handoff)
         raise
 
     def verify() -> None:
@@ -2802,6 +3047,8 @@ def _materialize_acquired_task(
         except BaseException as caught:
             if isinstance(caught, Exception):
                 _resolve_empty_handoff(ledger, handoff)
+            else:
+                _abandon_handoff(handoff)
             raise
         pair_holder = {}
 
