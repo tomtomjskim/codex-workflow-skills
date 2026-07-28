@@ -24,6 +24,7 @@ ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
+python3 -m pip install --disable-pip-version-check -r requirements-ci.txt
 ./scripts/validate_repo.sh
 ```
 
@@ -321,6 +322,7 @@ During implementation, run the smallest focused test; run `./scripts/validate_re
 Run the repository validation script for the standard public-release checks:
 
 ```bash
+python3 -m pip install --disable-pip-version-check -r requirements-ci.txt
 ./scripts/validate_repo.sh
 ```
 
