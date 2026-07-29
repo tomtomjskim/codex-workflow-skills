@@ -1,7 +1,7 @@
 # Native Canary Readiness Design
 
 **Date:** 2026-07-29
-**Status:** approved direction, written-spec review pending
+**Status:** approved for implementation
 **Scope:** Phase B0, zero-model-call native readiness only
 
 ## 1. Context
@@ -163,11 +163,13 @@ rule, or project `.codex` directory. The exact sandbox argv is
 The environment binds that `CODEX_HOME`, and the allowed root contains no
 ambient configuration file. The evidence digest covers the exact config bytes,
 argv template, environment-key allowlist, cwd class, and executable identities.
-The supervisor environment contains only `CODEX_HOME`, `HOME`, `PATH`,
-`TMPDIR`, `LANG`, and `LC_ALL`. `CODEX_HOME` and `HOME` equal the owned
-`codex-home`, `TMPDIR` equals the owned `tmp`, `PATH` is `/usr/bin:/bin`, and
-both locale values are `C`. The child executable is passed by canonical
-absolute path and does not depend on `PATH` lookup.
+The production-candidate strong supervisor environment contains only
+`CODEX_HOME`, `HOME`, `PATH`, `TMPDIR`, `LANG`, and `LC_ALL`. `CODEX_HOME` and
+`HOME` equal the owned `codex-home`, `TMPDIR` equals the owned `tmp`, `PATH` is
+`/usr/bin:/bin`, and both locale values are `C`. The weak control uses that
+same sanitized map plus exactly one `PHASE_B0_SYNTHETIC_SECRET` entry; neither
+attempt inherits the caller's ambient environment. The child executable is
+passed by canonical absolute path and does not depend on `PATH` lookup.
 
 Phase B0 intentionally does not run or parse `codex features list`. A finite
 feature list is neither a live tool inventory nor part of Seatbelt enforcement.
@@ -332,8 +334,8 @@ public result contains only:
 - `model_calls`: always `0`;
 - policy, executable, permission-profile, supervisor-environment,
   ledger-probe, and complete evidence digests when available;
-- cleanup state;
-- one fixed reason code.
+- `cleanup_state`: `not_started`, `removed`, or `cleanup_required`;
+- `reason_code`: one fixed reason code.
 
 Private canonical evidence is staged as nonterminal mode `0600` data under one
 fresh run directory below `--private-root`. It contains no synthetic secret
