@@ -29,6 +29,17 @@ def record(previous_record_hash, sequence):
     )
 
 
+def deeply_nested_record(previous_record_hash, depth=1100):
+    nested_value = b"[" * depth + b"0" + b"]" * depth
+    return (
+        b'{"payload":'
+        + nested_value
+        + b',"previous_record_hash":"'
+        + previous_record_hash.encode("ascii")
+        + b'"}'
+    )
+
+
 class PrivateJSONLLedgerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -96,6 +107,33 @@ class PrivateJSONLLedgerTests(unittest.TestCase):
                         ledger.append(value)
                     self.assertEqual(self.read_ledger(), before)
             ledger.append(valid)
+
+    def test_deeply_nested_append_input_raises_ledger_error(self):
+        deep_record = deeply_nested_record(GENESIS)
+        with PrivateJSONLLedger.open(
+            self.directory,
+            GENESIS,
+            max_bytes=len(deep_record) + 1,
+            max_record_bytes=len(deep_record),
+        ) as ledger:
+            with self.assertRaises(PrivateJSONLLedgerError):
+                ledger.append(deep_record)
+            self.assertEqual(self.read_ledger(), b"")
+
+    def test_deeply_nested_existing_history_raises_ledger_error(self):
+        deep_record = deeply_nested_record(GENESIS)
+        line = deep_record + b"\n"
+        (self.directory / "runtime.jsonl").write_bytes(line)
+        (self.directory / "runtime.lock").write_bytes(b"")
+        os.chmod(self.directory / "runtime.jsonl", 0o600)
+        os.chmod(self.directory / "runtime.lock", 0o600)
+        with self.assertRaises(PrivateJSONLLedgerError):
+            PrivateJSONLLedger.open(
+                self.directory,
+                GENESIS,
+                max_bytes=len(line),
+                max_record_bytes=len(deep_record),
+            )
 
     def test_record_and_total_byte_limits_do_not_write(self):
         with PrivateJSONLLedger.open(

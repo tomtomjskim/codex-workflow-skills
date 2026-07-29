@@ -268,10 +268,11 @@ class PrivateJSONLLedger:
                 raise PrivateJSONLLedgerError("record count limit exceeded")
             try:
                 parsed = load_canonical_input(raw_line)
-            except CanonicalJSONError as error:
+                encoded = canonical_bytes(parsed)
+            except (CanonicalJSONError, RecursionError) as error:
                 raise PrivateJSONLLedgerError("ledger record is invalid") from error
             if (
-                canonical_bytes(parsed) != raw_line
+                encoded != raw_line
                 or not isinstance(parsed, dict)
                 or "previous_record_hash" not in parsed
                 or parsed["previous_record_hash"] != expected_hash
@@ -286,10 +287,11 @@ class PrivateJSONLLedger:
             raise PrivateJSONLLedgerError("record must be bytes")
         try:
             parsed = load_canonical_input(record_bytes)
-        except CanonicalJSONError as error:
+            encoded = canonical_bytes(parsed)
+        except (CanonicalJSONError, RecursionError) as error:
             raise PrivateJSONLLedgerError("record is not canonical JSON") from error
         if (
-            canonical_bytes(parsed) != record_bytes
+            encoded != record_bytes
             or not isinstance(parsed, dict)
             or "previous_record_hash" not in parsed
             or parsed["previous_record_hash"] != self._state.last_record_hash
