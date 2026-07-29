@@ -249,6 +249,33 @@ def _phase_b0_surface_violations(source, filename):
         violations.append("subprocess_import_boundary")
     if socket_imports != (1 if native else 0):
         violations.append("socket_import_boundary")
+    if native:
+        probe_functions = [
+            node
+            for node in parsed.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_probe_argv"
+        ]
+        expected_returns = {
+            ast.dump(ast.parse("child", mode="eval").body),
+            ast.dump(
+                ast.parse(
+                    (
+                        '(str(codex), "sandbox", "-P", '
+                        'PERMISSION_PROFILE_NAME, "-C", str(allowed), "--",) '
+                        "+ child"
+                    ),
+                    mode="eval",
+                ).body
+            ),
+        }
+        actual_returns = {
+            ast.dump(node.value)
+            for function in probe_functions
+            for node in ast.walk(function)
+            if isinstance(node, ast.Return) and node.value is not None
+        }
+        if len(probe_functions) != 1 or actual_returns != expected_returns:
+            violations.append("strong_command_shape")
     for forbidden, label in _PHASE_B0_PROHIBITED_SOURCE.items():
         if forbidden in source:
             violations.append("prohibited_source:" + label)
@@ -283,6 +310,8 @@ def _phase_b0_surface_violations(source, filename):
         if not isinstance(node, ast.Call):
             continue
         name = _qualified_name(node.func, aliases)
+        if name in {"os.environ.get", "os.getenv"}:
+            violations.append("ambient_environment_access")
         if name is not None and name.startswith("subprocess."):
             subprocess_calls.append(node)
             argv = literal_argv(node.args[0]) if node.args else None
@@ -739,6 +768,46 @@ class RepositoryValidationTests(unittest.TestCase):
                     _phase_b0_surface_violations(
                         source + "\n" + mutation, str(native)
                     ),
+                )
+
+    def test_phase_b0_gate_binds_command_builder_and_environment_key(self):
+        root = Path(__file__).parents[1]
+        native = root / "scripts" / "live_eval" / "native_canary_readiness.py"
+        source = native.read_text(encoding="utf-8")
+        sandbox_prefix = (
+            'str(codex), "sandbox", "-P", PERMISSION_PROFILE_NAME,'
+        )
+        mutations = (
+            (
+                source.replace(
+                    sandbox_prefix,
+                    'str(codex), "exec", "-P", PERMISSION_PROFILE_NAME,',
+                    1,
+                ),
+                "strong_command_shape",
+            ),
+            (
+                source.replace(
+                    sandbox_prefix,
+                    (
+                        'str(codex), "features", "list", "-P", '
+                        "PERMISSION_PROFILE_NAME,"
+                    ),
+                    1,
+                ),
+                "strong_command_shape",
+            ),
+            (
+                source + '\nos.environ.get("OPENAI_API_KEY")\n',
+                "ambient_environment_access",
+            ),
+        )
+        self.assertIn(sandbox_prefix, source)
+        for mutated, expected in mutations:
+            with self.subTest(expected=expected):
+                self.assertIn(
+                    expected,
+                    _phase_b0_surface_violations(mutated, str(native)),
                 )
 
     def test_phase_b0_path_uses_only_bounded_native_seams(self):

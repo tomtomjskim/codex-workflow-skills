@@ -12,6 +12,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.live_eval.native_canary_readiness import (  # noqa: E402
+    NATIVE_CANARY_READINESS_POLICY_DIGEST,
     NativeCanaryReadinessRequest,
     NativeCanaryReadinessResult,
     run_native_canary_readiness,
@@ -46,7 +47,7 @@ def _blocked_result() -> NativeCanaryReadinessResult:
     return NativeCanaryReadinessResult(
         status="blocked",
         model_calls=0,
-        policy_digest="sha256:" + "0" * 64,
+        policy_digest=NATIVE_CANARY_READINESS_POLICY_DIGEST,
         codex_executable_identity_digest=None,
         python_executable_identity_digest=None,
         permission_profile_evidence_digest=None,

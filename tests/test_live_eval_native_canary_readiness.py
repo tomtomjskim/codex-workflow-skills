@@ -280,6 +280,46 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                 finally:
                     publisher.close()
 
+    def test_initial_evidence_post_replace_failure_removes_pending(self) -> None:
+        pending = {
+            "cleanup_state": "pending",
+            "reason_code": "cleanup_required",
+            "schema_version": 1,
+            "status": "blocked",
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            private_root = Path(raw).resolve() / "private"
+            private_root.mkdir(mode=0o700)
+            root_fd = os.open(
+                str(private_root),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            root_info = os.fstat(root_fd)
+            publisher = _EvidencePublisher(
+                private_root,
+                root_fd,
+                (root_info.st_dev, root_info.st_ino),
+            )
+            os.close(root_fd)
+            triggered = {"value": False}
+            original_fsync = readiness_module.os.fsync
+
+            def failing_fsync(descriptor):
+                if not triggered["value"] and descriptor == publisher._run_fd:
+                    triggered["value"] = True
+                    raise OSError(errno.EIO, "post-rename fsync fault")
+                return original_fsync(descriptor)
+
+            try:
+                with mock.patch.object(
+                    readiness_module.os, "fsync", side_effect=failing_fsync
+                ), self.assertRaises(OSError):
+                    publisher.publish(pending)
+                self.assertTrue(triggered["value"])
+                self.assertEqual(list(publisher.run_directory.iterdir()), [])
+            finally:
+                publisher.close()
+
     def test_production_policy_literals_match_exact_contract(self) -> None:
         self.assertEqual(PERMISSION_PROFILE_NAME, "phase-b0-native-readonly")
         self.assertEqual(len(CONFIG_BYTES), 284)
@@ -489,6 +529,31 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                 "darwin",
                 calls.append,
             )
+        self.assertEqual(result.reason_code, "request_invalid")
+        self.assertEqual(calls, [])
+
+    def test_same_physical_request_roots_are_rejected(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw).resolve()
+            temp_parent = base / "temp"
+            private_root = base / "private"
+            temp_parent.mkdir(mode=0o700)
+            private_root.mkdir(mode=0o700)
+            request = NativeCanaryReadinessRequest(
+                Path(os.path.realpath(sys.executable)),
+                Path(os.path.realpath(sys.executable)),
+                temp_parent,
+                private_root,
+            )
+            with mock.patch.object(
+                readiness_module,
+                "_validate_root_fd",
+                side_effect=((123, 456), (123, 456)),
+            ):
+                result = _run_with_policy(
+                    request, _PRODUCTION_POLICY, "darwin", calls.append
+                )
         self.assertEqual(result.reason_code, "request_invalid")
         self.assertEqual(calls, [])
 

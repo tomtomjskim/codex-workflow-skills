@@ -299,7 +299,9 @@ assert len(CONFIG_BYTES) == 284
 assert "sha256:" + hashlib.sha256(CONFIG_BYTES).hexdigest() == _POLICY_DOCUMENT["permission_profile"]["config_sha256"]
 assert len(CHILD_SOURCE.encode("utf-8")) == 2489
 assert "sha256:" + hashlib.sha256(CHILD_SOURCE.encode("utf-8")).hexdigest() == _POLICY_DOCUMENT["child"]["sha256"]
-assert sha256_id(_POLICY_DOCUMENT) == "sha256:af3a5979f7799bdf27f8ec100352a458b47e01464753d9f76e8f6826639e777c"
+NATIVE_CANARY_READINESS_POLICY_DIGEST = sha256_id(_POLICY_DOCUMENT)
+
+assert NATIVE_CANARY_READINESS_POLICY_DIGEST == "sha256:af3a5979f7799bdf27f8ec100352a458b47e01464753d9f76e8f6826639e777c"
 
 
 def _blocked(
@@ -408,6 +410,8 @@ def _validate_request(request: object) -> Optional[_TrustedRoots]:
         private_identity = _validate_root_fd(
             private_fd, request.private_root, empty=False
         )
+        if temp_identity == private_identity:
+            raise OSError(errno.EPERM, "request roots share one identity")
         return _TrustedRoots(
             temp_fd, private_fd, temp_identity, private_identity
         )
@@ -1326,6 +1330,9 @@ class _EvidencePublisher:
                     fallback_staging, fallback_bytes, success_identity
                 )
                 fallback_staging = None
+            elif replaced and success_identity is not None:
+                self._remove_identity(success_identity)
+                os.fsync(self._run_fd)
             raise
         finally:
             if descriptor >= 0:

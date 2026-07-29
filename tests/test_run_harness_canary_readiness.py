@@ -9,6 +9,7 @@ from unittest import mock
 
 import scripts.run_harness_canary_readiness as readiness_cli
 from scripts.live_eval.native_canary_readiness import (
+    NATIVE_CANARY_READINESS_POLICY_DIGEST,
     NativeCanaryReadinessResult,
 )
 
@@ -125,6 +126,10 @@ class NativeCanaryReadinessCliTests(unittest.TestCase):
                 payload = self._assert_compact_line(stdout)
                 self.assertEqual(payload["status"], "blocked")
                 self.assertEqual(payload["reason_code"], "request_invalid")
+                self.assertEqual(
+                    payload["policy_digest"],
+                    NATIVE_CANARY_READINESS_POLICY_DIGEST,
+                )
                 self.assertNotIn(private_path, stdout)
                 self.assertNotIn("Traceback", stdout)
 
