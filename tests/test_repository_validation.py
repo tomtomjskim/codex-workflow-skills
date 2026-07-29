@@ -252,23 +252,72 @@ def _phase_b0_surface_violations(source, filename):
     for forbidden, label in _PHASE_B0_PROHIBITED_SOURCE.items():
         if forbidden in source:
             violations.append("prohibited_source:" + label)
+    parents = {
+        child: parent
+        for parent in ast.walk(parsed)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def enclosing_function(node):
+        parent = parents.get(node)
+        while parent is not None and not isinstance(
+            parent, (ast.AsyncFunctionDef, ast.FunctionDef)
+        ):
+            parent = parents.get(parent)
+        return parent.name if parent is not None else None
+
+    def literal_argv(node):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            return None
+        values = []
+        for value in node.elts:
+            if not isinstance(value, ast.Constant) or not isinstance(
+                value.value, str
+            ):
+                return None
+            values.append(value.value)
+        return tuple(values)
+
+    subprocess_calls = []
+    for node in ast.walk(parsed):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _qualified_name(node.func, aliases)
+        if name is not None and name.startswith("subprocess."):
+            subprocess_calls.append(node)
+            argv = literal_argv(node.args[0]) if node.args else None
+            if argv in {
+                ("codex", "exec"),
+                ("codex", "features", "list"),
+            }:
+                violations.append("forbidden_subprocess_argv")
+            if (
+                name != "subprocess.Popen"
+                or enclosing_function(node) != "_run_bounded_command"
+                or not node.args
+                or _qualified_name(node.args[0], aliases) != "command.argv"
+            ):
+                violations.append("subprocess_execution_surface")
+    if len(subprocess_calls) != (1 if native else 0):
+        violations.append("subprocess_execution_surface")
+
     for tree in parsed_sources:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             name = _qualified_name(node.func, aliases)
-            connects = isinstance(node.func, ast.Attribute) and (
-                node.func.attr == "connect"
+            transport = isinstance(node.func, ast.Attribute) and (
+                node.func.attr in {"bind", "connect"}
             )
-            if name != "socket.create_connection" and not connects:
+            if name != "socket.create_connection" and not transport:
                 continue
-            destinations = [
-                value.value
-                for value in ast.walk(node)
-                if isinstance(value, ast.Constant)
-                and isinstance(value.value, str)
-            ]
-            if any(destination != "127.0.0.1" for destination in destinations):
+            destination = node.args[0] if node.args else None
+            if not (
+                isinstance(destination, (ast.List, ast.Tuple))
+                and destination.elts
+                and isinstance(destination.elts[0], ast.Constant)
+                and destination.elts[0].value == "127.0.0.1"
+            ):
                 violations.append("external_network_destination")
     return tuple(sorted(set(violations)))
 
@@ -662,7 +711,19 @@ class RepositoryValidationTests(unittest.TestCase):
             ("# codex exec\n", "prohibited_source:codex_exec"),
             ("# codex features list\n", "prohibited_source:features_list"),
             (
+                "subprocess.run(('codex', 'exec'))\n",
+                "forbidden_subprocess_argv",
+            ),
+            (
+                "subprocess.run(('codex', 'features', 'list'))\n",
+                "forbidden_subprocess_argv",
+            ),
+            (
                 "socket.create_connection(('example.com', 443))\n",
+                "external_network_destination",
+            ),
+            (
+                "socket.create_connection((host, 443))\n",
                 "external_network_destination",
             ),
             (

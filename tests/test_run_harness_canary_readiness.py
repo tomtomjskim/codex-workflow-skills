@@ -128,11 +128,16 @@ class NativeCanaryReadinessCliTests(unittest.TestCase):
                 self.assertNotIn(private_path, stdout)
                 self.assertNotIn("Traceback", stdout)
 
-    def test_entrypoint_maps_interrupt_to_130(self):
+    def test_entrypoint_maps_runner_interrupt_to_130_without_traceback(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
         with mock.patch.object(
-            readiness_cli, "main", side_effect=KeyboardInterrupt()
-        ):
-            self.assertEqual(readiness_cli._entrypoint(()), 130)
+            readiness_cli,
+            "run_native_canary_readiness",
+            side_effect=KeyboardInterrupt(),
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            self.assertEqual(readiness_cli._entrypoint(self._arguments()), 130)
+        self.assertNotIn("Traceback", stdout.getvalue() + stderr.getvalue())
 
     def test_help_lists_only_the_approved_path_arguments(self):
         return_code, stdout, stderr = self._run(("--help",))
@@ -143,6 +148,18 @@ class NativeCanaryReadinessCliTests(unittest.TestCase):
         self.assertIn("--temp-parent", stdout)
         self.assertIn("--private-root", stdout)
         self.assertNotIn("\"status\"", stdout)
+
+    def test_help_wins_over_other_arguments_without_running_readiness(self):
+        with mock.patch.object(
+            readiness_cli, "run_native_canary_readiness"
+        ) as runner:
+            return_code, stdout, stderr = self._run(
+                ("--help", *self._arguments())
+            )
+        self.assertEqual(return_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(runner.call_count, 0)
+        self.assertIn("--private-root", stdout)
 
     def test_direct_script_parser_failure_has_no_traceback_or_path_leakage(self):
         root = Path(__file__).parents[1]

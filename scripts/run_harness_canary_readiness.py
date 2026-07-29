@@ -72,7 +72,7 @@ def _write_result(result: NativeCanaryReadinessResult) -> None:
 def main(arguments: Sequence[str] = None) -> int:
     parser = _build_parser()
     parsed_arguments = tuple(sys.argv[1:] if arguments is None else arguments)
-    if parsed_arguments in (("-h",), ("--help",)):
+    if "-h" in parsed_arguments or "--help" in parsed_arguments:
         parser.print_help()
         return 0
     try:
