@@ -178,7 +178,9 @@ class PrivateJSONLLedger:
         raw_path = os.fspath(directory)
         if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
             raise PrivateJSONLLedgerError("ledger directory must be an absolute path")
-        normalized = os.path.realpath(os.path.normpath(raw_path))
+        normalized = os.path.normpath(raw_path)
+        if raw_path != normalized or os.path.realpath(raw_path) != raw_path:
+            raise PrivateJSONLLedgerError("ledger directory path must be canonical")
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         return os.open(normalized, flags)
 

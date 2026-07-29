@@ -32,7 +32,7 @@ def record(previous_record_hash, sequence):
 class PrivateJSONLLedgerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.directory = Path(self.temporary.name) / "ledger"
+        self.directory = Path(self.temporary.name).resolve() / "ledger"
         self.directory.mkdir(mode=0o700)
         os.chmod(self.directory, 0o700)
 
@@ -143,6 +143,20 @@ class PrivateJSONLLedgerTests(unittest.TestCase):
         os.chmod(self.directory, 0o755)
         with self.assertRaises(PrivateJSONLLedgerError):
             PrivateJSONLLedger.open(self.directory, GENESIS)
+
+    def test_rejects_final_directory_symlink_alias(self):
+        alias = Path(self.temporary.name) / "ledger-alias"
+        alias.symlink_to(self.directory.name, target_is_directory=True)
+        with self.assertRaises(PrivateJSONLLedgerError):
+            ledger = PrivateJSONLLedger.open(alias, GENESIS)
+            ledger.close()
+
+    def test_rejects_ancestor_directory_symlink_alias(self):
+        alias_parent = Path(self.temporary.name) / "parent-alias"
+        alias_parent.symlink_to(".", target_is_directory=True)
+        with self.assertRaises(PrivateJSONLLedgerError):
+            ledger = PrivateJSONLLedger.open(alias_parent / self.directory.name, GENESIS)
+            ledger.close()
         os.chmod(self.directory, 0o700)
         with PrivateJSONLLedger.open(self.directory, GENESIS):
             pass
