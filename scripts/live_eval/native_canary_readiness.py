@@ -676,6 +676,25 @@ def _invoke(
     return result
 
 
+def _invoke_strong(
+    command: BoundedCommand,
+    runner: Callable[[BoundedCommand], BoundedCommandResult],
+    executables: Tuple[_SealedExecutable, _SealedExecutable],
+    codex_home: "_TrustedProbeDirectory",
+    config: "_TrustedProbeFile",
+) -> BoundedCommandResult:
+    for executable in executables:
+        executable.validate()
+    codex_home.validate()
+    config.validate()
+    result = _validated_runner_result(runner(command), command)
+    config.validate()
+    codex_home.validate()
+    for executable in executables:
+        executable.validate()
+    return result
+
+
 def _environment(codex_home: Path, temporary: Path, secret: Optional[str]) -> Mapping[str, str]:
     value = {
         "CODEX_HOME": str(codex_home),
@@ -950,13 +969,18 @@ class _TrustedProbeFile:
 class _TrustedProbeDirectory:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.descriptor = os.open(
-            str(path),
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-        )
-        info = self._validate_metadata(os.fstat(self.descriptor))
-        self._identity = (info.st_dev, info.st_ino)
-        self.validate()
+        self.descriptor = -1
+        try:
+            self.descriptor = os.open(
+                str(path),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            info = self._validate_metadata(os.fstat(self.descriptor))
+            self._identity = (info.st_dev, info.st_ino)
+            self.validate()
+        except Exception:
+            self.close()
+            raise
 
     @staticmethod
     def _validate_metadata(info: os.stat_result) -> os.stat_result:
@@ -1033,6 +1057,23 @@ class _TrustedProbeDirectory:
             except OSError:
                 pass
             self.descriptor = -1
+
+
+class _ResourceRegistry:
+    def __init__(self) -> None:
+        self._resources = []
+
+    def add(self, resource: object) -> object:
+        self._resources.append(resource)
+        return resource
+
+    def close(self) -> None:
+        while self._resources:
+            resource = self._resources.pop()
+            try:
+                resource.close()
+            except Exception:
+                pass
 
 
 class _EvidencePublisher:
@@ -1479,11 +1520,12 @@ def _wait_for_lock_probe(
                     observed.extend(chunk)
                 elif chunk == b"":
                     selector.unregister(read_fd)
-            waited, status = os.waitpid(process_id, os.WNOHANG)
-            if waited == process_id:
-                status_value = status
-                if not selector.get_map():
-                    break
+            if status_value is None:
+                waited, status = os.waitpid(process_id, os.WNOHANG)
+                if waited == process_id:
+                    status_value = status
+            if status_value is not None and not selector.get_map():
+                break
             if len(observed) > 1:
                 break
         if status_value is None:
@@ -1613,8 +1655,7 @@ def _run_with_policy(
     temporary_name = None
     temporary_identity = None
     publisher = None
-    probe_files = []
-    probe_directories = []
+    resources = _ResourceRegistry()
     executable_digests: Tuple[Optional[str], Optional[str]] = (None, None)
     permission_digest = supervisor_digest = ledger_digest = complete_digest = None
     runner = command_runner or _run_bounded_command
@@ -1678,16 +1719,16 @@ def _run_with_policy(
         forbidden_read = forbidden / "forbidden-read"
         allowed_write = allowed / "allowed-write"
         forbidden_write = forbidden / "forbidden-write"
-        allowed_probe = _TrustedProbeDirectory(allowed)
-        forbidden_probe = _TrustedProbeDirectory(forbidden)
-        probe_directories.extend((allowed_probe, forbidden_probe))
-        allowed_sentinel = allowed_probe.create("allowed-read", token + b"a")
-        forbidden_sentinel = forbidden_probe.create(
-            "forbidden-read", token + b"f"
-        )
-        probe_files.extend((allowed_sentinel, forbidden_sentinel))
-        paths = (allowed_read, forbidden_read, allowed_write, forbidden_write)
         reason = "weak_control_invalid"
+        allowed_probe = resources.add(_TrustedProbeDirectory(allowed))
+        forbidden_probe = resources.add(_TrustedProbeDirectory(forbidden))
+        allowed_sentinel = resources.add(
+            allowed_probe.create("allowed-read", token + b"a")
+        )
+        forbidden_sentinel = resources.add(
+            forbidden_probe.create("forbidden-read", token + b"f")
+        )
+        paths = (allowed_read, forbidden_read, allowed_write, forbidden_write)
         weak_listener = _LoopbackListener()
         try:
             weak_result = _invoke(
@@ -1728,9 +1769,11 @@ def _run_with_policy(
         if not weak_valid:
             reason = "weak_control_invalid"
             raise RuntimeError("weak control invalid")
-        allowed_output = allowed_probe.open_output("allowed-write", token)
-        forbidden_output = forbidden_probe.open_output(
-            "forbidden-write", token
+        allowed_output = resources.add(
+            allowed_probe.open_output("allowed-write", token)
+        )
+        forbidden_output = resources.add(
+            forbidden_probe.open_output("forbidden-write", token)
         )
         try:
             allowed_sentinel.validate()
@@ -1742,11 +1785,16 @@ def _run_with_policy(
             forbidden_output.close()
         allowed_sentinel.validate()
         forbidden_sentinel.validate()
-        _write_exclusive(codex_home / "config.toml", policy.config_bytes, 0o600)
         reason = "native_permission_unproven"
+        codex_home_probe = resources.add(
+            _TrustedProbeDirectory(codex_home)
+        )
+        config_token = resources.add(
+            codex_home_probe.create("config.toml", policy.config_bytes)
+        )
         strong_listener = _LoopbackListener()
         try:
-            strong_result = _invoke(
+            strong_result = _invoke_strong(
                 _command(
                     _probe_argv(
                         request.codex_executable, request.python_executable,
@@ -1758,6 +1806,8 @@ def _run_with_policy(
                 ),
                 runner,
                 executables,
+                codex_home_probe,
+                config_token,
             )
             strong = _parse_child(strong_result)
             strong_network = strong_listener.observation(token)
@@ -1838,10 +1888,7 @@ def _run_with_policy(
             codex.close()
         if python is not None:
             python.close()
-        for probe_file in probe_files:
-            probe_file.close()
-        for probe_directory in probe_directories:
-            probe_directory.close()
+        resources.close()
     cleanup_ok = True
     if temporary_name is not None and temporary_identity is not None:
         cleanup_ok = _remove_tree(

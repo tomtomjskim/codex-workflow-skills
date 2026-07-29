@@ -29,6 +29,7 @@ from scripts.live_eval.native_canary_readiness import (
     _NativeReadinessPolicy,
     _EvidencePublisher,
     _LoopbackListener,
+    _ResourceRegistry,
     _TrustedProbeDirectory,
     _parse_child,
     _run_bounded_command,
@@ -129,6 +130,67 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
             finally:
                 output.close()
                 directory.close()
+
+    def test_partial_probe_acquisition_closes_prior_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw).resolve()
+            first_path = base / "first"
+            second_path = base / "second"
+            first_path.mkdir(mode=0o700)
+            second_path.mkdir(mode=0o700)
+
+            registry = _ResourceRegistry()
+            first_directory = registry.add(
+                _TrustedProbeDirectory(first_path)
+            )
+            first_fd = first_directory.descriptor
+            second_path.chmod(0o755)
+            try:
+                with self.assertRaises(OSError):
+                    _TrustedProbeDirectory(second_path)
+            finally:
+                registry.close()
+                second_path.chmod(0o700)
+            with self.assertRaises(OSError):
+                os.fstat(first_fd)
+
+            registry = _ResourceRegistry()
+            first_directory = registry.add(
+                _TrustedProbeDirectory(first_path)
+            )
+            second_directory = registry.add(
+                _TrustedProbeDirectory(second_path)
+            )
+            first_sentinel = registry.add(
+                first_directory.create("sentinel", b"first")
+            )
+            sentinel_fd = first_sentinel._descriptor
+            try:
+                with self.assertRaises(FileExistsError):
+                    first_directory.create("sentinel", b"duplicate")
+            finally:
+                registry.close()
+            with self.assertRaises(OSError):
+                os.fstat(sentinel_fd)
+
+            output_path = first_path / "output"
+            output_path.write_bytes(b"token")
+            output_path.chmod(0o600)
+            registry = _ResourceRegistry()
+            first_directory = registry.add(
+                _TrustedProbeDirectory(first_path)
+            )
+            first_output = registry.add(
+                first_directory.open_output("output", b"token")
+            )
+            output_fd = first_output._descriptor
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    first_directory.open_output("missing-output", b"token")
+            finally:
+                registry.close()
+            with self.assertRaises(OSError):
+                os.fstat(output_fd)
 
     def test_success_evidence_post_replace_failures_restore_blocked(self) -> None:
         blocked = {
@@ -580,6 +642,30 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
             _wait_for_lock_probe(process_id, read_fd, 0.25)
         self.assertLess(time.monotonic() - started, 1.5)
 
+    def test_lock_probe_reaps_prompt_child_once_while_descendant_holds_pipe(self) -> None:
+        read_fd, write_fd = os.pipe()
+        process_id = os.fork()
+        if process_id == 0:
+            os.close(read_fd)
+            descendant = os.fork()
+            if descendant == 0:
+                try:
+                    time.sleep(0.25)
+                finally:
+                    os.close(write_fd)
+                    os._exit(0)
+            os.write(write_fd, b"1")
+            os.close(write_fd)
+            os._exit(0)
+        os.close(write_fd)
+        started = time.monotonic()
+        observed, status_value = _wait_for_lock_probe(
+            process_id, read_fd, 1.0
+        )
+        self.assertEqual(observed, b"1")
+        self.assertEqual(status_value, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+
     def test_linux_private_evaluator_records_real_observations(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw).resolve()
@@ -697,6 +783,20 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                     temporary.mkdir(mode=0o700)
                 if not weak and scenario["mode"] == "denied_output_symlink":
                     Path(command.argv[-4]).symlink_to("missing-output")
+                if not weak and scenario["mode"] == "config_replaced":
+                    config = Path(command.environment["CODEX_HOME"]) / "config.toml"
+                    original_config = config.with_name("config-original.toml")
+                    config.rename(original_config)
+                    config.write_bytes(original_config.read_bytes())
+                    config.chmod(0o600)
+                if not weak and scenario["mode"] == "codex_home_replaced":
+                    codex_home = Path(command.environment["CODEX_HOME"])
+                    original_home = codex_home.with_name("codex-home-original")
+                    codex_home.rename(original_home)
+                    codex_home.mkdir(mode=0o700)
+                    replacement_config = codex_home / "config.toml"
+                    replacement_config.write_bytes(CONFIG_BYTES)
+                    replacement_config.chmod(0o600)
                 if scenario["mode"] == "extra_child_field":
                     payload["extra"] = "rejected"
                 return BoundedCommandResult(
@@ -778,6 +878,8 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                 ("extra_child_field", policy),
                 ("read_sentinel_replaced", policy),
                 ("denied_output_symlink", policy),
+                ("config_replaced", policy),
+                ("codex_home_replaced", policy),
             )
             for mode, scenario_policy in expected_modes:
                 scenario["mode"] = mode
@@ -815,6 +917,8 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                         )
                     )
                     if mode == "denied_output_symlink":
+                        expected_reason = "native_permission_unproven"
+                    if mode in {"config_replaced", "codex_home_replaced"}:
                         expected_reason = "native_permission_unproven"
                     self.assertEqual(blocked.reason_code, expected_reason)
                     self.assertEqual(blocked.model_calls, 0)
