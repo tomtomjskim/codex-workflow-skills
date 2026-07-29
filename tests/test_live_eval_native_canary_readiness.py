@@ -13,7 +13,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import scripts.live_eval.native_canary_readiness as readiness_module
+from scripts.live_eval.private_jsonl_ledger import PrivateJSONLLedgerError
 from scripts.live_eval.native_canary_readiness import (
     BoundedCommand,
     BoundedCommandResult,
@@ -24,13 +27,197 @@ from scripts.live_eval.native_canary_readiness import (
     NativeCanaryReadinessResult,
     _PRODUCTION_POLICY,
     _NativeReadinessPolicy,
+    _EvidencePublisher,
+    _LoopbackListener,
+    _TrustedProbeDirectory,
+    _parse_child,
     _run_bounded_command,
     _run_with_policy,
+    _wait_for_lock_probe,
 )
 from scripts.workflow_coordination.canonical_json import canonical_bytes, sha256_id
 
 
 class NativeCanaryReadinessContractTests(unittest.TestCase):
+    @staticmethod
+    def _valid_child_payload():
+        digest = "a" * 64
+        return {
+            "allowed_read": {
+                "digest": digest,
+                "errno": None,
+                "ok": True,
+                "overflow": False,
+            },
+            "allowed_write": {"errno": None, "ok": True},
+            "environment": {"digest": digest, "present": True},
+            "forbidden_read": {
+                "digest": None,
+                "errno": errno.EACCES,
+                "ok": False,
+                "overflow": False,
+            },
+            "forbidden_write": {"errno": errno.EPERM, "ok": False},
+            "network": {"errno": errno.EPERM, "ok": False},
+            "schema_version": 1,
+        }
+
+    @staticmethod
+    def _child_result(payload):
+        return BoundedCommandResult(
+            0,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            + b"\n",
+            b"",
+            False,
+            False,
+        )
+
+    def test_child_schema_rejects_bool_integer_aliases_and_bad_scalars(self) -> None:
+        mutations = (
+            (("schema_version",), True),
+            (("allowed_read", "digest"), 7),
+            (("allowed_read", "digest"), "not-a-digest"),
+            (("allowed_read", "errno"), True),
+            (("allowed_read", "ok"), 1),
+            (("allowed_read", "overflow"), 0),
+            (("allowed_write", "errno"), False),
+            (("allowed_write", "ok"), 1),
+            (("environment", "digest"), False),
+            (("environment", "present"), 0),
+            (("forbidden_read", "errno"), True),
+            (("forbidden_read", "ok"), 0),
+            (("forbidden_read", "overflow"), 1),
+            (("forbidden_write", "errno"), True),
+            (("forbidden_write", "ok"), 0),
+            (("network", "errno"), True),
+            (("network", "ok"), 0),
+        )
+        for path, replacement in mutations:
+            payload = self._valid_child_payload()
+            target = payload
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = replacement
+            with self.subTest(path=path, replacement=replacement):
+                with self.assertRaises(RuntimeError):
+                    _parse_child(self._child_result(payload))
+
+    def test_child_schema_rejects_malformed_json(self) -> None:
+        with self.assertRaises(RuntimeError):
+            _parse_child(
+                BoundedCommandResult(0, b"{\n", b"", False, False)
+            )
+
+    def test_output_token_rejects_replacement_before_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory_path = Path(raw).resolve() / "probe"
+            directory_path.mkdir(mode=0o700)
+            directory = _TrustedProbeDirectory(directory_path)
+            output_path = directory_path / "output"
+            output_path.write_bytes(b"token")
+            output_path.chmod(0o600)
+            output = directory.open_output("output", b"token")
+            original = directory_path / "output-original"
+            output_path.rename(original)
+            output_path.write_bytes(b"token")
+            output_path.chmod(0o600)
+            try:
+                with self.assertRaises(OSError):
+                    output.unlink()
+                self.assertTrue(output_path.exists())
+            finally:
+                output.close()
+                directory.close()
+
+    def test_success_evidence_post_replace_failures_restore_blocked(self) -> None:
+        blocked = {
+            "cleanup_state": "removed",
+            "reason_code": "evidence_retention_failed",
+            "schema_version": 1,
+            "status": "blocked",
+        }
+        success = {
+            "cleanup_state": "removed",
+            "reason_code": "native_primitive_observations_recorded",
+            "schema_version": 1,
+            "status": "native_primitive_observations_only",
+        }
+        for fault in ("fsync", "read", "path_swap"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as raw:
+                private_root = Path(raw).resolve() / "private"
+                private_root.mkdir(mode=0o700)
+                root_fd = os.open(
+                    str(private_root),
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+                root_info = os.fstat(root_fd)
+                publisher = _EvidencePublisher(
+                    private_root,
+                    root_fd,
+                    (root_info.st_dev, root_info.st_ino),
+                )
+                os.close(root_fd)
+                publisher.publish(blocked)
+                triggered = {"value": False}
+                original_fsync = readiness_module.os.fsync
+                original_read = readiness_module.os.read
+                original_stat = readiness_module.os.stat
+
+                def failing_fsync(descriptor):
+                    if (
+                        not triggered["value"]
+                        and descriptor == publisher._run_fd
+                    ):
+                        triggered["value"] = True
+                        raise OSError(errno.EIO, "post-rename fsync fault")
+                    return original_fsync(descriptor)
+
+                def failing_read(descriptor, limit):
+                    if not triggered["value"]:
+                        triggered["value"] = True
+                        raise OSError(errno.EIO, "post-rename read fault")
+                    return original_read(descriptor, limit)
+
+                def swapping_stat(path, *args, **kwargs):
+                    if (
+                        not triggered["value"]
+                        and path == "readiness.json"
+                        and kwargs.get("dir_fd") == publisher._run_fd
+                    ):
+                        triggered["value"] = True
+                        publisher.path.rename(
+                            publisher.path.with_name("swapped-success")
+                        )
+                        publisher.path.symlink_to("missing-evidence")
+                    return original_stat(path, *args, **kwargs)
+
+                replacement = {
+                    "fsync": mock.patch.object(
+                        readiness_module.os, "fsync", side_effect=failing_fsync
+                    ),
+                    "read": mock.patch.object(
+                        readiness_module.os, "read", side_effect=failing_read
+                    ),
+                    "path_swap": mock.patch.object(
+                        readiness_module.os, "stat", side_effect=swapping_stat
+                    ),
+                }[fault]
+                try:
+                    with replacement, self.assertRaises(OSError):
+                        publisher.publish(success, fallback=blocked)
+                    self.assertTrue(triggered["value"])
+                    self.assertEqual(
+                        publisher.path.read_bytes(), canonical_bytes(blocked)
+                    )
+                    for artifact in publisher.run_directory.iterdir():
+                        if artifact.is_file():
+                            self.assertNotEqual(
+                                artifact.read_bytes(), canonical_bytes(success)
+                            )
+                finally:
+                    publisher.close()
+
     def test_production_policy_literals_match_exact_contract(self) -> None:
         self.assertEqual(PERMISSION_PROFILE_NAME, "phase-b0-native-readonly")
         self.assertEqual(len(CONFIG_BYTES), 284)
@@ -89,6 +276,17 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
             dataclasses.replace(success, complete_evidence_digest=None)
         with self.assertRaises(ValueError):
             dataclasses.replace(success, policy_digest=1)
+        for model_calls in (-1, 1, False, True):
+            with self.subTest(model_calls=model_calls), self.assertRaises(
+                ValueError
+            ):
+                dataclasses.replace(success, model_calls=model_calls)
+        for status in ("blocked", "unknown"):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                dataclasses.replace(success, status=status)
+        for cleanup in ("not_started", "cleanup_required", "unknown"):
+            with self.subTest(cleanup=cleanup), self.assertRaises(ValueError):
+                dataclasses.replace(success, cleanup_state=cleanup)
 
     def test_result_terminal_table_is_exhaustive(self) -> None:
         digest = "sha256:" + "b" * 64
@@ -143,6 +341,72 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                 ),
                 python_executable_identity_digest=None,
             )
+
+    def test_every_unlisted_terminal_digest_mask_is_rejected(self) -> None:
+        digest = "sha256:" + "c" * 64
+        terminals = {
+            "native_primitive_observations_recorded": (
+                "native_primitive_observations_only",
+                "removed",
+                {"1111111"},
+            ),
+            "request_invalid": ("blocked", "not_started", {"1000000"}),
+            "unsupported_platform": ("blocked", "not_started", {"1000000"}),
+            "executable_identity_invalid": (
+                "blocked",
+                "removed",
+                {"1000000"},
+            ),
+            "cli_version_mismatch": ("blocked", "removed", {"1110000"}),
+            "weak_control_invalid": ("blocked", "removed", {"1110000"}),
+            "native_permission_unproven": (
+                "blocked",
+                "removed",
+                {"1110000"},
+            ),
+            "ledger_primitives_unproven": (
+                "blocked",
+                "removed",
+                {"1111100"},
+            ),
+            "evidence_retention_failed": (
+                "blocked",
+                "removed",
+                {"1111110"},
+            ),
+            "cleanup_required": (
+                "blocked",
+                "cleanup_required",
+                {"1000000", "1110000", "1111100", "1111110", "1111111"},
+            ),
+        }
+        for reason, (status, cleanup, allowed) in terminals.items():
+            for raw_mask in range(128):
+                mask = format(raw_mask, "07b")
+                if mask in allowed:
+                    continue
+                values = [digest if bit == "1" else None for bit in mask]
+                with self.subTest(reason=reason, mask=mask):
+                    with self.assertRaises(ValueError):
+                        NativeCanaryReadinessResult(
+                            status, 0, *values, cleanup, reason
+                        )
+
+    def test_listener_failure_is_distinct_from_no_connection(self) -> None:
+        class FailingSocket:
+            def accept(self):
+                raise OSError(errno.EIO, "fault")
+
+            def close(self):
+                pass
+
+        listener = _LoopbackListener()
+        listener._socket.close()
+        listener._socket = FailingSocket()
+        try:
+            self.assertEqual(listener.observation(b"x"), "failure")
+        finally:
+            listener.close()
 
     def test_invalid_request_returns_before_runner(self) -> None:
         calls = []
@@ -300,6 +564,22 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertLess(elapsed, 2.0)
 
+    def test_lock_probe_parent_bounds_silent_child(self) -> None:
+        read_fd, write_fd = os.pipe()
+        process_id = os.fork()
+        if process_id == 0:
+            os.close(read_fd)
+            try:
+                time.sleep(10)
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        started = time.monotonic()
+        with self.assertRaises(PrivateJSONLLedgerError):
+            _wait_for_lock_probe(process_id, read_fd, 0.25)
+        self.assertLess(time.monotonic() - started, 1.5)
+
     def test_linux_private_evaluator_records_real_observations(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw).resolve()
@@ -366,6 +646,14 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                         client.sendall(token)
                     Path(command.argv[-4]).write_bytes(token)
                     Path(command.argv[-3]).write_bytes(token)
+                    Path(command.argv[-4]).chmod(0o600)
+                    Path(command.argv[-3]).chmod(0o600)
+                    if scenario["mode"] == "read_sentinel_replaced":
+                        allowed_read = Path(command.argv[-6])
+                        moved_read = allowed_read.with_name("allowed-read-original")
+                        allowed_read.rename(moved_read)
+                        allowed_read.write_bytes(moved_read.read_bytes())
+                        allowed_read.chmod(0o600)
                 allowed_digest = hashlib.sha256(Path(command.argv[-6]).read_bytes()).hexdigest()
                 forbidden_digest = hashlib.sha256(Path(command.argv[-5]).read_bytes()).hexdigest()
                 payload = {
@@ -380,8 +668,17 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                     "network": {"errno": None if weak else errno.EPERM, "ok": weak},
                     "schema_version": 1,
                 }
-                if not weak and scenario["mode"] == "native_permission_unproven":
-                    payload["network"] = {"errno": errno.ECONNREFUSED, "ok": False}
+                false_network_causes = {
+                    "native_permission_unproven": errno.ECONNREFUSED,
+                    "network_refused": errno.ECONNREFUSED,
+                    "network_reset": errno.ECONNRESET,
+                    "network_timeout": errno.ETIMEDOUT,
+                }
+                if not weak and scenario["mode"] in false_network_causes:
+                    payload["network"] = {
+                        "errno": false_network_causes[scenario["mode"]],
+                        "ok": False,
+                    }
                 if not weak and scenario["mode"] == "listener_mismatch":
                     with socket.create_connection(
                         ("127.0.0.1", int(command.argv[-2]))
@@ -398,6 +695,8 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                     moved = temporary.with_name(temporary.name + "-moved")
                     temporary.rename(moved)
                     temporary.mkdir(mode=0o700)
+                if not weak and scenario["mode"] == "denied_output_symlink":
+                    Path(command.argv[-4]).symlink_to("missing-output")
                 if scenario["mode"] == "extra_child_field":
                     payload["extra"] = "rejected"
                 return BoundedCommandResult(
@@ -437,7 +736,26 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                 self.assertNotIn(secret, retained_bytes)
             self.assertEqual(retained[0].stat().st_mode & 0o777, 0o600)
             self.assertEqual(retained[0].parent.stat().st_mode & 0o777, 0o700)
-            poison = ("codex exec", "preflight_auth", "RuntimeContainmentReceipt", "features list")
+            poison = (
+                "codex exec",
+                "preflight_auth",
+                "RuntimeContainmentReceipt",
+                "codex features list",
+                "model_client",
+                "provider_client",
+                "http://",
+                "https://",
+                "external_destination",
+                "runtime_receipt",
+                "runtime_terminal",
+                "pilot_marker",
+                "marker_path",
+                "reservation.json",
+                "create_reservation",
+                "lima ",
+                "multipass",
+                " vm ",
+            )
             source = Path(__file__).parents[1] / "scripts/live_eval/native_canary_readiness.py"
             source_text = source.read_text()
             for phrase in poison:
@@ -448,6 +766,9 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                 ("cli_version_mismatch", policy),
                 ("weak_control_invalid", policy),
                 ("native_permission_unproven", policy),
+                ("network_refused", policy),
+                ("network_reset", policy),
+                ("network_timeout", policy),
                 ("listener_mismatch", policy),
                 ("malformed_runner", policy),
                 ("timeout", policy),
@@ -455,6 +776,8 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                 ("signal", policy),
                 ("internal_exception", policy),
                 ("extra_child_field", policy),
+                ("read_sentinel_replaced", policy),
+                ("denied_output_symlink", policy),
             )
             for mode, scenario_policy in expected_modes:
                 scenario["mode"] = mode
@@ -469,7 +792,13 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                     )
                     expected_reason = (
                         "native_permission_unproven"
-                        if mode == "listener_mismatch"
+                        if mode
+                        in {
+                            "listener_mismatch",
+                            "network_refused",
+                            "network_reset",
+                            "network_timeout",
+                        }
                         else (
                             "weak_control_invalid"
                             if mode
@@ -480,10 +809,13 @@ class NativeCanaryReadinessContractTests(unittest.TestCase):
                                 "signal",
                                 "internal_exception",
                                 "extra_child_field",
+                                "read_sentinel_replaced",
                             }
                             else mode
                         )
                     )
+                    if mode == "denied_output_symlink":
+                        expected_reason = "native_permission_unproven"
                     self.assertEqual(blocked.reason_code, expected_reason)
                     self.assertEqual(blocked.model_calls, 0)
                     public_bytes = canonical_bytes(dataclasses.asdict(blocked))

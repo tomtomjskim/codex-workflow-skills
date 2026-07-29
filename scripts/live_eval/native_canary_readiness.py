@@ -727,6 +727,21 @@ _CHILD_KEYS = {
 }
 
 
+def _child_digest(value: object) -> bool:
+    return (
+        value is None
+        or (
+            type(value) is str
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+    )
+
+
+def _child_errno(value: object) -> bool:
+    return value is None or type(value) is int
+
+
 def _parse_child(result: BoundedCommandResult) -> Mapping[str, object]:
     if (
         result.returncode != 0
@@ -745,6 +760,7 @@ def _parse_child(result: BoundedCommandResult) -> Mapping[str, object]:
         canonical_bytes(value) != raw
         or type(value) is not dict
         or set(value) != _CHILD_KEYS
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != 1
     ):
         raise RuntimeError("child output schema invalid")
@@ -760,6 +776,28 @@ def _parse_child(result: BoundedCommandResult) -> Mapping[str, object]:
         item = value.get(key)
         if type(item) is not dict or set(item) != keys:
             raise RuntimeError("child output schema invalid")
+    for key in ("allowed_read", "forbidden_read"):
+        item = value[key]
+        if (
+            not _child_digest(item["digest"])
+            or not _child_errno(item["errno"])
+            or type(item["ok"]) is not bool
+            or type(item["overflow"]) is not bool
+        ):
+            raise RuntimeError("child output scalar invalid")
+    for key in ("allowed_write", "forbidden_write", "network"):
+        item = value[key]
+        if (
+            not _child_errno(item["errno"])
+            or type(item["ok"]) is not bool
+        ):
+            raise RuntimeError("child output scalar invalid")
+    environment = value["environment"]
+    if (
+        not _child_digest(environment["digest"])
+        or type(environment["present"]) is not bool
+    ):
+        raise RuntimeError("child output scalar invalid")
     return value
 
 
@@ -840,6 +878,163 @@ def _write_exclusive(path: Path, data: bytes, mode: int) -> None:
         os.close(descriptor)
 
 
+class _TrustedProbeFile:
+    def __init__(
+        self,
+        directory: "_TrustedProbeDirectory",
+        name: str,
+        descriptor: int,
+        expected: bytes,
+    ) -> None:
+        self._directory = directory
+        self.name = name
+        self._descriptor = descriptor
+        self._expected = expected
+        info = self._validate_metadata(os.fstat(descriptor))
+        self._identity = (info.st_dev, info.st_ino)
+        self.validate()
+
+    @staticmethod
+    def _validate_metadata(info: os.stat_result) -> os.stat_result:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            raise OSError(errno.EPERM, "probe file metadata invalid")
+        return info
+
+    def validate(self) -> None:
+        self._directory.validate()
+        retained = self._validate_metadata(os.fstat(self._descriptor))
+        current = self._validate_metadata(
+            os.stat(
+                self.name,
+                dir_fd=self._directory.descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if (
+            (retained.st_dev, retained.st_ino) != self._identity
+            or (current.st_dev, current.st_ino) != self._identity
+            or os.pread(
+                self._descriptor, len(self._expected) + 1, 0
+            )
+            != self._expected
+        ):
+            raise OSError(errno.EPERM, "probe file identity changed")
+
+    def unlink(self) -> None:
+        self.validate()
+        os.unlink(self.name, dir_fd=self._directory.descriptor)
+        try:
+            os.stat(
+                self.name,
+                dir_fd=self._directory.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        raise OSError(errno.EPERM, "probe output still exists")
+
+    def close(self) -> None:
+        if self._descriptor >= 0:
+            try:
+                os.close(self._descriptor)
+            except OSError:
+                pass
+            self._descriptor = -1
+
+
+class _TrustedProbeDirectory:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.descriptor = os.open(
+            str(path),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        info = self._validate_metadata(os.fstat(self.descriptor))
+        self._identity = (info.st_dev, info.st_ino)
+        self.validate()
+
+    @staticmethod
+    def _validate_metadata(info: os.stat_result) -> os.stat_result:
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise OSError(errno.EPERM, "probe directory metadata invalid")
+        return info
+
+    def validate(self) -> None:
+        retained = self._validate_metadata(os.fstat(self.descriptor))
+        current = self._validate_metadata(
+            os.stat(str(self.path), follow_symlinks=False)
+        )
+        if (
+            (retained.st_dev, retained.st_ino) != self._identity
+            or (current.st_dev, current.st_ino) != self._identity
+        ):
+            raise OSError(errno.EPERM, "probe directory identity changed")
+
+    def create(self, name: str, data: bytes) -> _TrustedProbeFile:
+        self.validate()
+        descriptor = os.open(
+            name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
+            0o600,
+            dir_fd=self.descriptor,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            offset = 0
+            while offset < len(data):
+                written = os.write(descriptor, data[offset:])
+                if written <= 0:
+                    raise OSError(errno.EIO, "write made no progress")
+                offset += written
+            os.fsync(descriptor)
+            return _TrustedProbeFile(self, name, descriptor, data)
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def open_output(self, name: str, expected: bytes) -> _TrustedProbeFile:
+        self.validate()
+        descriptor = os.open(
+            name,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=self.descriptor,
+        )
+        try:
+            return _TrustedProbeFile(self, name, descriptor, expected)
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def require_absent(self, name: str) -> None:
+        self.validate()
+        try:
+            os.stat(name, dir_fd=self.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise OSError(errno.EEXIST, "denied output path exists")
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            try:
+                os.close(self.descriptor)
+            except OSError:
+                pass
+            self.descriptor = -1
+
+
 class _EvidencePublisher:
     def __init__(
         self,
@@ -914,11 +1109,7 @@ class _EvidencePublisher:
         ):
             raise OSError(errno.EPERM, "evidence directory identity invalid")
 
-    def publish(self, value: Mapping[str, object]) -> bytes:
-        self._validate()
-        retained = canonical_bytes(value)
-        if len(retained) > 65536:
-            raise OSError(errno.EFBIG, "evidence exceeds byte limit")
+    def _stage(self, retained: bytes) -> Tuple[str, Tuple[int, int]]:
         staging = "staging-" + secrets.token_hex(12)
         descriptor = os.open(
             staging,
@@ -935,38 +1126,176 @@ class _EvidencePublisher:
                     raise OSError(errno.EIO, "write made no progress")
                 offset += written
             os.fsync(descriptor)
+            info = self._validate_evidence_metadata(os.fstat(descriptor))
+            identity = (info.st_dev, info.st_ino)
+        except Exception:
+            try:
+                os.unlink(staging, dir_fd=self._run_fd)
+            except FileNotFoundError:
+                pass
+            raise
         finally:
             os.close(descriptor)
-        os.replace(
-            staging,
-            "readiness.json",
-            src_dir_fd=self._run_fd,
-            dst_dir_fd=self._run_fd,
-        )
-        os.fsync(self._run_fd)
-        retained_fd = os.open(
-            "readiness.json",
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=self._run_fd,
-        )
-        try:
-            info = os.fstat(retained_fd)
-            data = os.read(retained_fd, 65537)
-        finally:
-            os.close(retained_fd)
-        self._validate()
+        return staging, identity
+
+    @staticmethod
+    def _validate_evidence_metadata(info: os.stat_result) -> os.stat_result:
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_nlink != 1
-            or data != retained
+        ):
+            raise OSError(errno.EIO, "retained evidence metadata invalid")
+        return info
+
+    def _verify_descriptor(
+        self, descriptor: int, expected: bytes
+    ) -> bytes:
+        before = self._validate_evidence_metadata(os.fstat(descriptor))
+        identity = (before.st_dev, before.st_ino)
+        path_before = self._validate_evidence_metadata(
+            os.stat(
+                "readiness.json",
+                dir_fd=self._run_fd,
+                follow_symlinks=False,
+            )
+        )
+        data = os.read(descriptor, 65537)
+        after = self._validate_evidence_metadata(os.fstat(descriptor))
+        path_after = self._validate_evidence_metadata(
+            os.stat(
+                "readiness.json",
+                dir_fd=self._run_fd,
+                follow_symlinks=False,
+            )
+        )
+        if (
+            identity != (path_before.st_dev, path_before.st_ino)
+            or identity != (after.st_dev, after.st_ino)
+            or identity != (path_after.st_dev, path_after.st_ino)
+            or data != expected
         ):
             raise OSError(errno.EIO, "retained evidence identity invalid")
         reparsed = load_canonical_input(data)
         if canonical_bytes(reparsed) != data:
             raise OSError(errno.EIO, "retained evidence is not canonical")
-        return retained
+        self._validate()
+        return data
+
+    def _remove_identity(self, identity: Tuple[int, int]) -> None:
+        for name in os.listdir(self._run_fd):
+            try:
+                info = os.stat(
+                    name, dir_fd=self._run_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                continue
+            if (info.st_dev, info.st_ino) == identity:
+                os.unlink(name, dir_fd=self._run_fd)
+
+    def _restore_blocked(
+        self,
+        fallback_staging: str,
+        fallback_bytes: bytes,
+        success_identity: Tuple[int, int],
+    ) -> None:
+        restored = False
+        try:
+            os.replace(
+                fallback_staging,
+                "readiness.json",
+                src_dir_fd=self._run_fd,
+                dst_dir_fd=self._run_fd,
+            )
+            os.fsync(self._run_fd)
+            descriptor = os.open(
+                "readiness.json",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=self._run_fd,
+            )
+            try:
+                self._verify_descriptor(descriptor, fallback_bytes)
+            finally:
+                os.close(descriptor)
+            restored = True
+        finally:
+            self._remove_identity(success_identity)
+            if not restored:
+                try:
+                    current = os.stat(
+                        "readiness.json",
+                        dir_fd=self._run_fd,
+                        follow_symlinks=False,
+                    )
+                    if (current.st_dev, current.st_ino) == success_identity:
+                        os.unlink("readiness.json", dir_fd=self._run_fd)
+                except FileNotFoundError:
+                    pass
+                os.fsync(self._run_fd)
+
+    def publish(
+        self,
+        value: Mapping[str, object],
+        *,
+        fallback: Optional[Mapping[str, object]] = None,
+    ) -> bytes:
+        self._validate()
+        retained = canonical_bytes(value)
+        if len(retained) > 65536:
+            raise OSError(errno.EFBIG, "evidence exceeds byte limit")
+        fallback_bytes = canonical_bytes(fallback) if fallback is not None else None
+        if fallback_bytes is not None and len(fallback_bytes) > 65536:
+            raise OSError(errno.EFBIG, "fallback evidence exceeds byte limit")
+        fallback_staging = None
+        staging = None
+        success_identity = None
+        descriptor = -1
+        replaced = False
+        try:
+            if fallback_bytes is not None:
+                fallback_staging, _ = self._stage(fallback_bytes)
+            staging, success_identity = self._stage(retained)
+            os.replace(
+                staging,
+                "readiness.json",
+                src_dir_fd=self._run_fd,
+                dst_dir_fd=self._run_fd,
+            )
+            replaced = True
+            descriptor = os.open(
+                "readiness.json",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=self._run_fd,
+            )
+            info = self._validate_evidence_metadata(os.fstat(descriptor))
+            if (info.st_dev, info.st_ino) != success_identity:
+                raise OSError(errno.EIO, "published evidence identity changed")
+            os.fsync(self._run_fd)
+            data = self._verify_descriptor(descriptor, retained)
+            return data
+        except Exception:
+            if (
+                replaced
+                and fallback_staging is not None
+                and fallback_bytes is not None
+                and success_identity is not None
+            ):
+                self._restore_blocked(
+                    fallback_staging, fallback_bytes, success_identity
+                )
+                fallback_staging = None
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            for leftover in (staging, fallback_staging):
+                if leftover is None:
+                    continue
+                try:
+                    os.unlink(leftover, dir_fd=self._run_fd)
+                except FileNotFoundError:
+                    pass
 
     def close(self) -> None:
         for descriptor_name in ("_run_fd", "_root_fd"):
@@ -1090,29 +1419,97 @@ def _probe_ledger_lock(
     ledger = _open_probe_ledger(directory, genesis, limits)
     try:
         read_fd, write_fd = os.pipe()
-        process_id = os.fork()
+        try:
+            process_id = os.fork()
+        except OSError:
+            os.close(write_fd)
+            os.close(read_fd)
+            raise
         if process_id == 0:
             os.close(read_fd)
-            rejected = False
+            exit_code = 1
             try:
-                contender = _open_probe_ledger(directory, genesis, limits)
-            except PrivateJSONLLedgerError:
-                rejected = True
-            else:
-                contender.close()
-            try:
+                rejected = False
+                try:
+                    contender = _open_probe_ledger(
+                        directory, genesis, limits
+                    )
+                except PrivateJSONLLedgerError:
+                    rejected = True
+                else:
+                    contender.close()
                 os.write(write_fd, b"1" if rejected else b"0")
+                exit_code = 0
+            except BaseException:
+                exit_code = 1
             finally:
-                os.close(write_fd)
-            os._exit(0)
+                try:
+                    os.close(write_fd)
+                finally:
+                    os._exit(exit_code)
         os.close(write_fd)
-        observed = os.read(read_fd, 1)
-        os.close(read_fd)
-        _, status_value = os.waitpid(process_id, 0)
+        observed, status_value = _wait_for_lock_probe(
+            process_id, read_fd, 0.5
+        )
         if observed != b"1" or status_value != 0:
             raise PrivateJSONLLedgerError("ledger lock contention was not rejected")
     finally:
         ledger.close()
+
+
+def _wait_for_lock_probe(
+    process_id: int, read_fd: int, timeout_seconds: float
+) -> Tuple[bytes, int]:
+    selector = selectors.DefaultSelector()
+    observed = bytearray()
+    status_value = None
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        os.set_blocking(read_fd, False)
+        selector.register(read_fd, selectors.EVENT_READ)
+        while time.monotonic() < deadline:
+            for _, _ in selector.select(
+                min(0.05, max(0.0, deadline - time.monotonic()))
+            ):
+                try:
+                    chunk = os.read(read_fd, 2 - len(observed))
+                except BlockingIOError:
+                    chunk = None
+                if chunk:
+                    observed.extend(chunk)
+                elif chunk == b"":
+                    selector.unregister(read_fd)
+            waited, status = os.waitpid(process_id, os.WNOHANG)
+            if waited == process_id:
+                status_value = status
+                if not selector.get_map():
+                    break
+            if len(observed) > 1:
+                break
+        if status_value is None:
+            try:
+                os.kill(process_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _, status_value = os.waitpid(process_id, 0)
+            raise PrivateJSONLLedgerError("ledger lock probe timed out")
+        return bytes(observed), status_value
+    except (OSError, ChildProcessError) as error:
+        try:
+            os.kill(process_id, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            os.waitpid(process_id, 0)
+        except ChildProcessError:
+            pass
+        raise PrivateJSONLLedgerError("ledger lock probe failed") from error
+    finally:
+        selector.close()
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
 
 
 def _expect_ledger_rejection(action: Callable[[], object]) -> None:
@@ -1216,6 +1613,8 @@ def _run_with_policy(
     temporary_name = None
     temporary_identity = None
     publisher = None
+    probe_files = []
+    probe_directories = []
     executable_digests: Tuple[Optional[str], Optional[str]] = (None, None)
     permission_digest = supervisor_digest = ledger_digest = complete_digest = None
     runner = command_runner or _run_bounded_command
@@ -1279,8 +1678,14 @@ def _run_with_policy(
         forbidden_read = forbidden / "forbidden-read"
         allowed_write = allowed / "allowed-write"
         forbidden_write = forbidden / "forbidden-write"
-        _write_exclusive(allowed_read, token + b"a", 0o600)
-        _write_exclusive(forbidden_read, token + b"f", 0o600)
+        allowed_probe = _TrustedProbeDirectory(allowed)
+        forbidden_probe = _TrustedProbeDirectory(forbidden)
+        probe_directories.extend((allowed_probe, forbidden_probe))
+        allowed_sentinel = allowed_probe.create("allowed-read", token + b"a")
+        forbidden_sentinel = forbidden_probe.create(
+            "forbidden-read", token + b"f"
+        )
+        probe_files.extend((allowed_sentinel, forbidden_sentinel))
         paths = (allowed_read, forbidden_read, allowed_write, forbidden_write)
         reason = "weak_control_invalid"
         weak_listener = _LoopbackListener()
@@ -1319,20 +1724,24 @@ def _run_with_policy(
             and weak["network"] == {"errno": None, "ok": True}
             and weak["environment"]["present"] is True
             and weak["environment"]["digest"] == hashlib.sha256(secret.encode()).hexdigest()
-            and allowed_write.read_bytes() == token
-            and forbidden_write.read_bytes() == token
         )
         if not weak_valid:
             reason = "weak_control_invalid"
             raise RuntimeError("weak control invalid")
-        os.unlink(str(allowed_write))
-        os.unlink(str(forbidden_write))
-        if (
-            allowed_read.read_bytes() != token + b"a"
-            or forbidden_read.read_bytes() != token + b"f"
-        ):
-            reason = "weak_control_invalid"
-            raise RuntimeError("sentinel changed")
+        allowed_output = allowed_probe.open_output("allowed-write", token)
+        forbidden_output = forbidden_probe.open_output(
+            "forbidden-write", token
+        )
+        try:
+            allowed_sentinel.validate()
+            forbidden_sentinel.validate()
+            allowed_output.unlink()
+            forbidden_output.unlink()
+        finally:
+            allowed_output.close()
+            forbidden_output.close()
+        allowed_sentinel.validate()
+        forbidden_sentinel.validate()
         _write_exclusive(codex_home / "config.toml", policy.config_bytes, 0o600)
         reason = "native_permission_unproven"
         strong_listener = _LoopbackListener()
@@ -1367,10 +1776,6 @@ def _run_with_policy(
             and strong["allowed_write"]["errno"] in (errno.EACCES, errno.EPERM)
             and strong["forbidden_write"]["ok"] is False
             and strong["forbidden_write"]["errno"] in (errno.EACCES, errno.EPERM)
-            and not allowed_write.exists()
-            and not forbidden_write.exists()
-            and allowed_read.read_bytes() == token + b"a"
-            and forbidden_read.read_bytes() == token + b"f"
             and strong["environment"] == {"digest": None, "present": False}
             and strong["network"]["ok"] is False
             and strong["network"]["errno"] in (errno.EACCES, errno.EPERM)
@@ -1379,6 +1784,10 @@ def _run_with_policy(
         if not strong_valid:
             reason = "native_permission_unproven"
             raise RuntimeError("native permission unproven")
+        allowed_probe.require_absent("allowed-write")
+        forbidden_probe.require_absent("forbidden-write")
+        allowed_sentinel.validate()
+        forbidden_sentinel.validate()
         permission_digest = sha256_id(
             {
                 "allowed_read": True,
@@ -1429,6 +1838,10 @@ def _run_with_policy(
             codex.close()
         if python is not None:
             python.close()
+        for probe_file in probe_files:
+            probe_file.close()
+        for probe_directory in probe_directories:
+            probe_directory.close()
     cleanup_ok = True
     if temporary_name is not None and temporary_identity is not None:
         cleanup_ok = _remove_tree(
@@ -1477,7 +1890,15 @@ def _run_with_policy(
                 "supervisor_environment_evidence_digest": supervisor_digest,
             }
             complete_digest = sha256_id(terminal_document)
-            retained = publisher.publish(terminal_document)
+            retained = publisher.publish(
+                terminal_document,
+                fallback={
+                    "cleanup_state": "removed",
+                    "reason_code": "evidence_retention_failed",
+                    "schema_version": 1,
+                    "status": "blocked",
+                },
+            )
             if "sha256:" + hashlib.sha256(retained).hexdigest() != complete_digest:
                 raise OSError(errno.EIO, "retained evidence digest mismatch")
         except (AssertionError, CanonicalJSONError, OSError):
