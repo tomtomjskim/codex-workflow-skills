@@ -98,6 +98,50 @@ _PHASE_A_INTERNAL_DEPENDENCY_ALLOWLIST = {
     ),
 }
 
+_PHASE_B0_INTERNAL_DEPENDENCY_ALLOWLIST = {
+    "private_jsonl_ledger.py": frozenset(
+        {"scripts.workflow_coordination.canonical_json"}
+    ),
+    "native_canary_readiness.py": frozenset(
+        {
+            "scripts.live_eval.private_jsonl_ledger",
+            "scripts.workflow_coordination.canonical_json",
+        }
+    ),
+    "run_harness_canary_readiness.py": frozenset(
+        {"scripts.live_eval.native_canary_readiness"}
+    ),
+}
+_FORBIDDEN_PHASE_B0_IMPORT_ROOTS = {
+    "aiohttp",
+    "http",
+    "httpx",
+    "requests",
+    "urllib",
+    "scripts.run_live_eval",
+    "scripts.live_eval.artifacts",
+    "scripts.live_eval.budget",
+    "scripts.live_eval.experiment",
+    "scripts.live_eval.experiment_plan",
+    "scripts.live_eval.experiment_receipts",
+    "scripts.live_eval.experiment_telemetry",
+    "scripts.live_eval.harness",
+    "scripts.live_eval.isolation",
+    "scripts.live_eval.scenarios",
+    "scripts.live_eval.task_snapshot",
+}
+_PHASE_B0_PROHIBITED_SOURCE = {
+    "codex exec": "codex_exec",
+    "features list": "features_list",
+    "RuntimeContainmentReceipt": "runtime_receipt",
+    "lima": "vm_command",
+    "colima": "vm_command",
+    "qemu": "vm_command",
+    "vagrant": "vm_command",
+    "virtualbox": "vm_command",
+    "vmrun": "vm_command",
+}
+
 
 def _qualified_name(node, aliases):
     if isinstance(node, ast.Name):
@@ -143,6 +187,90 @@ def _phase_a_internal_dependency_violations(source, filename):
         "missing_internal_import:" + dependency
         for dependency in sorted(allowed - actual)
     )
+
+
+def _phase_b0_internal_dependency_violations(source, filename):
+    module_name = Path(filename).name
+    allowed = _PHASE_B0_INTERNAL_DEPENDENCY_ALLOWLIST[module_name]
+    actual = _phase_a_internal_dependencies(source, filename)
+    return tuple(
+        "unexpected_internal_import:" + dependency
+        for dependency in sorted(actual - allowed)
+    ) + tuple(
+        "missing_internal_import:" + dependency
+        for dependency in sorted(allowed - actual)
+    )
+
+
+def _phase_b0_surface_violations(source, filename):
+    parsed = ast.parse(source, filename=filename)
+    parsed_sources = [parsed]
+    for value in ast.walk(parsed):
+        if (
+            isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+            and "socket." in value.value
+        ):
+            try:
+                parsed_sources.append(ast.parse(value.value, filename=filename))
+            except SyntaxError:
+                pass
+    module_name = Path(filename).name
+    aliases = {}
+    violations = []
+    imported = set()
+    subprocess_imports = 0
+    socket_imports = 0
+    for node in ast.walk(parsed):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name)
+                aliases[alias.asname or alias.name.split(".")[0]] = (
+                    alias.name if alias.asname else alias.name.split(".")[0]
+                )
+                if alias.name == "subprocess" and alias.asname is None:
+                    subprocess_imports += 1
+                if alias.name == "socket" and alias.asname is None:
+                    socket_imports += 1
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = (
+                    (node.module + "." if node.module else "") + alias.name
+                )
+    for imported_name in imported:
+        if any(
+            imported_name == root or imported_name.startswith(root + ".")
+            for root in _FORBIDDEN_PHASE_B0_IMPORT_ROOTS
+        ):
+            violations.append("forbidden_import:" + imported_name)
+    native = module_name == "native_canary_readiness.py"
+    if subprocess_imports != (1 if native else 0):
+        violations.append("subprocess_import_boundary")
+    if socket_imports != (1 if native else 0):
+        violations.append("socket_import_boundary")
+    for forbidden, label in _PHASE_B0_PROHIBITED_SOURCE.items():
+        if forbidden in source:
+            violations.append("prohibited_source:" + label)
+    for tree in parsed_sources:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _qualified_name(node.func, aliases)
+            connects = isinstance(node.func, ast.Attribute) and (
+                node.func.attr == "connect"
+            )
+            if name != "socket.create_connection" and not connects:
+                continue
+            destinations = [
+                value.value
+                for value in ast.walk(node)
+                if isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+            ]
+            if any(destination != "127.0.0.1" for destination in destinations):
+                violations.append("external_network_destination")
+    return tuple(sorted(set(violations)))
 
 
 def _phase_a_dependency_violations(source, filename):
@@ -488,6 +616,82 @@ def _phase_a_dependency_violations(source, filename):
 
 
 class RepositoryValidationTests(unittest.TestCase):
+    _PHASE_B0_REQUIRED_FILES = (
+        "scripts/live_eval/private_jsonl_ledger.py",
+        "scripts/live_eval/native_canary_readiness.py",
+        "scripts/run_harness_canary_readiness.py",
+        "tests/test_live_eval_private_jsonl_ledger.py",
+        "tests/test_live_eval_native_canary_readiness.py",
+        "tests/test_run_harness_canary_readiness.py",
+    )
+
+    def test_validator_requires_each_phase_b0_file_exactly_once(self):
+        root = Path(__file__).parents[1]
+        validator = (root / "scripts" / "validate_repo.sh").read_text(
+            encoding="utf-8"
+        )
+
+        for relative in self._PHASE_B0_REQUIRED_FILES:
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    validator.count("require_file " + relative),
+                    1,
+                )
+
+    def test_phase_b0_internal_imports_follow_dependency_direction(self):
+        root = Path(__file__).parents[1]
+        for relative in self._PHASE_B0_REQUIRED_FILES[:3]:
+            path = root / relative
+            with self.subTest(path=path):
+                self.assertEqual(
+                    _phase_b0_internal_dependency_violations(
+                        path.read_text(encoding="utf-8"), str(path)
+                    ),
+                    (),
+                )
+
+    def test_phase_b0_gates_detect_prohibited_surface_mutations(self):
+        root = Path(__file__).parents[1]
+        native = root / "scripts" / "live_eval" / "native_canary_readiness.py"
+        source = native.read_text(encoding="utf-8")
+        mutations = (
+            (
+                "from scripts.live_eval.experiment import run_experiment_preflight\n",
+                "forbidden_import:scripts.live_eval.experiment",
+            ),
+            ("# codex exec\n", "prohibited_source:codex_exec"),
+            ("# codex features list\n", "prohibited_source:features_list"),
+            (
+                "socket.create_connection(('example.com', 443))\n",
+                "external_network_destination",
+            ),
+            (
+                "RuntimeContainmentReceipt = object\n",
+                "prohibited_source:runtime_receipt",
+            ),
+            ("# lima start\n", "prohibited_source:vm_command"),
+        )
+        for mutation, expected in mutations:
+            with self.subTest(expected=expected):
+                self.assertIn(
+                    expected,
+                    _phase_b0_surface_violations(
+                        source + "\n" + mutation, str(native)
+                    ),
+                )
+
+    def test_phase_b0_path_uses_only_bounded_native_seams(self):
+        root = Path(__file__).parents[1]
+        for relative in self._PHASE_B0_REQUIRED_FILES[:3]:
+            path = root / relative
+            with self.subTest(path=path):
+                self.assertEqual(
+                    _phase_b0_surface_violations(
+                        path.read_text(encoding="utf-8"), str(path)
+                    ),
+                    (),
+                )
+
     _PHASE_A_REQUIRED_FILES = (
         ".github/workflows/validate.yml",
         "scripts/run_harness_experiment.py",

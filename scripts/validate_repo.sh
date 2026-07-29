@@ -89,6 +89,12 @@ require_file .github/dependabot.yml
 require_file requirements-ci.txt
 require_file scripts/validate_ci_maintenance.py
 require_file tests/test_validate_ci_maintenance.py
+require_file scripts/live_eval/private_jsonl_ledger.py
+require_file scripts/live_eval/native_canary_readiness.py
+require_file scripts/run_harness_canary_readiness.py
+require_file tests/test_live_eval_private_jsonl_ledger.py
+require_file tests/test_live_eval_native_canary_readiness.py
+require_file tests/test_run_harness_canary_readiness.py
 
 if [ ! -x scripts/workflow ]; then
   printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2

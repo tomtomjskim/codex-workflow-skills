@@ -172,6 +172,26 @@ If the Codex validation scripts are available, run the checks in the [Validation
 
 ## Usage
 
+### Phase B0 native readiness
+
+Phase B0 is a host-specific, zero-call observation command for native
+filesystem, environment, loopback, and ledger primitives. Run it only with
+explicit absolute paths:
+
+```bash
+python3 scripts/run_harness_canary_readiness.py \
+  --codex-executable /absolute/path/to/codex \
+  --python-executable /absolute/path/to/python3 \
+  --temp-parent /absolute/path/to/private-temp-parent \
+  --private-root /absolute/path/to/private-ledger-root
+```
+
+It performs no authentication, model call, or external network request. A
+successful result is not live-containment proof and does not authorize a paid
+canary. VM fallback remains a separately approved choice. See the approved
+[native readiness design](docs/superpowers/specs/2026-07-29-native-canary-readiness-design.md)
+and [implementation plan](docs/superpowers/plans/2026-07-29-native-canary-readiness-plan.md).
+
 Start with intake for ambiguous, multi-step, or risky work:
 
 ```text
