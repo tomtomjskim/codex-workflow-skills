@@ -81,7 +81,10 @@ Phase B0 trusts:
 - the operating-system kernel and macOS Seatbelt implementation;
 - the pinned Python interpreter used by the deterministic probe child;
 - repository-owned canonical JSON, hashing, and ledger code;
-- the human operator controlling the private roots.
+- the human operator controlling the private roots and pinned executable
+  namespace;
+- other same-UID processes, including the executable updater, remaining trusted
+  for the duration of a run.
 
 The Codex client process itself is not enclosed by the permission profile.
 Permission profiles govern sandboxed local command execution. Protecting the
@@ -155,6 +158,14 @@ rechecks descriptor and path identity plus content before and after every
 invocation. For the first accepted run, the Codex binary is owned by the
 operator UID with mode `0755`, and Python is owned by UID `0` with mode `0755`.
 Any mismatch is `executable_identity_invalid`.
+
+These checks detect executable drift at the pre/post validation points, but the
+path-based subprocess launch is not bound to the retained file descriptor. A
+same-UID process can potentially swap the executable path after validation and
+restore it before the next validation. Phase B0 therefore does not claim
+resistance to a malicious same-UID operator, peer process, or updater; the
+operator and pinned executable namespace are part of the trusted computing
+base.
 
 The probe creates a fresh mode-0700 `CODEX_HOME` containing only the exact
 `config.toml`; it creates no named config overlay, auth file, plugin, skill,
@@ -251,6 +262,15 @@ result. “Command missing,” malformed output, timeout, signal termination,
 wrong executable, wrong cwd, or a failed positive control is
 `native_permission_unproven`, not a successful denial.
 
+The real bounded runner starts the direct child in a new process group. On
+normal failure, bounded cleanup terminates that group, escalates when necessary,
+drains or closes its pipes, and reaps the direct child. On `BaseException`, it
+terminates the group, closes the pipes without claiming a bounded drain, and
+reaps the direct child. Non-detached descendants in the same group are covered
+by the group signals. This contract relies on the trusted pinned Codex client
+and constant child not calling `setsid()` or otherwise detaching. Arbitrary
+detached descendants are outside Phase B0.
+
 The loopback listener and all sentinel files are owned temporary test data.
 Phase B0 makes no external network request.
 
@@ -318,6 +338,11 @@ that a future live runner orders reservation, invocation, and terminal receipts
 correctly.
 
 ### 5.4 Evidence and CLI
+
+The public library API is `run_native_canary_readiness(request)` with no
+runner-injection parameter; it always selects the real bounded runner.
+Deterministic tests inject a runner only through module-private
+`_run_with_policy(..., command_runner=...)`.
 
 `scripts/run_harness_canary_readiness.py` accepts:
 
@@ -452,6 +477,10 @@ The real acceptance is host-specific evidence, not a portable unit test.
 Linux CI runs deterministic fake-runner and filesystem-ledger tests but does
 not claim macOS Seatbelt verification.
 
+The observed fixed-policy real-host result
+`blocked`/`cli_version_mismatch` is diagnostic and fail-closed. It does not
+authorize a VM fallback or any change to the pinned policy.
+
 ### 8.3 Repository completion gate
 
 Run focused tests first, then:
@@ -461,6 +490,12 @@ Run focused tests first, then:
 ```
 
 No new production dependency is permitted.
+
+The AST and poison-pill checks are repository regression guards for the
+enumerated process, command-builder, import, and network surfaces. They are not
+code signing, tamper-proof validation, whole-program analysis, or containment
+against a malicious contributor. An actor who can change production source and
+its tests together is outside this gate’s claim.
 
 ## 9. Over-engineering guardrails
 
@@ -476,6 +511,12 @@ Stop this implementation at Phase B0. Specifically:
   workspace-write requirements;
 - do not install Lima unless native acceptance fails and a separate decision
   approves the fallback.
+
+Executable path replacement by a hostile same-UID process and arbitrary
+detached-descendant containment are not Phase B0 requirements. If either
+becomes required, a separately approved VM or OS lifecycle boundary may be
+warranted; the current diagnostic evidence, including
+`cli_version_mismatch`, does not justify installing one.
 
 The implementation should add two focused library modules, one CLI, focused
 tests, and the minimum README/design cross-reference needed to describe the

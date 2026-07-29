@@ -204,6 +204,11 @@ def _phase_b0_internal_dependency_violations(source, filename):
 
 def _phase_b0_surface_violations(source, filename):
     parsed = ast.parse(source, filename=filename)
+    parents = {
+        child: parent
+        for parent in ast.walk(parsed)
+        for child in ast.iter_child_nodes(parent)
+    }
     parsed_sources = [parsed]
     for value in ast.walk(parsed):
         if (
@@ -244,6 +249,10 @@ def _phase_b0_surface_violations(source, filename):
             for root in _FORBIDDEN_PHASE_B0_IMPORT_ROOTS
         ):
             violations.append("forbidden_import:" + imported_name)
+        if imported_name in {"builtins", "importlib"} or imported_name.startswith(
+            "importlib."
+        ):
+            violations.append("dynamic_import_surface")
     native = module_name == "native_canary_readiness.py"
     if subprocess_imports != (1 if native else 0):
         violations.append("subprocess_import_boundary")
@@ -255,35 +264,75 @@ def _phase_b0_surface_violations(source, filename):
             for node in parsed.body
             if isinstance(node, ast.FunctionDef) and node.name == "_probe_argv"
         ]
-        expected_returns = {
-            ast.dump(ast.parse("child", mode="eval").body),
-            ast.dump(
-                ast.parse(
-                    (
-                        '(str(codex), "sandbox", "-P", '
-                        'PERMISSION_PROFILE_NAME, "-C", str(allowed), "--",) '
-                        "+ child"
-                    ),
-                    mode="eval",
-                ).body
-            ),
-        }
-        actual_returns = {
-            ast.dump(node.value)
-            for function in probe_functions
-            for node in ast.walk(function)
-            if isinstance(node, ast.Return) and node.value is not None
-        }
-        if len(probe_functions) != 1 or actual_returns != expected_returns:
+        expected_probe = ast.parse(
+            """
+def _probe_argv(
+    codex: Optional[Path],
+    python: Path,
+    allowed: Path,
+    paths: Tuple[Path, Path, Path, Path],
+    listener: _LoopbackListener,
+    token: bytes,
+    child_source: str,
+) -> Tuple[str, ...]:
+    child = (
+        str(python), "-I", "-S", "-B", "-c", child_source,
+        str(paths[0]), str(paths[1]), str(paths[2]), str(paths[3]),
+        str(listener.port), token.hex(),
+    )
+    if codex is None:
+        return child
+    return (
+        str(codex), "sandbox", "-P", PERMISSION_PROFILE_NAME,
+        "-C", str(allowed), "--",
+    ) + child
+"""
+        ).body[0]
+        probe_references = [
+            node
+            for node in ast.walk(parsed)
+            if isinstance(node, ast.Name) and node.id == "_probe_argv"
+        ]
+        direct_probe_calls = [
+            node
+            for node in probe_references
+            if isinstance(node.ctx, ast.Load)
+            and isinstance(parents.get(node), ast.Call)
+            and parents[node].func is node
+        ]
+        if (
+            len(probe_functions) != 1
+            or ast.dump(
+                probe_functions[0], include_attributes=False
+            )
+            != ast.dump(expected_probe, include_attributes=False)
+            or len(probe_references) != 2
+            or probe_references != direct_probe_calls
+        ):
+            violations.append("strong_command_shape")
+        if any(
+            (
+                isinstance(node, ast.Constant)
+                and node.value == "_probe_argv"
+            )
+            or (
+                isinstance(node, ast.Call)
+                and _qualified_name(node.func, aliases)
+                in {
+                    "globals",
+                    "locals",
+                    "vars",
+                    "builtins.globals",
+                    "builtins.locals",
+                    "builtins.vars",
+                }
+            )
+            for node in ast.walk(parsed)
+        ):
             violations.append("strong_command_shape")
     for forbidden, label in _PHASE_B0_PROHIBITED_SOURCE.items():
         if forbidden in source:
             violations.append("prohibited_source:" + label)
-    parents = {
-        child: parent
-        for parent in ast.walk(parsed)
-        for child in ast.iter_child_nodes(parent)
-    }
 
     def enclosing_function(node):
         parent = parents.get(node)
@@ -312,6 +361,14 @@ def _phase_b0_surface_violations(source, filename):
         name = _qualified_name(node.func, aliases)
         if name in {"os.environ.get", "os.getenv"}:
             violations.append("ambient_environment_access")
+        if name in _FORBIDDEN_OS_PROCESS_CALLS:
+            violations.append("forbidden_os_process_call")
+        if name in {
+            "__import__",
+            "builtins.__import__",
+            "importlib.import_module",
+        }:
+            violations.append("dynamic_import_surface")
         if name is not None and name.startswith("subprocess."):
             subprocess_calls.append(node)
             argv = literal_argv(node.args[0]) if node.args else None
@@ -330,22 +387,159 @@ def _phase_b0_surface_violations(source, filename):
     if len(subprocess_calls) != (1 if native else 0):
         violations.append("subprocess_execution_surface")
 
+    expected_network = ast.parse(
+        """
+class _LoopbackListener:
+    def __init__(self) -> None:
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen(1)
+        self._socket.settimeout(0.25)
+        self.port = self._socket.getsockname()[1]
+
+    def observation(self, token: bytes) -> str:
+        try:
+            connection, address = self._socket.accept()
+        except socket.timeout:
+            return "none"
+        except OSError:
+            return "failure"
+        try:
+            connection.settimeout(0.25)
+            data = b""
+            while len(data) < len(token):
+                chunk = connection.recv(len(token) - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            if address[0] == "127.0.0.1" and data == token:
+                return "matched"
+            return "mismatch"
+        except OSError:
+            return "failure"
+        finally:
+            connection.close()
+
+    def close(self) -> None:
+        self._socket.close()
+
+def connect_loopback(port, content):
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        client.settimeout(2)
+        client.connect(("127.0.0.1", port))
+        client.sendall(content)
+        return {"errno": None, "ok": True}
+    except OSError as error:
+        return {"errno": error.errno, "ok": False}
+    finally:
+        client.close()
+"""
+    )
+    expected_listener = expected_network.body[0]
+    expected_child_network = expected_network.body[1]
+    listeners = [
+        node
+        for node in parsed.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "_LoopbackListener"
+    ]
+    child_network_functions = [
+        node
+        for tree in parsed_sources[1:]
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "connect_loopback"
+    ]
+    if native and (
+        len(listeners) != 1
+        or ast.dump(listeners[0], include_attributes=False)
+        != ast.dump(expected_listener, include_attributes=False)
+        or len(child_network_functions) != 1
+        or ast.dump(
+            child_network_functions[0], include_attributes=False
+        )
+        != ast.dump(expected_child_network, include_attributes=False)
+    ):
+        violations.append("external_network_destination")
+
+    sensitive_network_attributes = {
+        "accept",
+        "bind",
+        "connect",
+        "connect_ex",
+        "create_connection",
+        "getaddrinfo",
+        "gethostbyaddr",
+        "gethostbyname",
+        "gethostbyname_ex",
+        "getnameinfo",
+        "getpeername",
+        "getsockname",
+        "listen",
+        "recv",
+        "recvfrom",
+        "recvfrom_into",
+        "recv_into",
+        "recvmsg",
+        "recvmsg_into",
+        "send",
+        "sendall",
+        "sendfile",
+        "sendmsg",
+        "sendto",
+        "settimeout",
+        "setsockopt",
+        "shutdown",
+        "socket",
+    }
+
+    def is_socket_capability_reference(node):
+        name = _qualified_name(node, aliases)
+        return (
+            isinstance(node, (ast.Attribute, ast.Name))
+            and name is not None
+            and (name == "socket" or name.startswith("socket."))
+        ) or (
+            isinstance(node, ast.Attribute)
+            and node.attr in sensitive_network_attributes
+        )
+
+    approved_capability_nodes = (
+        {
+            node
+            for boundary in listeners + child_network_functions
+            for node in ast.walk(boundary)
+        }
+        if native
+        else set()
+    )
+    if any(
+        is_socket_capability_reference(node)
+        and node not in approved_capability_nodes
+        for tree in parsed_sources
+        for node in ast.walk(tree)
+    ):
+        violations.append("external_network_destination")
+
     for tree in parsed_sources:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             name = _qualified_name(node.func, aliases)
-            transport = isinstance(node.func, ast.Attribute) and (
-                node.func.attr in {"bind", "connect"}
-            )
-            if name != "socket.create_connection" and not transport:
+            if name not in {
+                "delattr",
+                "getattr",
+                "setattr",
+                "builtins.delattr",
+                "builtins.getattr",
+                "builtins.setattr",
+            }:
                 continue
-            destination = node.args[0] if node.args else None
-            if not (
-                isinstance(destination, (ast.List, ast.Tuple))
-                and destination.elts
-                and isinstance(destination.elts[0], ast.Constant)
-                and destination.elts[0].value == "127.0.0.1"
+            attribute = node.args[1] if len(node.args) > 1 else None
+            if isinstance(attribute, ast.Constant) and (
+                attribute.value in sensitive_network_attributes
             ):
                 violations.append("external_network_destination")
     return tuple(sorted(set(violations)))
@@ -756,6 +950,89 @@ class RepositoryValidationTests(unittest.TestCase):
                 "external_network_destination",
             ),
             (
+                (
+                    "dial = socket.create_connection\n"
+                    "dial(('example.com', 443))\n"
+                ),
+                "external_network_destination",
+            ),
+            (
+                (
+                    "dial = client.sendto\n"
+                    "dial(b'probe', ('example.com', 443))\n"
+                ),
+                "external_network_destination",
+            ),
+            (
+                (
+                    "transport = listener._socket\n"
+                    "transport.connect(('example.com', 443))\n"
+                ),
+                "external_network_destination",
+            ),
+            (
+                (
+                    "def transmit(transport):\n"
+                    "    transport.sendto(b'probe', ('example.com', 443))\n"
+                    "transmit(client)\n"
+                ),
+                "external_network_destination",
+            ),
+            (
+                (
+                    "getattr(socket, 'create_connection')"
+                    "(('example.com', 443))\n"
+                ),
+                "external_network_destination",
+            ),
+            (
+                "__import__('socket').create_connection(('example.com', 443))\n",
+                "dynamic_import_surface",
+            ),
+            (
+                (
+                    "import importlib\n"
+                    "importlib.import_module('socket')."
+                    "create_connection(('example.com', 443))\n"
+                ),
+                "dynamic_import_surface",
+            ),
+            (
+                "os.system('curl https://example.com')\n",
+                "forbidden_os_process_call",
+            ),
+            (
+                "socket.socket().connect_ex(('example.com', 443))\n",
+                "external_network_destination",
+            ),
+            (
+                "socket.socket().sendto(b'probe', ('example.com', 443))\n",
+                "external_network_destination",
+            ),
+            (
+                "client.sendmsg([b'probe'])\n",
+                "external_network_destination",
+            ),
+            (
+                "connection.recvmsg(1)\n",
+                "external_network_destination",
+            ),
+            (
+                "socket.getaddrinfo('example.com', 443)\n",
+                "external_network_destination",
+            ),
+            (
+                "socket.gethostbyname('example.com')\n",
+                "external_network_destination",
+            ),
+            (
+                (
+                    "from socket import getaddrinfo\n"
+                    "getaddrinfo('example.com', 443)\n"
+                ),
+                "external_network_destination",
+            ),
+            (
                 "RuntimeContainmentReceipt = object\n",
                 "prohibited_source:runtime_receipt",
             ),
@@ -778,6 +1055,58 @@ class RepositoryValidationTests(unittest.TestCase):
             'str(codex), "sandbox", "-P", PERMISSION_PROFILE_NAME,'
         )
         mutations = (
+            (
+                source.replace(
+                    "def _probe_argv(",
+                    "@wrapper\ndef _probe_argv(",
+                    1,
+                ),
+                "strong_command_shape",
+            ),
+            (
+                source + "\n_probe_argv = replacement\n",
+                "strong_command_shape",
+            ),
+            (
+                source + "\nprobe_alias = _probe_argv\n",
+                "strong_command_shape",
+            ),
+            (
+                source + '\nglobals()["_probe_argv"] = replacement\n',
+                "strong_command_shape",
+            ),
+            (
+                (
+                    source
+                    + "\nsetattr(sys.modules[__name__], "
+                    + '"_probe_argv", replacement)\n'
+                ),
+                "strong_command_shape",
+            ),
+            (
+                source.replace(
+                    "if codex is None:\n        return child",
+                    (
+                        "if codex is None:\n"
+                        '        child = (str(codex), "exec") + child\n'
+                        "        return child"
+                    ),
+                    1,
+                ),
+                "strong_command_shape",
+            ),
+            (
+                source.replace(
+                    "if codex is None:\n        return child",
+                    (
+                        "child = tuple(child)\n"
+                        "    if codex is None:\n"
+                        "        return child"
+                    ),
+                    1,
+                ),
+                "strong_command_shape",
+            ),
             (
                 source.replace(
                     sandbox_prefix,
@@ -809,6 +1138,53 @@ class RepositoryValidationTests(unittest.TestCase):
                     expected,
                     _phase_b0_surface_violations(mutated, str(native)),
                 )
+
+    def test_phase_b0_command_builder_constructs_exact_strong_argv(self):
+        from scripts.live_eval import native_canary_readiness
+
+        listener = mock.Mock(port=4242)
+        paths = tuple(
+            Path("/phase-b0/" + name)
+            for name in (
+                "allowed-read",
+                "forbidden-read",
+                "allowed-write",
+                "forbidden-write",
+            )
+        )
+
+        self.assertEqual(
+            native_canary_readiness._probe_argv(
+                Path("/tools/codex"),
+                Path("/usr/bin/python3"),
+                Path("/phase-b0/allowed"),
+                paths,
+                listener,
+                b"\x01\x02",
+                "child source",
+            ),
+            (
+                "/tools/codex",
+                "sandbox",
+                "-P",
+                native_canary_readiness.PERMISSION_PROFILE_NAME,
+                "-C",
+                "/phase-b0/allowed",
+                "--",
+                "/usr/bin/python3",
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                "child source",
+                "/phase-b0/allowed-read",
+                "/phase-b0/forbidden-read",
+                "/phase-b0/allowed-write",
+                "/phase-b0/forbidden-write",
+                "4242",
+                "0102",
+            ),
+        )
 
     def test_phase_b0_path_uses_only_bounded_native_seams(self):
         root = Path(__file__).parents[1]

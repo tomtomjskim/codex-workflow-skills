@@ -359,14 +359,20 @@ class _TrustedRoots:
         self.private_identity = private_identity
 
     def close(self) -> None:
+        failure = None
         for name in ("private_fd", "temp_fd"):
             descriptor = getattr(self, name)
             if descriptor >= 0:
+                setattr(self, name, -1)
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-                setattr(self, name, -1)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            raise failure.with_traceback(failure.__traceback__)
 
 
 def _validate_root_fd(
@@ -446,24 +452,58 @@ def _create_owned_directory(
     raise OSError(errno.EEXIST, "cannot create owned directory")
 
 
+def _process_group_alive(process_id: int) -> bool:
+    try:
+        os.killpg(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return False
+        raise
+    return True
+
+
 def _terminate_group(process: subprocess.Popen) -> None:
+    failure = None
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except OSError:
-        return
-    grace_deadline = time.monotonic() + 0.25
-    while time.monotonic() < grace_deadline:
+    except ProcessLookupError:
+        pass
+    except OSError as error:
+        failure = error
+    except BaseException as error:
+        failure = error
+    if process.returncode is None:
         try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            return
-        except PermissionError:
+            process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
             pass
-        time.sleep(0.01)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+    else:
+        time.sleep(0.25)
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
+    except ProcessLookupError:
         pass
+    except OSError as error:
+        if failure is None:
+            failure = error
+    except BaseException as error:
+        if failure is None:
+            failure = error
+    if process.returncode is None:
+        try:
+            process.wait(timeout=0.25)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+    else:
+        time.sleep(0.25)
+    if failure is not None:
+        raise failure.with_traceback(failure.__traceback__)
 
 
 def _run_bounded_command(command: BoundedCommand) -> BoundedCommandResult:
@@ -499,67 +539,110 @@ def _run_bounded_command(command: BoundedCommand) -> BoundedCommandResult:
         start_new_session=True,
         close_fds=True,
     )
-    assert process.stdout is not None and process.stderr is not None
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, ("stdout", command.stdout_limit))
-    selector.register(process.stderr, selectors.EVENT_READ, ("stderr", command.stderr_limit))
-    buffers = {"stdout": bytearray(), "stderr": bytearray()}
-    deadline = time.monotonic() + command.timeout_seconds
-    timed_out = False
-    overflow = False
-    while selector.get_map():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            _terminate_group(process)
-            break
-        for key, _ in selector.select(min(remaining, 0.1)):
-            name, limit = key.data
-            chunk = os.read(key.fileobj.fileno(), min(8192, limit + 1))
-            if not chunk:
-                selector.unregister(key.fileobj)
-                continue
-            room = max(0, limit - len(buffers[name]))
-            buffers[name].extend(chunk[:room])
-            if len(chunk) > room:
-                overflow = True
+    selector = None
+    finished = False
+    failure = None
+    failure_traceback = None
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        selector = selectors.DefaultSelector()
+        selector.register(
+            process.stdout,
+            selectors.EVENT_READ,
+            ("stdout", command.stdout_limit),
+        )
+        selector.register(
+            process.stderr,
+            selectors.EVENT_READ,
+            ("stderr", command.stderr_limit),
+        )
+        buffers = {"stdout": bytearray(), "stderr": bytearray()}
+        deadline = time.monotonic() + command.timeout_seconds
+        timed_out = False
+        overflow = False
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
                 _terminate_group(process)
                 break
-        if overflow:
-            break
-    try:
-        process.wait(timeout=0.5)
-    except subprocess.TimeoutExpired:
-        _terminate_group(process)
-        process.wait(timeout=0.5)
-    drain_deadline = time.monotonic() + 0.25
-    for stream in (process.stdout, process.stderr):
-        os.set_blocking(stream.fileno(), False)
-    while time.monotonic() < drain_deadline:
-        made_progress = False
-        for stream in (process.stdout, process.stderr):
+            for key, _ in selector.select(min(remaining, 0.1)):
+                name, limit = key.data
+                chunk = os.read(
+                    key.fileobj.fileno(), min(8192, limit + 1)
+                )
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                room = max(0, limit - len(buffers[name]))
+                buffers[name].extend(chunk[:room])
+                if len(chunk) > room:
+                    overflow = True
+                    _terminate_group(process)
+                    break
+            if overflow:
+                break
+        if process.returncode is None:
             try:
-                chunk = os.read(stream.fileno(), 8192)
-                made_progress = made_progress or bool(chunk)
-            except BlockingIOError:
-                pass
-            except OSError:
-                pass
-        if not made_progress:
-            time.sleep(0.01)
-    for stream in (process.stdout, process.stderr):
-        try:
-            stream.close()
-        except OSError:
-            pass
-    selector.close()
-    return BoundedCommandResult(
-        None if timed_out else process.returncode,
-        bytes(buffers["stdout"]),
-        bytes(buffers["stderr"]),
-        timed_out,
-        overflow,
-    )
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                _terminate_group(process)
+        live_group = _process_group_alive(process.pid)
+        if live_group:
+            _terminate_group(process)
+            timed_out = True
+        drain_deadline = time.monotonic() + 0.25
+        for stream in (process.stdout, process.stderr):
+            os.set_blocking(stream.fileno(), False)
+        while time.monotonic() < drain_deadline:
+            made_progress = False
+            for stream in (process.stdout, process.stderr):
+                try:
+                    chunk = os.read(stream.fileno(), 8192)
+                    made_progress = made_progress or bool(chunk)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    pass
+            if not made_progress:
+                time.sleep(0.01)
+        result = BoundedCommandResult(
+            None if timed_out else process.returncode,
+            bytes(buffers["stdout"]),
+            bytes(buffers["stderr"]),
+            timed_out,
+            overflow,
+        )
+        finished = True
+    except BaseException as error:
+        failure = error
+        failure_traceback = error.__traceback__
+    finally:
+        if not finished:
+            try:
+                _terminate_group(process)
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                    failure_traceback = error.__traceback__
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+                        failure_traceback = error.__traceback__
+        if selector is not None:
+            try:
+                selector.close()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                    failure_traceback = error.__traceback__
+    if failure is not None:
+        raise failure.with_traceback(failure_traceback)
+    return result
 
 
 class _IdentityError(RuntimeError):
@@ -582,9 +665,15 @@ class _SealedExecutable:
             self._content_digest = self._hash_descriptor()
             if self._content_digest != specification["sha256"]:
                 raise _IdentityError("executable content mismatch")
+        except _IdentityError:
+            self.close()
+            raise
         except (OSError, KeyError, TypeError, ValueError) as error:
             self.close()
             raise _IdentityError("executable identity invalid") from error
+        except BaseException:
+            self.close()
+            raise
 
     def _validate_metadata(self, info: os.stat_result) -> os.stat_result:
         expected_owner = self._specification["expected_owner"]
@@ -643,11 +732,12 @@ class _SealedExecutable:
 
     def close(self) -> None:
         if self._descriptor >= 0:
+            descriptor = self._descriptor
+            self._descriptor = -1
             try:
-                os.close(self._descriptor)
+                os.close(descriptor)
             except OSError:
                 pass
-            self._descriptor = -1
 
 
 def _validated_runner_result(value: object, command: BoundedCommand) -> BoundedCommandResult:
@@ -963,11 +1053,12 @@ class _TrustedProbeFile:
 
     def close(self) -> None:
         if self._descriptor >= 0:
+            descriptor = self._descriptor
+            self._descriptor = -1
             try:
-                os.close(self._descriptor)
+                os.close(descriptor)
             except OSError:
                 pass
-            self._descriptor = -1
 
 
 class _TrustedProbeDirectory:
@@ -1056,11 +1147,12 @@ class _TrustedProbeDirectory:
 
     def close(self) -> None:
         if self.descriptor >= 0:
+            descriptor = self.descriptor
+            self.descriptor = -1
             try:
-                os.close(self.descriptor)
+                os.close(descriptor)
             except OSError:
                 pass
-            self.descriptor = -1
 
 
 class _ResourceRegistry:
@@ -1072,12 +1164,18 @@ class _ResourceRegistry:
         return resource
 
     def close(self) -> None:
+        failure = None
         while self._resources:
             resource = self._resources.pop()
             try:
                 resource.close()
             except Exception:
                 pass
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure.with_traceback(failure.__traceback__)
 
 
 class _EvidencePublisher:
@@ -1117,6 +1215,12 @@ class _EvidencePublisher:
                 except FileExistsError:
                     continue
                 self._name = candidate
+                created = os.stat(
+                    candidate,
+                    dir_fd=self._root_fd,
+                    follow_symlinks=False,
+                )
+                self._run_identity = (created.st_dev, created.st_ino)
                 break
             if not self._name:
                 raise OSError(errno.EEXIST, "cannot create evidence directory")
@@ -1127,13 +1231,88 @@ class _EvidencePublisher:
                 dir_fd=self._root_fd,
             )
             run_info = os.fstat(self._run_fd)
-            self._run_identity = (run_info.st_dev, run_info.st_ino)
+            if (run_info.st_dev, run_info.st_ino) != self._run_identity:
+                raise OSError(errno.EPERM, "evidence directory identity changed")
             self._validate()
-        except Exception:
-            self.close()
+        except BaseException:
+            try:
+                self.abort()
+            except BaseException:
+                pass
             raise
         self.run_directory = private_root / self._name
         self.path = self.run_directory / "readiness.json"
+
+    def abort(self) -> None:
+        failure = None
+        authority = self._root_fd
+        reopened = False
+        try:
+            if authority < 0 and self._name:
+                authority = os.open(
+                    str(self._root_path),
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                )
+                reopened = True
+                retained = os.fstat(authority)
+                current = os.stat(
+                    str(self._root_path), follow_symlinks=False
+                )
+                if (
+                    (retained.st_dev, retained.st_ino)
+                    != self._root_identity
+                    or (current.st_dev, current.st_ino)
+                    != self._root_identity
+                    or not stat.S_ISDIR(retained.st_mode)
+                    or retained.st_uid != os.getuid()
+                    or stat.S_IMODE(retained.st_mode) != 0o700
+                ):
+                    raise OSError(
+                        errno.EPERM, "evidence root identity changed"
+                    )
+            if authority >= 0 and self._name:
+                try:
+                    if self._run_identity == (-1, -1):
+                        os.rmdir(self._name, dir_fd=authority)
+                    elif not _remove_tree(
+                        authority, self._name, self._run_identity
+                    ):
+                        raise OSError(
+                            errno.EPERM, "evidence run cleanup failed"
+                        )
+                except BaseException as error:
+                    failure = error
+                try:
+                    os.fsync(authority)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+        except BaseException as error:
+            if failure is None:
+                failure = error
+        finally:
+            if reopened and authority >= 0:
+                closing = authority
+                authority = -1
+                try:
+                    os.close(closing)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+            for descriptor_name in ("_run_fd", "_root_fd"):
+                owned = getattr(self, descriptor_name, -1)
+                if owned >= 0:
+                    setattr(self, descriptor_name, -1)
+                    try:
+                        os.close(owned)
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
+        if failure is not None:
+            raise failure.with_traceback(failure.__traceback__)
 
     def _validate(self) -> None:
         root_retained = os.fstat(self._root_fd)
@@ -1156,13 +1335,18 @@ class _EvidencePublisher:
 
     def _stage(self, retained: bytes) -> Tuple[str, Tuple[int, int]]:
         staging = "staging-" + secrets.token_hex(12)
-        descriptor = os.open(
-            staging,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-            dir_fd=self._run_fd,
-        )
+        descriptor = -1
         try:
+            descriptor = os.open(
+                staging,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,
+                0o600,
+                dir_fd=self._run_fd,
+            )
             os.fchmod(descriptor, 0o600)
             offset = 0
             while offset < len(retained):
@@ -1173,14 +1357,20 @@ class _EvidencePublisher:
             os.fsync(descriptor)
             info = self._validate_evidence_metadata(os.fstat(descriptor))
             identity = (info.st_dev, info.st_ino)
-        except Exception:
+            closing = descriptor
+            descriptor = -1
+            os.close(closing)
+        except BaseException:
             try:
                 os.unlink(staging, dir_fd=self._run_fd)
-            except FileNotFoundError:
+            except BaseException:
                 pass
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
             raise
-        finally:
-            os.close(descriptor)
         return staging, identity
 
     @staticmethod
@@ -1318,25 +1508,9 @@ class _EvidencePublisher:
                 raise OSError(errno.EIO, "published evidence identity changed")
             os.fsync(self._run_fd)
             data = self._verify_descriptor(descriptor, retained)
-            return data
-        except Exception:
-            if (
-                replaced
-                and fallback_staging is not None
-                and fallback_bytes is not None
-                and success_identity is not None
-            ):
-                self._restore_blocked(
-                    fallback_staging, fallback_bytes, success_identity
-                )
-                fallback_staging = None
-            elif replaced and success_identity is not None:
-                self._remove_identity(success_identity)
-                os.fsync(self._run_fd)
-            raise
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            closing = descriptor
+            descriptor = -1
+            os.close(closing)
             for leftover in (staging, fallback_staging):
                 if leftover is None:
                     continue
@@ -1344,16 +1518,53 @@ class _EvidencePublisher:
                     os.unlink(leftover, dir_fd=self._run_fd)
                 except FileNotFoundError:
                     pass
+            return data
+        except BaseException:
+            try:
+                if (
+                    replaced
+                    and fallback_staging is not None
+                    and fallback_bytes is not None
+                    and success_identity is not None
+                ):
+                    self._restore_blocked(
+                        fallback_staging, fallback_bytes, success_identity
+                    )
+                    fallback_staging = None
+                elif replaced and success_identity is not None:
+                    self._remove_identity(success_identity)
+                    os.fsync(self._run_fd)
+            except BaseException:
+                pass
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+            for leftover in (staging, fallback_staging):
+                if leftover is None:
+                    continue
+                try:
+                    os.unlink(leftover, dir_fd=self._run_fd)
+                except BaseException:
+                    pass
+            raise
 
     def close(self) -> None:
+        failure = None
         for descriptor_name in ("_run_fd", "_root_fd"):
             descriptor = getattr(self, descriptor_name, -1)
             if descriptor >= 0:
+                setattr(self, descriptor_name, -1)
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-                setattr(self, descriptor_name, -1)
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            raise failure.with_traceback(failure.__traceback__)
 
 
 def _remove_directory_contents(descriptor: int) -> None:
@@ -1644,6 +1855,30 @@ def _probe_ledger_corruption(
         )
 
 
+def _abort_native_readiness_run(
+    publisher: Optional[_EvidencePublisher],
+    roots: _TrustedRoots,
+    temporary_name: Optional[str],
+    temporary_identity: Optional[Tuple[int, int]],
+) -> None:
+    if publisher is not None:
+        try:
+            publisher.abort()
+        except BaseException:
+            pass
+    if temporary_name is not None and temporary_identity is not None:
+        try:
+            _remove_tree(
+                roots.temp_fd, temporary_name, temporary_identity
+            )
+        except BaseException:
+            pass
+    try:
+        roots.close()
+    except BaseException:
+        pass
+
+
 def _run_with_policy(
     request: NativeCanaryReadinessRequest,
     policy: _NativeReadinessPolicy,
@@ -1667,6 +1902,8 @@ def _run_with_policy(
     permission_digest = supervisor_digest = ledger_digest = complete_digest = None
     runner = command_runner or _run_bounded_command
     reason = "executable_identity_invalid"
+    fatal_error = None
+    fatal_traceback = None
     try:
         limits = policy.document["limits"]
         codex = _SealedExecutable(
@@ -1890,17 +2127,40 @@ def _run_with_policy(
         executable_digests = (None, None)
     except Exception:
         pass
+    except BaseException as error:
+        fatal_error = error
+        fatal_traceback = error.__traceback__
     finally:
-        if codex is not None:
-            codex.close()
-        if python is not None:
-            python.close()
-        resources.close()
+        for executable in (codex, python):
+            if executable is not None:
+                try:
+                    executable.close()
+                except BaseException as error:
+                    if fatal_error is None:
+                        fatal_error = error
+                        fatal_traceback = error.__traceback__
+        try:
+            resources.close()
+        except BaseException as error:
+            if fatal_error is None:
+                fatal_error = error
+                fatal_traceback = error.__traceback__
+    if fatal_error is not None:
+        _abort_native_readiness_run(
+            publisher, roots, temporary_name, temporary_identity
+        )
+        raise fatal_error.with_traceback(fatal_traceback)
     cleanup_ok = True
     if temporary_name is not None and temporary_identity is not None:
-        cleanup_ok = _remove_tree(
-            roots.temp_fd, temporary_name, temporary_identity
-        )
+        try:
+            cleanup_ok = _remove_tree(
+                roots.temp_fd, temporary_name, temporary_identity
+            )
+        except BaseException:
+            _abort_native_readiness_run(
+                publisher, roots, temporary_name, temporary_identity
+            )
+            raise
     if not cleanup_ok:
         mask = (
             executable_digests[0], executable_digests[1],
@@ -1918,9 +2178,25 @@ def _run_with_policy(
                 )
             except (CanonicalJSONError, OSError):
                 pass
-            finally:
+            except BaseException:
+                _abort_native_readiness_run(
+                    publisher, roots, temporary_name, temporary_identity
+                )
+                raise
+            try:
                 publisher.close()
-        roots.close()
+            except BaseException:
+                _abort_native_readiness_run(
+                    publisher, roots, temporary_name, temporary_identity
+                )
+                raise
+        try:
+            roots.close()
+        except BaseException:
+            _abort_native_readiness_run(
+                publisher, roots, temporary_name, temporary_identity
+            )
+            raise
         return _blocked(
             policy_digest, "cleanup_required", "cleanup_required", mask
         )
@@ -1959,13 +2235,21 @@ def _run_with_policy(
             reason = "evidence_retention_failed"
             complete_digest = None
             available = available[:5] + (None,)
-        finally:
+        except BaseException:
+            _abort_native_readiness_run(
+                publisher, roots, temporary_name, temporary_identity
+            )
+            raise
+    if reason == "native_primitive_observations_recorded":
+        try:
+            roots.close()
             if publisher is not None:
                 publisher.close()
-    elif publisher is not None:
-        publisher.close()
-    if reason == "native_primitive_observations_recorded":
-        roots.close()
+        except BaseException:
+            _abort_native_readiness_run(
+                publisher, roots, temporary_name, temporary_identity
+            )
+            raise
         return NativeCanaryReadinessResult(
             "native_primitive_observations_only",
             0,
@@ -1980,7 +2264,13 @@ def _run_with_policy(
             reason,
         )
     if reason == "executable_identity_invalid" and temporary is None:
-        roots.close()
+        try:
+            roots.close()
+        except BaseException:
+            _abort_native_readiness_run(
+                publisher, roots, temporary_name, temporary_identity
+            )
+            raise
         return _blocked(policy_digest, reason, "not_started", (None,) * 6)
     masks = {
         "executable_identity_invalid": (None,) * 6,
@@ -1994,18 +2284,24 @@ def _run_with_policy(
             permission_digest, supervisor_digest, ledger_digest, None,
         ),
     }
-    roots.close()
+    try:
+        roots.close()
+        if publisher is not None:
+            publisher.close()
+    except BaseException:
+        _abort_native_readiness_run(
+            publisher, roots, temporary_name, temporary_identity
+        )
+        raise
     return _blocked(policy_digest, reason, "removed", masks[reason])
 
 
 def run_native_canary_readiness(
     request: NativeCanaryReadinessRequest,
-    *,
-    command_runner: Optional[Callable[[BoundedCommand], BoundedCommandResult]] = None,
 ) -> NativeCanaryReadinessResult:
     return _run_with_policy(
         request,
         _PRODUCTION_POLICY,
         platform.system().lower(),
-        command_runner,
+        _run_bounded_command,
     )

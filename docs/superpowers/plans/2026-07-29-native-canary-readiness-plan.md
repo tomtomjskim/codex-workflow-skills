@@ -12,8 +12,9 @@ JSONL storage observations without resolving authentication, invoking a model,
 or provisioning a VM.
 
 **Architecture:** Add one narrow cooperative JSONL ledger primitive, one
-native-readiness library with immutable policy and injectable bounded-command
-seam, and one thin CLI. The library runs a direct weak control and a named
+native-readiness library with immutable policy and a private injectable
+bounded-command seam, and one thin CLI. The public entry point always uses the
+real bounded runner. The library runs a direct weak control and a named
 permission-profile strong candidate against owned sentinels, exercises the
 physical ledger, cleans temporary state, and only then publishes path-free
 private evidence and a bounded public result. A passing result is
@@ -37,6 +38,11 @@ nonterminal-to-terminal evidence transition.
 - Do not create `RuntimeContainmentReceipt`, reservation, terminal, marker, or
   pilot state.
 - Do not install Lima or introduce a VM/backend abstraction.
+- The observed fixed-policy real-host `cli_version_mismatch` is diagnostic and
+  fail-closed; it does not authorize VM fallback or a policy-pin change.
+- If hostile same-UID replacement or arbitrary detached-descendant containment
+  becomes a requirement, evaluate a separately approved VM or OS lifecycle
+  boundary. Current Phase B0 does not justify installing one.
 - Do not parse `codex features list`; it is not a live tool inventory.
 - Do not modify the schemas or public behavior of Phase A or the legacy live
   runner.
@@ -51,6 +57,12 @@ nonterminal-to-terminal evidence transition.
   claim success before owned temporary state is removed.
 - A passing Phase B0 observation remains necessary but insufficient for paid
   canary work.
+- The human operator, pinned executable namespace, and other same-UID
+  processes/updater are trusted. Pre/post executable validation detects drift
+  but does not bind path-based exec against same-UID swap-and-restore.
+- The pinned Codex client and constant child must remain in the runner-created
+  process group and must not call `setsid()` or otherwise detach. Arbitrary
+  detached descendants are outside Phase B0.
 
 ## File and Dependency Map
 
@@ -144,17 +156,18 @@ class NativeCanaryReadinessResult:
 
 ```
 
-The function
-`run_native_canary_readiness(request, *, command_runner=None)` returns
-`NativeCanaryReadinessResult`; an injected runner has the exact callable shape
-`Callable[[BoundedCommand], BoundedCommandResult]`.
+The function `run_native_canary_readiness(request)` returns
+`NativeCanaryReadinessResult` and always uses the real bounded subprocess
+runner. It has no public runner-injection parameter.
 
 The public wrapper always supplies the production policy and
 `platform.system().lower()`. A module-private `_run_with_policy()` core accepts
-an immutable policy and observed platform so Linux CI can use generated local
-executables with known hashes. This core is not test-only behavior: it is the
-dependency-free evaluator used by the production wrapper. The CLI imports only
-the fixed-policy public wrapper.
+an immutable policy, observed platform, and optional injected runner with the
+exact callable shape
+`Callable[[BoundedCommand], BoundedCommandResult]`. Linux CI uses that private
+seam with generated local executables whose hashes are known. This core is not
+test-only behavior: it is the dependency-free evaluator used by the production
+wrapper. The CLI imports only the fixed-policy public wrapper.
 
 `NativeCanaryReadinessResult.__post_init__()` enforces fixed fields and
 relationships. `status` is `native_primitive_observations_only` or `blocked`;
@@ -194,9 +207,11 @@ No other reason, state, cleanup, or digest-mask combination is valid.
 - `removed` when every owned temporary path was removed;
 - `cleanup_required` when identity-aware cleanup failed.
 
-`command_runner=None` selects the real bounded subprocess implementation.
-Tests inject the callable; production callers cannot alter the immutable
-policy. The public result contains only the listed fields and fixed values.
+Only private `_run_with_policy(..., command_runner=...)` permits deterministic
+runner injection; omitting it selects the real bounded subprocess
+implementation. Production callers cannot replace the runner or alter the
+immutable policy. The public result contains only the listed fields and fixed
+values.
 
 The production policy binds:
 
@@ -577,6 +592,9 @@ Expected: import failure because
 - [ ] Classify any executable mismatch as
   `executable_identity_invalid`; classify an exact Codex version mismatch as
   `cli_version_mismatch`.
+- [ ] Document that those pre/post checks detect drift but do not bind
+  path-based exec against a same-UID swap-and-restore between checks. Do not
+  claim malicious same-UID resistance.
 
 ### Step 4: Implement one bounded subprocess adapter
 
@@ -585,6 +603,13 @@ Expected: import failure because
 - [ ] Enforce one wall-clock deadline and independent stdout/stderr byte caps.
 - [ ] On timeout or overflow, terminate then kill the process group within
   bounded grace periods and drain/close pipes.
+- [ ] On normal failure, apply bounded group termination, pipe drain/close, and
+  direct-child reap. On `BaseException`, terminate the group, close pipes
+  without claiming a bounded drain, and reap the direct child. This covers
+  non-detached descendants in the same process group; it does not claim control
+  of arbitrary detached descendants.
+- [ ] Require the trusted pinned Codex client and constant child not to call
+  `setsid()` or otherwise detach from the runner-created process group.
 - [ ] Return only `BoundedCommandResult`; never interpolate argv, paths, child
   bytes, stdout, or stderr into errors or public results.
 - [ ] Reject malformed runner results and extra child fields fail closed.
@@ -787,6 +812,10 @@ not yet exist.
   allowing the explicitly bounded `subprocess` and loopback `socket` seams.
 - [ ] Test the gates with small source mutations so a future bypass is detected
   rather than merely asserting the current source happens to be clean.
+- [ ] Describe these checks as regression guards for enumerated surfaces, not
+  code signing, tamper-proof validation, malicious-contributor containment, or
+  whole-program analysis. Changing production source and its tests together is
+  outside the gate’s claim.
 
 ### Step 6: Run focused validation
 
