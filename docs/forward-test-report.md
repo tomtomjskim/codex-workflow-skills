@@ -1,6 +1,6 @@
 # Forward-Test Report
 
-Date: 2026-07-27
+Date: 2026-07-29
 
 This report records the latest validation evidence for the public `codex-workflow-skills` repository. It is intentionally scoped to repeatable checks and known limits, not private session notes.
 
@@ -12,6 +12,8 @@ This report records the latest validation evidence for the public `codex-workflo
 - Phase A four-task harness experiment preflight behavior, including canonical
   input, masked-review precommit v2, static receipts, deterministic planning,
   cleanup, and fixed path-free result states.
+- Phase B0 native readiness behavior, including zero-call host observation,
+  fail-closed result states, redacted private evidence, and VM stop-lines.
 - Repository release hygiene for README links, changelog coverage, plugin manifest version alignment, and public-content scans.
 
 ## Fresh-Context Forward Tests
@@ -76,6 +78,10 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
   not proof that a reviewer received or observed those bytes. A Phase B live
   packager must hash the actual packaged bytes and compare them with the
   declared digests before delivery.
+- Phase B0 is a host-specific primitive observation, not live-containment
+  proof. Linux deterministic tests do not verify macOS Seatbelt behavior, and
+  the recorded real-host result stopped at the CLI version gate before native
+  filesystem, environment, loopback, or ledger conclusions could be made.
 
 ## Release Gate
 
@@ -88,7 +94,7 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
 - live model execution: not_run
 - No model-quality or production-network conclusion is inferred from deterministic tests or dry-run output.
 
-### Phase A experiment preflight validation
+### Phase A experiment preflight validation (2026-07-27 snapshot)
 
 The following local checks passed on 2026-07-27 with Python 3.9.6:
 
@@ -106,7 +112,7 @@ python3 -m unittest tests.test_repository_validation -v
 - A-01 repository validation: 11 passed.
 - The current focused integration of those three suites: 122 passed.
 - Full live-eval-pattern discovery: 599 passed.
-- Full repository validation: 749 tests ran, with 2 environment-dependent
+- At this checkpoint, full repository validation ran 749 tests, with 2 environment-dependent
   shared-agent checks skipped because `SHARED_AGENTS_ROOT` was not configured;
   the validation gate passed.
 - The v2 tests verified exact seed/context commitment binding, pre-unmask seed
@@ -123,7 +129,7 @@ python3 -m unittest tests.test_repository_validation -v
 - The owned `phase-a` tree was removed and the caller-owned temporary parent remained empty.
 - Captured stdout and stderr contained none of the input, bundle, skill, task-source, or temporary absolute paths and none of the private task sentinel bytes. Invalid live-intent arguments produced one fixed blocked JSON result, exit `2`, and empty stderr before file reading or orchestration.
 - The dependency gate covered all six Phase A modules and rejected representative aliased, dynamic, relative, authentication, network, environment-credential, checkout, harness, and subprocess escapes. This AST policy is a regression gate, not proof against intentionally obfuscated reflection; runtime poison-pill tests remain part of the boundary.
-- The workflow is configured with `actions/setup-python@v7`, `python-version: "3.9"`, and an explicit 3.9 assertion. No remote GitHub Actions result is claimed here.
+- The workflow is configured with `actions/setup-python@v7`, `python-version: "3.9"`, and an explicit 3.9 assertion. Current remote evidence is recorded below.
 - live containment backend, canary, pilot, approval, credential, executable, network, live-ledger, and paid model calls: unavailable or not_run
 - Phase A remains `static_only`; model, API, and network calls were 0. No live
   experiment, model-quality, harness-consumption, profile-winner, reviewer
@@ -131,6 +137,47 @@ python3 -m unittest tests.test_repository_validation -v
 - The current final decision projection omits
   `review_evidence_classification`; Phase B output must carry
   `operator_attested_aggregated_review` explicitly.
+
+### Phase B0 native readiness and current remote validation
+
+- GitHub Actions
+  [run 30431829255](https://github.com/tomtomjskim/codex-workflow-skills/actions/runs/30431829255)
+  validated commit `e975218ef95ef834d2ddc0cc3c9cff9267cc61b2` on
+  Ubuntu 24.04.4 with Python 3.9.25. Full repository discovery ran 858
+  tests: 856 passed and 2 environment-dependent shared-agent checks were
+  skipped because `SHARED_AGENTS_ROOT` was not configured. The
+  repository-owned validation gate passed.
+- The remote runner did not contain the Codex system `quick_validate.py` or
+  `validate_plugin.py` scripts. All four skill-structure validations and the
+  plugin validation were therefore skipped remotely; the run proves the
+  repository-owned gate, not those external validators.
+- Local validation on 2026-07-29 ran all four Codex system skill validators,
+  the plugin validator, and `./scripts/validate_repo.sh` with
+  `SHARED_AGENTS_ROOT` configured. Full repository discovery ran 865 tests
+  with no failures or skips, and the repository validation gate passed. This
+  closes the local external-validator and shared-agent-audit gaps without
+  expanding the scope of the remote result.
+- Phase B0 performs no authentication, external network request, `codex exec`,
+  reservation, or paid/model call. Its result contract and deterministic tests
+  require integer `model_calls=0` for successful observations and every
+  blocked or error terminal result.
+- The approved design and implementation plan record that the fixed-policy
+  real-host macOS observation returned `status=blocked`,
+  `reason_code=cli_version_mismatch`, and `cleanup_state=removed`. This is
+  diagnostic fail-closed evidence, not native-containment proof. The raw
+  real-host acceptance output supporting that recorded result is not present
+  in the repository, so this report update could not independently replay it.
+- Phase B0 retains only canonical redacted private evidence and digests. Raw
+  subprocess stdout and stderr are bounded and discarded after projection; it
+  does not retain raw host paths, command output, file content, a synthetic
+  secret, a `RuntimeContainmentReceipt`, a terminal receipt, or a marker
+  receipt. Raw structured response and complete marker-occurrence binding
+  remain future Phase B requirements.
+- VM fallback was neither run nor authorized. The observed
+  `cli_version_mismatch` does not justify fallback. Any future native-to-VM
+  fallback must occur before the first reservation, use a new backend identity,
+  rerun the complete probe set and any required plan-bound static preflight,
+  and receive separate approval. Native and VM evidence must not be combined.
 
 Before public release, run:
 
