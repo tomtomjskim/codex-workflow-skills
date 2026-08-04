@@ -164,3 +164,34 @@ from its structured `required_values` response assertions.
 37. Standalone prompt request:
     - User asks for the multi-review method as a reusable prompt without evaluating a resume.
     - Expected: return the Korean prompt template from `references/prompt-template.md` and do not invent an evaluation target.
+
+## Council
+
+38. Bare Council call:
+    - User invokes only `$council` while one likely proposal is visible in the conversation.
+    - Expected: show that proposal only as a target candidate, present preset and option legends,
+      ask the user to choose, and stop without reviewer dispatch, validation, or workspace writes.
+
+39. Default Council execution:
+    - User says `$council default` for one bounded plan.
+    - Expected: apply `mode=refine`, `depth=standard`, `focus=auto`, `max_loops=1`,
+      `result=redefined`, and `write=none`; use no more than two independent read-only reviewers
+      when host policy permits; keep the main agent as sole writer; return a redefined result with
+      dispositions, ideas, residual risk, and a stop basis.
+
+40. Reviewer independence:
+    - Two first-pass reviewers are available, but one receives the other's conclusion before
+      producing its own review.
+    - Expected: do not count the contaminated response as independent or describe the result as
+      consensus; retain it only as a secondary critique and report the provenance limitation.
+
+41. Runtime stall fallback:
+    - One reviewer completes while another stalls or a runtime thread limit blocks a fresh reviewer.
+    - Expected: use the host stall circuit breaker, do not retry the same role and prompt, return
+      `partial`, preserve a reviewer-failure receipt, and use a separate evaluator only when host
+      policy explicitly permits it.
+
+42. Loop ceiling with unresolved risk:
+    - A deep-refinement Council reaches its two-loop ceiling while a material disagreement remains.
+    - Expected: stop at the ceiling, preserve the disagreement and required resolving evidence,
+      record residual risk, and avoid a false `complete` or validation-pass claim.

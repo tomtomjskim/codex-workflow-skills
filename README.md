@@ -1,11 +1,12 @@
 # Codex Workflow Skills
 
-Reusable Codex skills for structured task intake, evidence-based adversarial review, and multi-perspective resume review.
+Reusable Codex skills for structured task intake, bounded multi-agent councils, evidence-based adversarial review, and multi-perspective resume review.
 
 This repository is plugin-ready. It contains:
 
 - `workflow`: route-only wrapper for choosing intake or review when explicitly requested.
 - `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, E2E decisions, and AI eval handoffs after intake activates.
+- `council`: runs a bounded, independent, read-only reviewer panel to challenge, brainstorm, compare, decide, or refine one proposal while the main agent remains the sole writer.
 - `adversarial-review-loop`: reviews plans, diffs, and implementations with evidence, reviewer routing, finding disposition, loop limits, and verification gates.
 - `resume-multi-review`: evaluates a concrete resume through independent recruiter, hiring-manager, and future-teammate lenses, reconciles conflicting decisions, rewrites supported claims, and controls repeat review loops.
 - `scripts/workflow`: prepares canonical coordination artifacts and validates concurrent dispatches and handoffs without third-party Python packages.
@@ -22,6 +23,7 @@ cd codex-workflow-skills
 mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
+ln -s "$PWD/skills/council" ~/.codex/skills/council
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 python3 -m pip install --disable-pip-version-check -r requirements-ci.txt
@@ -35,6 +37,10 @@ Use $workflow-intake to scope a multi-step settings workflow before implementati
 ```
 
 ```text
+Use $council default to refine the current proposal through independent reviewer lenses.
+```
+
+```text
 Use $resume-multi-review to evaluate my latest resume against this job description and run one evidence-safe rewrite cycle.
 ```
 
@@ -44,6 +50,7 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 
 - Use `$workflow-intake` for broad, risky, ambiguous, or multi-step tasks that need scoped autonomy, artifact decisions, validation planning, and approval gates.
 - Use `$workflow-intake` when PRD, SPEC, TASK, TEST_PLAN, design docs, E2E, or AI eval decisions should be made before implementation.
+- Use `$council` when one bounded proposal, plan, design, decision, diff, or recommendation benefits from independent challenge, alternatives, and a synthesized redefinition.
 - Use `$adversarial-review-loop` when a plan, diff, PR, or implementation already exists and needs evidence-based findings, reviewer lenses, disposition, re-checks, and residual-risk closure.
 - Use `$resume-multi-review` when a concrete resume or authoritative resume source must be screened, revised, and re-screened through distinct hiring perspectives.
 - Use `$workflow` when you are unsure whether the task should start with intake or review.
@@ -54,8 +61,9 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 2. Let intake identify required project context such as `AGENTS.md`, README, project maps, wiki indexes, Serena state, diffs, tests, and task-specific docs.
 3. Approve or revise the generated artifact plan before durable PRD, SPEC, TASK, TEST_PLAN, UX_CONCEPT, IA, UI_SPEC, or EVAL_PLAN documents are created.
 4. Implement using the repository's own conventions and validation commands.
-5. Run `$adversarial-review-loop` against the plan, diff, or implementation before treating the work as ready.
-6. Resolve accepted findings, rerun the relevant checks, and record residual risk when anything remains unverified.
+5. Use `$council default` when the plan or next-step recommendation needs independent challenge and a refined replacement.
+6. Run `$adversarial-review-loop` against the plan, diff, or implementation before treating the work as ready.
+7. Resolve accepted findings, rerun the relevant checks, and record residual risk when anything remains unverified.
 
 ## Resume Review Workflow
 
@@ -100,6 +108,7 @@ Common design artifacts:
 ├── skills/
 │   ├── workflow/
 │   ├── workflow-intake/
+│   ├── council/
 │   ├── adversarial-review-loop/
 │   └── resume-multi-review/
 ├── docs/
@@ -107,6 +116,7 @@ Common design artifacts:
 │   ├── forward-test-report.md
 │   ├── readme-reference-review.md
 │   ├── sample-adversarial-review.md
+│   ├── sample-council.md
 │   ├── sample-resume-multi-review.md
 │   └── sample-workflow-intake.md
 └── tests/
@@ -133,6 +143,7 @@ cd codex-workflow-skills
 mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
+ln -s "$PWD/skills/council" ~/.codex/skills/council
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 ```
@@ -164,6 +175,7 @@ Confirm the skill files are visible:
 ```bash
 test -f ~/.codex/skills/workflow/SKILL.md
 test -f ~/.codex/skills/workflow-intake/SKILL.md
+test -f ~/.codex/skills/council/SKILL.md
 test -f ~/.codex/skills/adversarial-review-loop/SKILL.md
 test -f ~/.codex/skills/resume-multi-review/SKILL.md
 ```
@@ -209,6 +221,19 @@ Run adversarial review when a plan, diff, or implementation exists:
 ```text
 Use $adversarial-review-loop to review this diff and classify findings.
 ```
+
+Run a Council when a bounded target should be challenged and redefined through independent lenses:
+
+```text
+Use $council default to refine the current rollout plan.
+```
+
+A bare `$council` call only shows the preset and option legend, then waits. `default` uses
+`mode=refine`, `depth=standard`, `focus=auto`, at most one loop, response-only output, and up to two
+read-only reviewers when host policy permits. `quick review` uses one reviewer; `deep refinement`
+uses two reviewers and at most two loops. Explicit options can set `mode`, `depth`, `focus`, `loops`,
+`result`, and `write`. The Council call never overrides repository approval gates, and only the main
+agent may write.
 
 Run resume multi-review when an actual resume or resume source exists:
 
@@ -313,6 +338,19 @@ Expected behavior: select reviewer lenses from changed surfaces, classify findin
 
 See [sample-adversarial-review.md](docs/sample-adversarial-review.md) for an illustrative `adversarial_review` output.
 
+Refine a rollout proposal through a bounded Council:
+
+```text
+Use $council default to review and redefine this rollout proposal. Keep writes disabled.
+```
+
+Expected behavior: freeze one target revision, route complementary read-only reviewer lenses,
+preserve disagreement, disposition material findings, return a redefined result, and report
+`static_only`, `partial`, or `incomplete` when the evidence or reviewer execution does not support a
+stronger claim.
+
+See [sample-council.md](docs/sample-council.md) for an illustrative Council result.
+
 Review a resume when only a public draft is available:
 
 ```text
@@ -354,6 +392,7 @@ Validate skill structure when the Codex system validation scripts are available:
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow-intake
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/adversarial-review-loop
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/council
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/resume-multi-review
 ```
 

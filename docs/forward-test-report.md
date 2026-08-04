@@ -1,12 +1,14 @@
 # Forward-Test Report
 
-Date: 2026-07-29
+Date: 2026-08-04
 
 This report records the latest validation evidence for the public `codex-workflow-skills` repository. It is intentionally scoped to repeatable checks and known limits, not private session notes.
 
 ## Scope
 
 - `workflow-intake` guided-intake behavior for planning, design artifact decisions, validation level selection, and E2E recommendations.
+- `council` behavior for bare-call option discovery, bounded reviewer routing, independent synthesis,
+  reviewer-failure fallback, and residual-risk reporting.
 - `adversarial-review-loop` behavior for read-only review routing, evidence requirements, finding severity, disposition, and residual-risk reporting.
 - Fixed `current|lean` harness materialization preflight behavior, including path-free summaries and zero model calls.
 - Phase A four-task harness experiment preflight behavior, including canonical
@@ -41,6 +43,34 @@ Result:
 - A material finding was identified: a `button` inside a form without an explicit `type="button"` can submit the form when the command is meant to save a draft.
 - The sample adversarial review output was updated to include this HIGH finding and concrete remediation guidance.
 
+### Council
+
+Synthetic targets: a bounded Council operating-contract proposal and a reusable-skill publication
+plan. No workspace writes, tests, commits, or pushes were authorized inside the Council prompts.
+
+Result:
+
+- A fresh Codex CLI context loaded the public Council skill and received only `$council` plus one
+  likely target. It returned the localized target candidate, three presets, all six option keys,
+  defaults, and examples, then stopped without reviewer dispatch or workspace mutation.
+- A separate development-session Council used one native read-only reviewer and one fresh
+  read-only evaluator with the same compact first-pass packet. The chair synthesized a revision,
+  preserved disagreements, and used targeted delta review rather than replaying the entire context.
+  A two-loop deep refinement stopped at the configured ceiling with validation status
+  `static_only`; it did not claim that the proposed workflow had been deployed or rehearsed.
+- A fresh Codex CLI execution that attempted automatic reviewer creation announced a two-reviewer
+  panel but produced no further output for 60 seconds. The caller interrupted it and recorded the
+  result as `spawn_rpc_stall`; no Council result was produced, so this attempt is not a pass. The
+  exact runtime-internal cause is unknown.
+- The skill was tightened to preflight callable reviewer capability before announcing a panel and
+  to use a 45-second reviewer-start ceiling when the host defines none. A follow-up fresh-context
+  test with reviewer facilities explicitly unavailable returned `incomplete`,
+  `provisional_main_only`, and `static_only`, included an `unavailable` failure receipt, consumed
+  zero loops, and made no consensus or validation-pass claim.
+- Reviewer prompts now receive the compact packet and output contract inline. They do not reload the
+  Council skill or broad conversation history, which is the verified non-stalling route for the
+  completed reviewer-backed development-session tests.
+
 ## Clean-Install Smoke Test
 
 Expected command sequence:
@@ -51,10 +81,14 @@ cd codex-workflow-skills
 mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
+ln -s "$PWD/skills/council" ~/.codex/skills/council
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
+ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 test -f ~/.codex/skills/workflow/SKILL.md
 test -f ~/.codex/skills/workflow-intake/SKILL.md
+test -f ~/.codex/skills/council/SKILL.md
 test -f ~/.codex/skills/adversarial-review-loop/SKILL.md
+test -f ~/.codex/skills/resume-multi-review/SKILL.md
 ./scripts/validate_repo.sh
 ```
 
@@ -65,6 +99,9 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
 ## Known Limits
 
 - Forward tests used synthetic prompts and artifacts rather than a real production repository.
+- Automatic subagent creation from a nested Codex CLI context stalled on this host. Capability
+  preflight and explicit failure fallback are verified, and a mixed native/fresh-evaluator Council
+  completed, but nested CLI reviewer dispatch itself remains unverified rather than passed.
 - The clean-install smoke test verifies clone, file visibility, symlink shape, and repository validation. It does not programmatically launch a brand-new Codex UI session and inspect skill-trigger behavior.
 - Browser or Playwright E2E remains task-dependent. `workflow-intake` should recommend it by default for real UI work, but these skills themselves do not include a browser app to exercise.
 - Phase A task qualification remains `operator_attested_static`, and masked
@@ -84,6 +121,27 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
   filesystem, environment, loopback, or ledger conclusions could be made.
 
 ## Release Gate
+
+### Council release validation (2026-08-04)
+
+The Council change set passed the following local release checks:
+
+```bash
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/council
+python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+python3 -m unittest tests.test_council_contract -v
+./scripts/validate_repo.sh
+```
+
+- Council focused contract tests: 5 passed.
+- All five repository skills passed the Codex system skill validator.
+- The plugin manifest passed the Codex system plugin validator.
+- Full repository-owned discovery: 863 tests run; 861 passed and 2 external
+  shared-agent audits were skipped because `SHARED_AGENTS_ROOT` was not configured.
+- Repository validation, policy contracts, CI maintenance policy, README links,
+  manifest/changelog version alignment, diff checks, and public hygiene passed.
+- The skipped external shared-agent audits do not validate local adapter installations. They do not
+  weaken the Council-specific structure, contract, fallback, or fresh-context results above.
 
 ### Legacy live-eval runner validation
 

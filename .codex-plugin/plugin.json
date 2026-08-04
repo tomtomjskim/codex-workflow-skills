@@ -1,7 +1,7 @@
 {
   "name": "codex-workflow-skills",
-  "version": "0.2.0",
-  "description": "Guided workflow intake, adversarial review, and multi-perspective resume review skills for Codex.",
+  "version": "0.3.0",
+  "description": "Guided workflow intake, bounded multi-agent councils, adversarial review, and multi-perspective resume review skills for Codex.",
   "author": {
     "name": "TOM"
   },
@@ -10,6 +10,7 @@
     "codex",
     "workflow",
     "review",
+    "council",
     "resume",
     "hiring",
     "skills",
@@ -18,8 +19,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Workflow Skills",
-    "shortDescription": "Guided intake, adversarial review, and resume review loops.",
-    "longDescription": "Codex Workflow Skills adds reusable skills for workflow routing, scoped intake, evidence-based adversarial review, and independent recruiter, hiring-manager, and teammate resume evaluation.",
+    "shortDescription": "Guided intake, councils, and evidence-based review loops.",
+    "longDescription": "Codex Workflow Skills adds reusable skills for workflow routing, scoped intake, bounded multi-agent councils, evidence-based adversarial review, and independent recruiter, hiring-manager, and teammate resume evaluation.",
     "developerName": "TOM",
     "category": "Productivity",
     "capabilities": [
@@ -29,6 +30,7 @@
     "defaultPrompt": [
       "Use $workflow to route my request to intake or review.",
       "Use $workflow-intake to scope this task before implementation.",
+      "Use $council to show options for reviewing and refining the current proposal.",
       "Use $adversarial-review-loop to review this plan or diff.",
       "Use $resume-multi-review to evaluate and revise my authoritative resume through three independent hiring lenses."
     ]
