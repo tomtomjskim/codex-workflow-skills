@@ -67,6 +67,12 @@ Result:
   test with reviewer facilities explicitly unavailable returned `incomplete`,
   `provisional_main_only`, and `static_only`, included an `unavailable` failure receipt, consumed
   zero loops, and made no consensus or validation-pass claim.
+- A final fresh-context execution supplied no reviewer-availability hint. The capability preflight
+  detected the callable collaboration surface, started two separate read-only reviewer contexts,
+  kept their first-pass conclusions independent, and completed one default loop. The result marked
+  the Council meeting `complete` while separately retaining `static_only` for repository adoption,
+  installation, and validation. No file, test, commit, push, or external-write operation ran inside
+  the Council.
 - Reviewer prompts now receive the compact packet and output contract inline. They do not reload the
   Council skill or broad conversation history, which is the verified non-stalling route for the
   completed reviewer-backed development-session tests.
@@ -99,9 +105,10 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
 ## Known Limits
 
 - Forward tests used synthetic prompts and artifacts rather than a real production repository.
-- Automatic subagent creation from a nested Codex CLI context stalled on this host. Capability
-  preflight and explicit failure fallback are verified, and a mixed native/fresh-evaluator Council
-  completed, but nested CLI reviewer dispatch itself remains unverified rather than passed.
+- Automatic reviewer creation from a nested Codex CLI context stalled in one early attempt and
+  completed in the final bounded attempt after capability preflight and compact inline packet
+  routing. Runtime latency remains variable; future stalls must still produce a failure receipt and
+  must not be converted into a pass.
 - The clean-install smoke test verifies clone, file visibility, symlink shape, and repository validation. It does not programmatically launch a brand-new Codex UI session and inspect skill-trigger behavior.
 - Browser or Playwright E2E remains task-dependent. `workflow-intake` should recommend it by default for real UI work, but these skills themselves do not include a browser app to exercise.
 - Phase A task qualification remains `operator_attested_static`, and masked
