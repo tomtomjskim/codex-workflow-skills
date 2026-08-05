@@ -8,6 +8,24 @@ All notable changes to this repository are documented here.
 
 - Added the zero-model-call Phase A harness experiment foundation with a preflight-only CLI, host-local-path-free fixed result output, repository validation coverage, and an explicit Python 3.9 CI baseline; live canary and pilot execution remain unavailable.
 
+## [0.4.0] - 2026-08-04
+
+### Added
+
+- Added `$session-wiki` for verified end-of-session knowledge extraction, classification, review,
+  project-document routing, and personal-wiki capture.
+- Added bare-call option discovery plus quick-candidate, default, personal-capture, and full-closeout
+  presets.
+- Added source precedence, stable-knowledge eligibility, source-mapping, personal trust-zone, privacy,
+  promotion hard-stop, and closeout receipt contracts.
+- Added Session Wiki acceptance scenarios, a sample result, contract tests, and Codex UI metadata.
+
+### Changed
+
+- Expanded README installation, usage, and validation guidance for Session Wiki.
+- Expanded repository validation to include the Session Wiki skill, references, tests, and sample.
+- Bumped the plugin manifest version to `0.4.0`.
+
 ## [0.3.0] - 2026-08-04
 
 ### Added
@@ -96,7 +114,8 @@ All notable changes to this repository are documented here.
 - Added acceptance scenarios for workflow routing, intake, review loop behavior, session conduct, and E2E decisions.
 - Added public repository hygiene guidance and validation commands.
 
-[Unreleased]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tomtomjskim/codex-workflow-skills/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/tomtomjskim/codex-workflow-skills/releases/tag/v0.1.4

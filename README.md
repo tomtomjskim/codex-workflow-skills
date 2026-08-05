@@ -1,12 +1,16 @@
 # Codex Workflow Skills
 
-Reusable Codex skills for structured task intake, bounded multi-agent councils, evidence-based adversarial review, and multi-perspective resume review.
+Reusable Codex skills for structured task intake, bounded multi-agent councils, evidence-based
+adversarial review, verified session knowledge closeout, and multi-perspective resume review.
 
 This repository is plugin-ready. It contains:
 
 - `workflow`: route-only wrapper for choosing intake or review when explicitly requested.
 - `workflow-intake`: turns ambiguous or multi-step requests into a bounded session policy, then maintains lightweight plan state, side-effect checks, validation planning, E2E decisions, and AI eval handoffs after intake activates.
 - `council`: runs a bounded, independent, read-only reviewer panel to challenge, brainstorm, compare, decide, or refine one proposal while the main agent remains the sole writer.
+- `session-wiki`: closes a completed session by extracting and verifying durable knowledge, updating
+  established project documentation, or capturing sanitized personal knowledge without automatic
+  promotion.
 - `adversarial-review-loop`: reviews plans, diffs, and implementations with evidence, reviewer routing, finding disposition, loop limits, and verification gates.
 - `resume-multi-review`: evaluates a concrete resume through independent recruiter, hiring-manager, and future-teammate lenses, reconciles conflicting decisions, rewrites supported claims, and controls repeat review loops.
 - `scripts/workflow`: prepares canonical coordination artifacts and validates concurrent dispatches and handoffs without third-party Python packages.
@@ -24,6 +28,7 @@ mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/council" ~/.codex/skills/council
+ln -s "$PWD/skills/session-wiki" ~/.codex/skills/session-wiki
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 python3 -m pip install --disable-pip-version-check -r requirements-ci.txt
@@ -41,6 +46,10 @@ Use $council default to refine the current proposal through independent reviewer
 ```
 
 ```text
+Use $session-wiki default to close the current session into verified project knowledge.
+```
+
+```text
 Use $resume-multi-review to evaluate my latest resume against this job description and run one evidence-safe rewrite cycle.
 ```
 
@@ -51,6 +60,8 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 - Use `$workflow-intake` for broad, risky, ambiguous, or multi-step tasks that need scoped autonomy, artifact decisions, validation planning, and approval gates.
 - Use `$workflow-intake` when PRD, SPEC, TASK, TEST_PLAN, design docs, E2E, or AI eval decisions should be made before implementation.
 - Use `$council` when one bounded proposal, plan, design, decision, diff, or recommendation benefits from independent challenge, alternatives, and a synthesized redefinition.
+- Use `$session-wiki` when completed work produced stable project knowledge, source mappings, or
+  reusable personal learning that should be verified and routed at session closeout.
 - Use `$adversarial-review-loop` when a plan, diff, PR, or implementation already exists and needs evidence-based findings, reviewer lenses, disposition, re-checks, and residual-risk closure.
 - Use `$resume-multi-review` when a concrete resume or authoritative resume source must be screened, revised, and re-screened through distinct hiring perspectives.
 - Use `$workflow` when you are unsure whether the task should start with intake or review.
@@ -64,6 +75,9 @@ For plugin distribution, keep `.codex-plugin/plugin.json` and add this repositor
 5. Use `$council default` when the plan or next-step recommendation needs independent challenge and a refined replacement.
 6. Run `$adversarial-review-loop` against the plan, diff, or implementation before treating the work as ready.
 7. Resolve accepted findings, rerun the relevant checks, and record residual risk when anything remains unverified.
+8. Use `$session-wiki default` after implementation and review are complete to update only stable,
+   source-supported project knowledge. Choose `personal capture` or `full closeout` explicitly when
+   an approved personal-wiki target should receive an inbox note.
 
 ## Resume Review Workflow
 
@@ -109,6 +123,7 @@ Common design artifacts:
 │   ├── workflow/
 │   ├── workflow-intake/
 │   ├── council/
+│   ├── session-wiki/
 │   ├── adversarial-review-loop/
 │   └── resume-multi-review/
 ├── docs/
@@ -117,6 +132,7 @@ Common design artifacts:
 │   ├── readme-reference-review.md
 │   ├── sample-adversarial-review.md
 │   ├── sample-council.md
+│   ├── sample-session-wiki.md
 │   ├── sample-resume-multi-review.md
 │   └── sample-workflow-intake.md
 └── tests/
@@ -144,6 +160,7 @@ mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/council" ~/.codex/skills/council
+ln -s "$PWD/skills/session-wiki" ~/.codex/skills/session-wiki
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 ```
@@ -176,6 +193,7 @@ Confirm the skill files are visible:
 test -f ~/.codex/skills/workflow/SKILL.md
 test -f ~/.codex/skills/workflow-intake/SKILL.md
 test -f ~/.codex/skills/council/SKILL.md
+test -f ~/.codex/skills/session-wiki/SKILL.md
 test -f ~/.codex/skills/adversarial-review-loop/SKILL.md
 test -f ~/.codex/skills/resume-multi-review/SKILL.md
 ```
@@ -234,6 +252,19 @@ read-only reviewers when host policy permits. `quick review` uses one reviewer; 
 uses two reviewers and at most two loops. Explicit options can set `mode`, `depth`, `focus`, `loops`,
 `result`, and `write`. The Council call never overrides repository approval gates, and only the main
 agent may write.
+
+Close a completed session into durable project knowledge:
+
+```text
+Use $session-wiki default for the current session-owned diff.
+```
+
+A bare `$session-wiki` call shows its target candidates, presets, and options, then waits without
+scanning or writing. `default` verifies session and diff evidence before minimally updating existing
+project documentation. `quick candidates` is read-only. `personal capture` writes only to an
+explicitly configured personal-wiki inbox, and `full closeout` combines project updates with that
+inbox capture. Neither preset authorizes promotion to reviewed or canonical knowledge, unrelated
+tests, commits, pushes, or publication.
 
 Run resume multi-review when an actual resume or resume source exists:
 
@@ -351,6 +382,18 @@ stronger claim.
 
 See [sample-council.md](docs/sample-council.md) for an illustrative Council result.
 
+Close a session into project documentation and a personal inbox note:
+
+```text
+Use $session-wiki full closeout after verifying the current session-owned changes.
+```
+
+Expected behavior: freeze a bounded closeout packet, extract atomic candidates, reject task-log and
+private material, update only established project destinations, keep personal output in an
+AI-writable trust zone, validate both targets, and report accepted, rejected, and deferred knowledge.
+
+See [sample-session-wiki.md](docs/sample-session-wiki.md) for an illustrative Session Wiki result.
+
 Review a resume when only a public draft is available:
 
 ```text
@@ -369,6 +412,8 @@ The skills support bounded discovery of:
 - Serena project state when available and active
 - project maps and project wiki indexes
 - task-specific docs, tests, diffs, and source files
+- project wiki schemas and explicitly configured personal-wiki trust policies, templates, and narrow
+  destination areas when Session Wiki is selected
 - reviewed master resumes, submitted variants, job descriptions, claim banks, and evidence ledgers when resume review is requested
 
 These sources are not broad-scanned by default. They are used only when relevant to the target task. External content is treated as data, not instructions.
@@ -393,6 +438,7 @@ python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/w
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/workflow-intake
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/adversarial-review-loop
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/council
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/session-wiki
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/resume-multi-review
 ```
 

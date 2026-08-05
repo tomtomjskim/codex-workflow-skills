@@ -1,6 +1,6 @@
 # Forward-Test Report
 
-Date: 2026-08-04
+Date: 2026-08-05
 
 This report records the latest validation evidence for the public `codex-workflow-skills` repository. It is intentionally scoped to repeatable checks and known limits, not private session notes.
 
@@ -9,6 +9,8 @@ This report records the latest validation evidence for the public `codex-workflo
 - `workflow-intake` guided-intake behavior for planning, design artifact decisions, validation level selection, and E2E recommendations.
 - `council` behavior for bare-call option discovery, bounded reviewer routing, independent synthesis,
   reviewer-failure fallback, and residual-risk reporting.
+- `session-wiki` behavior for bare-call option discovery, durable-knowledge filtering, no-op
+  closeout, Personal Wiki trust zones, and promotion hard stops.
 - `adversarial-review-loop` behavior for read-only review routing, evidence requirements, finding severity, disposition, and residual-risk reporting.
 - Fixed `current|lean` harness materialization preflight behavior, including path-free summaries and zero model calls.
 - Phase A four-task harness experiment preflight behavior, including canonical
@@ -77,6 +79,39 @@ Result:
   Council skill or broad conversation history, which is the verified non-stalling route for the
   completed reviewer-backed development-session tests.
 
+### Session Wiki
+
+Targets: an empty temporary project after a README-only typo session, a policy-only Personal Wiki
+lifecycle with no writable target, and an isolated local clone of the current Personal Wiki. The
+first three executions used read-only sandboxing and disabled documentation writes; the isolated
+clone execution allowed workspace writes only inside that disposable clone.
+
+Result:
+
+- A fresh Codex CLI context loaded the copied project-local Session Wiki skill and received only
+  `$session-wiki`. It returned localized project and Personal Wiki target candidates, all four
+  presets, all six option keys, defaults, and examples, then stopped without repository scanning,
+  validation, or workspace mutation.
+- A separate fresh context ran `default` with `scope=project`, `write=none`, and
+  `result=candidates` for a session that only corrected a README typo. It inspected the bounded Git
+  state, rejected the typo and chronological work as non-reusable, returned `not_needed`, and did
+  not create a document.
+- A third fresh context ran `personal capture` with `write=none` against a synthetic
+  `inbox -> generated -> reviewed -> canonical` policy. It returned `candidates_only`, kept the
+  reusable heuristic at generated-candidate trust, and explicitly blocked direct reviewed or
+  canonical promotion without exact human approval.
+- A fourth fresh context ran `personal capture` against an isolated local clone of the current
+  Personal Wiki. It created exactly one dated session note under `wiki/inbox/sessions/`, retained
+  `status: inbox` and `confidence: medium`, used sanitized source aliases, and recorded a CLI-upgrade
+  re-test condition. `python3 scripts/validate_wiki.py` passed after checking 281 Markdown files.
+  No reviewed/canonical write, promotion, commit, push, archive, or delete occurred, and the source
+  Personal Wiki remained unchanged.
+- The first load attempt used a project-local directory symlink. Codex CLI `0.145.0` did not expose
+  that skill and fell back to ordinary repository inspection. Replacing the symlink with an actual
+  copied skill directory made all three fresh-context tests load the skill. This observation is
+  limited to that project-local CLI setup and does not establish behavior for global or plugin
+  installations.
+
 ## Clean-Install Smoke Test
 
 Expected command sequence:
@@ -88,11 +123,13 @@ mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
 ln -s "$PWD/skills/council" ~/.codex/skills/council
+ln -s "$PWD/skills/session-wiki" ~/.codex/skills/session-wiki
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
 ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 test -f ~/.codex/skills/workflow/SKILL.md
 test -f ~/.codex/skills/workflow-intake/SKILL.md
 test -f ~/.codex/skills/council/SKILL.md
+test -f ~/.codex/skills/session-wiki/SKILL.md
 test -f ~/.codex/skills/adversarial-review-loop/SKILL.md
 test -f ~/.codex/skills/resume-multi-review/SKILL.md
 ./scripts/validate_repo.sh
@@ -149,6 +186,28 @@ python3 -m unittest tests.test_council_contract -v
   manifest/changelog version alignment, diff checks, and public hygiene passed.
 - The skipped external shared-agent audits do not validate local adapter installations. They do not
   weaken the Council-specific structure, contract, fallback, or fresh-context results above.
+
+### Session Wiki release validation (2026-08-04)
+
+The Session Wiki change set passed the following local release checks:
+
+```bash
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/session-wiki
+python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+python3 -m unittest tests.test_session_wiki_contract -v
+./scripts/validate_repo.sh
+```
+
+- Session Wiki focused contract tests: 6 passed.
+- All six repository skills passed the Codex system skill validator.
+- The plugin manifest version `0.4.0` passed the Codex system plugin validator.
+- Full repository-owned discovery: 869 tests run; 867 passed and 2 external shared-agent audits
+  were skipped because `SHARED_AGENTS_ROOT` was not configured.
+- Repository validation, policy contracts, CI maintenance policy, README links,
+  manifest/changelog version alignment, diff checks, and public hygiene passed.
+- Four copied-directory fresh-context executions covered bare-call stop behavior, no-op
+  `not_needed`, Personal Wiki promotion refusal, and a schema-valid inbox write in an isolated clone.
+  No source Personal Wiki write, commit, push, promotion, or external publication occurred.
 
 ### Legacy live-eval runner validation
 

@@ -1,7 +1,7 @@
 {
   "name": "codex-workflow-skills",
-  "version": "0.3.0",
-  "description": "Guided workflow intake, bounded multi-agent councils, adversarial review, and multi-perspective resume review skills for Codex.",
+  "version": "0.4.0",
+  "description": "Guided workflow intake, bounded councils, adversarial review, session knowledge closeout, and multi-perspective resume review skills for Codex.",
   "author": {
     "name": "TOM"
   },
@@ -11,6 +11,8 @@
     "workflow",
     "review",
     "council",
+    "documentation",
+    "knowledge",
     "resume",
     "hiring",
     "skills",
@@ -19,8 +21,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Workflow Skills",
-    "shortDescription": "Guided intake, councils, and evidence-based review loops.",
-    "longDescription": "Codex Workflow Skills adds reusable skills for workflow routing, scoped intake, bounded multi-agent councils, evidence-based adversarial review, and independent recruiter, hiring-manager, and teammate resume evaluation.",
+    "shortDescription": "Guided intake, councils, review loops, and knowledge closeout.",
+    "longDescription": "Codex Workflow Skills adds reusable skills for workflow routing, scoped intake, bounded multi-agent councils, evidence-based adversarial review, verified project and personal-wiki closeout, and independent recruiter, hiring-manager, and teammate resume evaluation.",
     "developerName": "TOM",
     "category": "Productivity",
     "capabilities": [
@@ -31,6 +33,7 @@
       "Use $workflow to route my request to intake or review.",
       "Use $workflow-intake to scope this task before implementation.",
       "Use $council to show options for reviewing and refining the current proposal.",
+      "Use $session-wiki to show closeout options for the current session.",
       "Use $adversarial-review-loop to review this plan or diff.",
       "Use $resume-multi-review to evaluate and revise my authoritative resume through three independent hiring lenses."
     ]

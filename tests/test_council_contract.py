@@ -62,7 +62,7 @@ class CouncilContractTests(unittest.TestCase):
                 self.assertTrue(
                     (ROOT / "skills" / "council" / "references" / name).is_file()
                 )
-        self.assertEqual(manifest["version"], "0.3.0")
+        self.assertEqual(manifest["version"], "0.4.0")
         self.assertTrue(
             any("$council" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         )

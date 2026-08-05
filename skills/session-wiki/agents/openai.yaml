@@ -1,0 +1,7 @@
+interface:
+  display_name: "Session Wiki"
+  short_description: "세션의 검증된 지식을 프로젝트와 개인 위키에 안전하게 반영합니다"
+  default_prompt: "Use $session-wiki to show closeout options for the current session."
+
+policy:
+  allow_implicit_invocation: false
