@@ -55,6 +55,9 @@ class CouncilContractTests(unittest.TestCase):
         manifest = json.loads(
             (ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
+        metadata = (
+            ROOT / "skills" / "council" / "agents" / "openai.yaml"
+        ).read_text(encoding="utf-8")
 
         for name in ("council-packet.md", "loop-control.md", "panel-routing.md"):
             with self.subTest(name=name):
@@ -66,6 +69,8 @@ class CouncilContractTests(unittest.TestCase):
         self.assertTrue(
             any("$council" in prompt for prompt in manifest["interface"]["defaultPrompt"])
         )
+        self.assertIn("Use $council", metadata)
+        self.assertIn("allow_implicit_invocation: false", metadata)
 
     def test_readme_links_the_sample(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")

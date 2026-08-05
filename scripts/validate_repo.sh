@@ -107,6 +107,7 @@ require_file tests/test_live_eval_native_canary_readiness.py
 require_file tests/test_run_harness_canary_readiness.py
 require_file tests/test_council_contract.py
 require_file tests/test_session_wiki_contract.py
+require_file tests/test_plugin_manifest_contract.py
 
 if [ ! -x scripts/workflow ]; then
   printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2

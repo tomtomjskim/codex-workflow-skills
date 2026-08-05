@@ -8,6 +8,13 @@ All notable changes to this repository are documented here.
 
 - Added the zero-model-call Phase A harness experiment foundation with a preflight-only CLI, host-local-path-free fixed result output, repository validation coverage, and an explicit Python 3.9 CI baseline; live canary and pilot execution remain unavailable.
 
+### Changed
+
+- Limited plugin starter prompts to the three supported UI entries while keeping `$council` and
+  `$session-wiki` directly discoverable, and declared documentation-write capability explicitly.
+- Added manifest contract coverage for starter-prompt limits, Council and Session Wiki exposure,
+  and write-capability metadata.
+
 ## [0.4.0] - 2026-08-04
 
 ### Added
