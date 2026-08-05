@@ -1,12 +1,16 @@
 # Forward-Test Report
 
-Date: 2026-07-29
+Date: 2026-08-05
 
 This report records the latest validation evidence for the public `codex-workflow-skills` repository. It is intentionally scoped to repeatable checks and known limits, not private session notes.
 
 ## Scope
 
 - `workflow-intake` guided-intake behavior for planning, design artifact decisions, validation level selection, and E2E recommendations.
+- `council` behavior for bare-call option discovery, bounded reviewer routing, independent synthesis,
+  reviewer-failure fallback, and residual-risk reporting.
+- `session-wiki` behavior for bare-call option discovery, durable-knowledge filtering, no-op
+  closeout, Personal Wiki trust zones, and promotion hard stops.
 - `adversarial-review-loop` behavior for read-only review routing, evidence requirements, finding severity, disposition, and residual-risk reporting.
 - Fixed `current|lean` harness materialization preflight behavior, including path-free summaries and zero model calls.
 - Phase A four-task harness experiment preflight behavior, including canonical
@@ -41,6 +45,73 @@ Result:
 - A material finding was identified: a `button` inside a form without an explicit `type="button"` can submit the form when the command is meant to save a draft.
 - The sample adversarial review output was updated to include this HIGH finding and concrete remediation guidance.
 
+### Council
+
+Synthetic targets: a bounded Council operating-contract proposal and a reusable-skill publication
+plan. No workspace writes, tests, commits, or pushes were authorized inside the Council prompts.
+
+Result:
+
+- A fresh Codex CLI context loaded the public Council skill and received only `$council` plus one
+  likely target. It returned the localized target candidate, three presets, all six option keys,
+  defaults, and examples, then stopped without reviewer dispatch or workspace mutation.
+- A separate development-session Council used one native read-only reviewer and one fresh
+  read-only evaluator with the same compact first-pass packet. The chair synthesized a revision,
+  preserved disagreements, and used targeted delta review rather than replaying the entire context.
+  A two-loop deep refinement stopped at the configured ceiling with validation status
+  `static_only`; it did not claim that the proposed workflow had been deployed or rehearsed.
+- A fresh Codex CLI execution that attempted automatic reviewer creation announced a two-reviewer
+  panel but produced no further output for 60 seconds. The caller interrupted it and recorded the
+  result as `spawn_rpc_stall`; no Council result was produced, so this attempt is not a pass. The
+  exact runtime-internal cause is unknown.
+- The skill was tightened to preflight callable reviewer capability before announcing a panel and
+  to use a 45-second reviewer-start ceiling when the host defines none. A follow-up fresh-context
+  test with reviewer facilities explicitly unavailable returned `incomplete`,
+  `provisional_main_only`, and `static_only`, included an `unavailable` failure receipt, consumed
+  zero loops, and made no consensus or validation-pass claim.
+- A final fresh-context execution supplied no reviewer-availability hint. The capability preflight
+  detected the callable collaboration surface, started two separate read-only reviewer contexts,
+  kept their first-pass conclusions independent, and completed one default loop. The result marked
+  the Council meeting `complete` while separately retaining `static_only` for repository adoption,
+  installation, and validation. No file, test, commit, push, or external-write operation ran inside
+  the Council.
+- Reviewer prompts now receive the compact packet and output contract inline. They do not reload the
+  Council skill or broad conversation history, which is the verified non-stalling route for the
+  completed reviewer-backed development-session tests.
+
+### Session Wiki
+
+Targets: an empty temporary project after a README-only typo session, a policy-only Personal Wiki
+lifecycle with no writable target, and an isolated local clone of the current Personal Wiki. The
+first three executions used read-only sandboxing and disabled documentation writes; the isolated
+clone execution allowed workspace writes only inside that disposable clone.
+
+Result:
+
+- A fresh Codex CLI context loaded the copied project-local Session Wiki skill and received only
+  `$session-wiki`. It returned localized project and Personal Wiki target candidates, all four
+  presets, all six option keys, defaults, and examples, then stopped without repository scanning,
+  validation, or workspace mutation.
+- A separate fresh context ran `default` with `scope=project`, `write=none`, and
+  `result=candidates` for a session that only corrected a README typo. It inspected the bounded Git
+  state, rejected the typo and chronological work as non-reusable, returned `not_needed`, and did
+  not create a document.
+- A third fresh context ran `personal capture` with `write=none` against a synthetic
+  `inbox -> generated -> reviewed -> canonical` policy. It returned `candidates_only`, kept the
+  reusable heuristic at generated-candidate trust, and explicitly blocked direct reviewed or
+  canonical promotion without exact human approval.
+- A fourth fresh context ran `personal capture` against an isolated local clone of the current
+  Personal Wiki. It created exactly one dated session note under `wiki/inbox/sessions/`, retained
+  `status: inbox` and `confidence: medium`, used sanitized source aliases, and recorded a CLI-upgrade
+  re-test condition. `python3 scripts/validate_wiki.py` passed after checking 281 Markdown files.
+  No reviewed/canonical write, promotion, commit, push, archive, or delete occurred, and the source
+  Personal Wiki remained unchanged.
+- The first load attempt used a project-local directory symlink. Codex CLI `0.145.0` did not expose
+  that skill and fell back to ordinary repository inspection. Replacing the symlink with an actual
+  copied skill directory made all three fresh-context tests load the skill. This observation is
+  limited to that project-local CLI setup and does not establish behavior for global or plugin
+  installations.
+
 ## Clean-Install Smoke Test
 
 Expected command sequence:
@@ -51,10 +122,16 @@ cd codex-workflow-skills
 mkdir -p ~/.codex/skills
 ln -s "$PWD/skills/workflow" ~/.codex/skills/workflow
 ln -s "$PWD/skills/workflow-intake" ~/.codex/skills/workflow-intake
+ln -s "$PWD/skills/council" ~/.codex/skills/council
+ln -s "$PWD/skills/session-wiki" ~/.codex/skills/session-wiki
 ln -s "$PWD/skills/adversarial-review-loop" ~/.codex/skills/adversarial-review-loop
+ln -s "$PWD/skills/resume-multi-review" ~/.codex/skills/resume-multi-review
 test -f ~/.codex/skills/workflow/SKILL.md
 test -f ~/.codex/skills/workflow-intake/SKILL.md
+test -f ~/.codex/skills/council/SKILL.md
+test -f ~/.codex/skills/session-wiki/SKILL.md
 test -f ~/.codex/skills/adversarial-review-loop/SKILL.md
+test -f ~/.codex/skills/resume-multi-review/SKILL.md
 ./scripts/validate_repo.sh
 ```
 
@@ -65,6 +142,10 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
 ## Known Limits
 
 - Forward tests used synthetic prompts and artifacts rather than a real production repository.
+- Automatic reviewer creation from a nested Codex CLI context stalled in one early attempt and
+  completed in the final bounded attempt after capability preflight and compact inline packet
+  routing. Runtime latency remains variable; future stalls must still produce a failure receipt and
+  must not be converted into a pass.
 - The clean-install smoke test verifies clone, file visibility, symlink shape, and repository validation. It does not programmatically launch a brand-new Codex UI session and inspect skill-trigger behavior.
 - Browser or Playwright E2E remains task-dependent. `workflow-intake` should recommend it by default for real UI work, but these skills themselves do not include a browser app to exercise.
 - Phase A task qualification remains `operator_attested_static`, and masked
@@ -84,6 +165,49 @@ Latest local result: passed on 2026-07-08 with an isolated clone, isolated skill
   filesystem, environment, loopback, or ledger conclusions could be made.
 
 ## Release Gate
+
+### Council release validation (2026-08-04)
+
+The Council change set passed the following local release checks:
+
+```bash
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/council
+python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+python3 -m unittest tests.test_council_contract -v
+./scripts/validate_repo.sh
+```
+
+- Council focused contract tests: 5 passed.
+- All five repository skills passed the Codex system skill validator.
+- The plugin manifest passed the Codex system plugin validator.
+- Full repository-owned discovery: 863 tests run; 861 passed and 2 external
+  shared-agent audits were skipped because `SHARED_AGENTS_ROOT` was not configured.
+- Repository validation, policy contracts, CI maintenance policy, README links,
+  manifest/changelog version alignment, diff checks, and public hygiene passed.
+- The skipped external shared-agent audits do not validate local adapter installations. They do not
+  weaken the Council-specific structure, contract, fallback, or fresh-context results above.
+
+### Session Wiki release validation (2026-08-04)
+
+The Session Wiki change set passed the following local release checks:
+
+```bash
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/session-wiki
+python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+python3 -m unittest tests.test_session_wiki_contract -v
+./scripts/validate_repo.sh
+```
+
+- Session Wiki focused contract tests: 6 passed.
+- All six repository skills passed the Codex system skill validator.
+- The plugin manifest version `0.4.0` passed the Codex system plugin validator.
+- Full repository-owned discovery: 869 tests run; 867 passed and 2 external shared-agent audits
+  were skipped because `SHARED_AGENTS_ROOT` was not configured.
+- Repository validation, policy contracts, CI maintenance policy, README links,
+  manifest/changelog version alignment, diff checks, and public hygiene passed.
+- Four copied-directory fresh-context executions covered bare-call stop behavior, no-op
+  `not_needed`, Personal Wiki promotion refusal, and a schema-valid inbox write in an isolated clone.
+  No source Personal Wiki write, commit, push, promotion, or external publication occurred.
 
 ### Legacy live-eval runner validation
 

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Council"
+  short_description: "다중 에이전트 회의로 제안과 계획을 검토·고도화합니다"
+  default_prompt: "Use $council to show options for reviewing and refining the current proposal."
+
+policy:
+  allow_implicit_invocation: false

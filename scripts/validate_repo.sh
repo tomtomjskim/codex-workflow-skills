@@ -46,12 +46,22 @@ require_file .codex-plugin/plugin.json
 require_file skills/workflow/SKILL.md
 require_file skills/workflow-intake/SKILL.md
 require_file skills/adversarial-review-loop/SKILL.md
+require_file skills/council/SKILL.md
+require_file skills/council/references/council-packet.md
+require_file skills/council/references/loop-control.md
+require_file skills/council/references/panel-routing.md
+require_file skills/session-wiki/SKILL.md
+require_file skills/session-wiki/references/knowledge-contract.md
+require_file skills/session-wiki/references/project-routing.md
+require_file skills/session-wiki/references/personal-wiki-routing.md
 require_file skills/resume-multi-review/SKILL.md
 require_file skills/resume-multi-review/references/source-precedence.md
 require_file skills/resume-multi-review/references/review-contract.md
 require_file skills/resume-multi-review/references/prompt-template.md
 require_file docs/sample-workflow-intake.md
 require_file docs/sample-adversarial-review.md
+require_file docs/sample-council.md
+require_file docs/sample-session-wiki.md
 require_file docs/sample-resume-multi-review.md
 require_file tests/acceptance-scenarios.md
 require_file scripts/workflow
@@ -95,6 +105,9 @@ require_file scripts/run_harness_canary_readiness.py
 require_file tests/test_live_eval_private_jsonl_ledger.py
 require_file tests/test_live_eval_native_canary_readiness.py
 require_file tests/test_run_harness_canary_readiness.py
+require_file tests/test_council_contract.py
+require_file tests/test_session_wiki_contract.py
+require_file tests/test_plugin_manifest_contract.py
 
 if [ ! -x scripts/workflow ]; then
   printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2
@@ -105,6 +118,8 @@ if [ -f "$SKILL_VALIDATOR" ]; then
   run python3 "$SKILL_VALIDATOR" skills/workflow
   run python3 "$SKILL_VALIDATOR" skills/workflow-intake
   run python3 "$SKILL_VALIDATOR" skills/adversarial-review-loop
+  run python3 "$SKILL_VALIDATOR" skills/council
+  run python3 "$SKILL_VALIDATOR" skills/session-wiki
   run python3 "$SKILL_VALIDATOR" skills/resume-multi-review
 else
   printf 'skip: skill validator not found at %s\n' "$SKILL_VALIDATOR"
@@ -129,8 +144,12 @@ run python3 -m unittest discover -s tests -v
 
 require_match '\[sample-workflow-intake\.md\]\(docs/sample-workflow-intake\.md\)' README.md 'workflow intake sample link'
 require_match '\[sample-adversarial-review\.md\]\(docs/sample-adversarial-review\.md\)' README.md 'adversarial review sample link'
+require_match '\[sample-council\.md\]\(docs/sample-council\.md\)' README.md 'council sample link'
+require_match '\[sample-session-wiki\.md\]\(docs/sample-session-wiki\.md\)' README.md 'session wiki sample link'
 require_match '\[sample-resume-multi-review\.md\]\(docs/sample-resume-multi-review\.md\)' README.md 'resume multi-review sample link'
 require_match '\[CHANGELOG\.md\]\(CHANGELOG\.md\)' README.md 'changelog link'
+require_match 'name: council' skills/council/SKILL.md 'council skill name'
+require_match 'name: session-wiki' skills/session-wiki/SKILL.md 'session wiki skill name'
 require_match 'name: resume-multi-review' skills/resume-multi-review/SKILL.md 'resume multi-review skill name'
 require_match 'source_gap' skills/resume-multi-review/references/review-contract.md 'resume source-gap output state'
 

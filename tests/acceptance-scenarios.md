@@ -164,3 +164,83 @@ from its structured `required_values` response assertions.
 37. Standalone prompt request:
     - User asks for the multi-review method as a reusable prompt without evaluating a resume.
     - Expected: return the Korean prompt template from `references/prompt-template.md` and do not invent an evaluation target.
+
+## Council
+
+38. Bare Council call:
+    - User invokes only `$council` while one likely proposal is visible in the conversation.
+    - Expected: show that proposal only as a target candidate, present preset and option legends,
+      ask the user to choose, and stop without reviewer dispatch, validation, or workspace writes.
+
+39. Default Council execution:
+    - User says `$council default` for one bounded plan.
+    - Expected: apply `mode=refine`, `depth=standard`, `focus=auto`, `max_loops=1`,
+      `result=redefined`, and `write=none`; use no more than two independent read-only reviewers
+      when host policy permits; keep the main agent as sole writer; return a redefined result with
+      dispositions, ideas, residual risk, and a stop basis.
+
+40. Reviewer independence:
+    - Two first-pass reviewers are available, but one receives the other's conclusion before
+      producing its own review.
+    - Expected: do not count the contaminated response as independent or describe the result as
+      consensus; retain it only as a secondary critique and report the provenance limitation.
+
+41. Runtime stall fallback:
+    - One reviewer completes while another stalls or a runtime thread limit blocks a fresh reviewer.
+    - Expected: use the host stall circuit breaker, do not retry the same role and prompt, return
+      `partial`, preserve a reviewer-failure receipt, and use a separate evaluator only when host
+      policy explicitly permits it.
+
+42. Loop ceiling with unresolved risk:
+    - A deep-refinement Council reaches its two-loop ceiling while a material disagreement remains.
+    - Expected: stop at the ceiling, preserve the disagreement and required resolving evidence,
+      record residual risk, and avoid a false `complete` or validation-pass claim.
+
+## Session Wiki
+
+43. Bare Session Wiki call:
+    - User invokes only `$session-wiki` after completing one bounded repository task.
+    - Expected: show project and configured personal-wiki target candidates plus preset and option
+      legends, ask the user to choose, and stop without repository scanning, validation, writes,
+      commits, pushes, or promotion.
+
+44. Default project closeout:
+    - User says `$session-wiki default` after a session changed a stable domain transition.
+    - Expected: use `scope=project`, `source=session+diff`, `depth=standard`, `review=standard`,
+      `write=project`, and `result=updated`; update only the existing authoritative project page
+      after source verification and run its smallest required documentation validation.
+
+45. Transient task-log exclusion:
+    - The session contains a commit summary, temporary debug sequence, passed commands, and one
+      stable source-mapping fact.
+    - Expected: route only the stable reusable mapping to project documentation; reject the
+      chronology, transient debug detail, and routine command list as task-log material.
+
+46. Personal inbox capture:
+    - User says `$session-wiki personal capture` and an explicit personal-wiki target uses
+      `inbox -> generated -> reviewed -> canonical` trust levels.
+    - Expected: create or merge one schema-valid inbox session note, sanitize sources and private
+      paths, record confidence, run required wiki validation, and perform no promotion.
+
+47. Personal promotion request without exact approval:
+    - A useful generated note appears ready for reviewed or canonical status, but the user only
+      requested `full closeout`.
+    - Expected: leave it in the AI-writable trust zone, return a promotion candidate and required
+      human checks, and do not move the file or change its status.
+
+48. Code and wiki conflict:
+    - An existing project wiki page disagrees with current schema and tested transition code.
+    - Expected: prefer current authoritative sources, refresh the wiki only when the selected
+      session proves the replacement, preserve compatibility context when relevant, and otherwise
+      report a conflict instead of guessing.
+
+49. No durable candidate:
+    - The session only fixes a typo and adds no stable project or personal knowledge.
+    - Expected: return `not_needed`, explain that no durable candidate exists, and do not create a
+      session document merely to prove the skill ran.
+
+50. Mixed session ownership:
+    - The worktree contains unrelated changes from another session in addition to the current
+      session's explicit paths.
+    - Expected: freeze only the current session's bounded source set, exclude unrelated changes,
+      and report `partial` if a selected-scope claim cannot be attributed safely.
