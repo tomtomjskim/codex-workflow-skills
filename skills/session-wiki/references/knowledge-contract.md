@@ -21,17 +21,36 @@ approved verification results are sufficient.
 Represent each candidate with these fields during the closeout:
 
 ```yaml
+claim_id:
 claim: one atomic statement
 class: project | personal | both | discard
 durability: stable | time-bound | transient | unknown
 source: bounded path, symbol, test, commit, user decision, or session evidence
+source_hash_or_revision:
+ownership: current-session | other-session | unknown
 confidence: high | medium | low
 freshness: current | dated | unknown
 privacy: public-safe | project-internal | personal | prohibited
-disposition: new | merge | refresh | conflict | duplicate | reject | defer
+comparison: new | merge | refresh | conflict | duplicate | not_checked
+decision: accept | reject | defer
 destination: existing path and section, trust zone, or undecided
 reason: evidence and reuse value
+strict_review:
+  contradiction_check: pass | fail | unknown
+  privacy_check: pass | fail | unknown
+  provenance_check: pass | fail | unknown
+  lifecycle_check: pass | fail | unknown
 ```
+
+Use a stable session-local `claim_id` so the receipt can disposition every candidate without relying
+on mutable prose. `source_hash_or_revision` may be a commit, diff revision, content digest, stable
+document revision, or `unknown`; do not fabricate one. `ownership` is about the selected session's
+authority, not filesystem ownership.
+
+Keep document comparison separate from the final decision. `comparison=conflict` means selected
+sources disagree; it normally pairs with `decision=defer` until the selected source scope proves a
+replacement. `comparison=duplicate` normally pairs with `decision=reject` and no write. Use
+`decision=accept` only when the eligibility gate and destination policy pass.
 
 ## Project Eligibility Gate
 
@@ -83,3 +102,8 @@ Reject or defer:
 5. Is the candidate useful enough to justify future maintenance?
 
 If any answer remains unclear, reduce confidence or defer the candidate.
+
+Record `contradiction_check`, `privacy_check`, `provenance_check`, and `lifecycle_check` as
+`pass`, `fail`, or `unknown` for every candidate in strict review. Any accepted claim requires all
+four to be `pass`. A comparison conflict or unknown provenance cannot be converted to `pass` merely
+because the claim sounds likely.

@@ -41,10 +41,31 @@ class ScenarioTests(unittest.TestCase):
     def test_loads_versioned_corpus_with_all_documented_scenarios(self):
         scenarios = load_scenarios(FIXTURE)
 
-        self.assertEqual(len(scenarios), 26)
+        self.assertEqual(len(scenarios), 36)
         self.assertEqual(tuple(scenarios), tuple(sorted(scenarios)))
         self.assertTrue(all(item.schema_version == 1 for item in scenarios.values()))
         self.assertTrue(all(item.required_values for item in scenarios.values()))
+
+    def test_council_and_session_wiki_quality_regressions_are_executable(self):
+        scenarios = load_scenarios(FIXTURE)
+
+        expected = {
+            "CO-BARE-CALL",
+            "CO-STARTED-WAITING",
+            "CO-REPLACEMENT-PROVENANCE",
+            "CO-NO-REVIEWER-INCOMPLETE",
+            "CO-WEBHOOK-SEEDED-RISKS",
+            "SW-BARE-CALL",
+            "SW-INCOMPATIBLE-WRITE",
+            "SW-STRICT-UNSUPPORTED",
+            "SW-MIXED-OWNERSHIP",
+            "SW-PROMOTION-HARD-STOP",
+        }
+        self.assertTrue(expected.issubset(scenarios))
+        seeded = dict(scenarios["CO-WEBHOOK-SEEDED-RISKS"].required_values)
+        self.assertEqual(seeded.pop("target_revision"), "payment-webhook-v1")
+        self.assertEqual(len(seeded), 7)
+        self.assertTrue(all(value is True for value in seeded.values()))
 
     def test_documentation_and_corpus_have_the_same_unique_ids(self):
         scenarios = load_scenarios(FIXTURE)

@@ -13,13 +13,22 @@ import scripts.live_eval.checkout as checkout_module
 from scripts.live_eval.checkout import (
     canonical_name_key,
     install_checkout_skills,
+    install_eval_checkout_skills,
     require_unique_canonical_names,
     verify_loaded_checkout,
+    verify_loaded_eval_checkout,
 )
 
 
 EXPECTED_SKILLS = (
     "adversarial-review-loop",
+    "workflow",
+    "workflow-intake",
+)
+EXTENDED_EVAL_SKILLS = (
+    "adversarial-review-loop",
+    "council",
+    "session-wiki",
     "workflow",
     "workflow-intake",
 )
@@ -47,7 +56,7 @@ class CheckoutTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        for index, name in enumerate(EXPECTED_SKILLS):
+        for index, name in enumerate(EXTENDED_EVAL_SKILLS):
             skill = self.repo / "skills" / name
             (skill / "references").mkdir(parents=True)
             (skill / "SKILL.md").write_text(
@@ -127,6 +136,20 @@ class CheckoutTests(unittest.TestCase):
         result = verify_loaded_checkout(self.repo, self.codex_home)
         self.assertEqual(result.classification, "ready")
         self.assertEqual(result.result, "pass")
+        self.assertEqual(result.manifest, manifest)
+
+    def test_extended_eval_materializes_council_and_session_wiki_without_changing_legacy_set(self):
+        home = self.new_home("extended-eval-home")
+
+        manifest = install_eval_checkout_skills(self.repo, home)
+
+        self.assertEqual(manifest.skill_names, EXTENDED_EVAL_SKILLS)
+        self.assertEqual(
+            tuple(sorted(item.name for item in (home / "skills").iterdir())),
+            EXTENDED_EVAL_SKILLS,
+        )
+        result = verify_loaded_eval_checkout(self.repo, home)
+        self.assertEqual(result.classification, "ready")
         self.assertEqual(result.manifest, manifest)
 
     def test_plugin_hash_is_canonical_head_blob_content(self):

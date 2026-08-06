@@ -24,8 +24,8 @@ from scripts.live_eval.artifacts import RedactingWriter, RedactionError
 from scripts.live_eval.budget import Budget, BudgetExceeded
 from scripts.live_eval.checkout import (
     CheckoutManifest,
-    install_checkout_skills,
-    verify_loaded_checkout,
+    install_eval_checkout_skills as install_checkout_skills,
+    verify_loaded_eval_checkout as verify_loaded_checkout,
 )
 from scripts.live_eval.harness import (
     materialize_harness_home,
@@ -54,7 +54,7 @@ DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_MODELS = (DEFAULT_MODEL,)
 DEFAULT_API_KEY_ENV_NAME = "OPENAI_API_KEY"
 TARGETED_MAX_SCENARIOS = 3
-RELEASE_MAX_SCENARIOS = 26
+RELEASE_MAX_SCENARIOS = 36
 CHECKOUT_ENTRIES = (".live-eval-checkout.json", "skills")
 REQUIRED_FLAGS = frozenset(
     {

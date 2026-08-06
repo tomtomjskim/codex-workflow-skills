@@ -78,6 +78,24 @@ Result:
 - Reviewer prompts now receive the compact packet and output contract inline. They do not reload the
   Council skill or broad conversation history, which is the verified non-stalling route for the
   completed reviewer-backed development-session tests.
+- A quality-hardening pass on Codex CLI `0.146.0` separated reviewer registration from reviewer
+  completion. The 45-second ceiling now applies only until a canonical reviewer target is
+  registered; a registered attempt is observed in wait slices of at most 60 seconds and receives
+  the preset completion ceiling. A fresh-context trace crossed its first quiet wait slice, remained
+  `registered_started`, did not interrupt or dispatch a replacement, and then completed through the
+  original `S1/A1` attempt.
+- The first fresh-context quick review of the seeded payment-webhook proposal completed with one
+  independent read-only security reviewer and identified all expected risk groups, but its receipt
+  renamed the explicit input revision from `v1` to the Council-internal `v0`. That run therefore
+  passed risk recall and reviewer lifecycle behavior but failed target-identity preservation. The
+  contract was revised to keep an explicit source revision unchanged through the packet, reviewer,
+  attempts, delta review, and final receipt. A second fresh-context execution preserved
+  `payment-webhook-v1` exactly, crossed one quiet 60-second wait slice without interrupting the
+  reviewer, and again identified process-local cache idempotency, pre-durable 2xx event loss,
+  split-transaction inconsistency, missing database uniqueness, fixed retry concentration,
+  raw-payload privacy, and insufficient testing. It kept unverified signature, replay-window,
+  queue-durability, and log-policy details as residual risk and reported `static_only / tests
+  not_run` rather than a validation pass.
 
 ### Session Wiki
 
@@ -111,6 +129,12 @@ Result:
   copied skill directory made all three fresh-context tests load the skill. This observation is
   limited to that project-local CLI setup and does not establish behavior for global or plugin
   installations.
+- A Codex CLI `0.146.0` fresh-context strict-review test exposed ambiguity in the original single
+  candidate disposition. The contract was split into source comparison
+  (`new|merge|refresh|conflict|duplicate|not_checked`) and publication decision
+  (`accept|reject|defer`). After that revision, the same unsupported payment-webhook claim returned
+  `comparison=conflict`, `decision=defer`, explicit pass/fail values for all four strict checks, and
+  `write=not_run`; it did not update project documentation.
 
 ## Clean-Install Smoke Test
 
@@ -208,6 +232,28 @@ python3 -m unittest tests.test_session_wiki_contract -v
 - Four copied-directory fresh-context executions covered bare-call stop behavior, no-op
   `not_needed`, Personal Wiki promotion refusal, and a schema-valid inbox write in an isolated clone.
   No source Personal Wiki write, commit, push, promotion, or external publication occurred.
+
+### Council and Session Wiki quality hardening (2026-08-05)
+
+- Council now records reviewer seats independently from runtime attempts, preserves canonical
+  target IDs and timestamps, applies replacement only after terminal failure, and derives
+  `complete`, `partial`, or `incomplete` from required-seat evidence rather than from attempt count.
+- Explicit source revisions are now immutable Council packet evidence; Council-assigned `v0` is
+  used only when the source supplies no revision.
+- Session Wiki now validates incompatible scope/write combinations before discovery, records claim
+  ownership in mixed sessions, separates comparison from publication decision, and requires all
+  four strict checks before accepting a candidate.
+- Ten machine-readable Council and Session Wiki scenarios expanded the executable corpus to 36.
+  The normal live-eval checkout includes both skills, while legacy Phase A and harness checkout
+  APIs retain their fixed three-skill surface. The release budget is 40 calls, 5,400 seconds, and
+  concurrency two.
+- Focused contract, checkout, harness, scenario, and runner suites passed. Full repository
+  validation discovered 881 tests: 879 passed and 2 external shared-agent audits were skipped
+  because `SHARED_AGENTS_ROOT` was not configured.
+- Bare-call, reviewer-wait, seeded-webhook, and strict Session Wiki behavior were also exercised in
+  independent global copied-directory installs through Codex CLI `0.146.0`. These were direct
+  operator-local OAuth CLI forward tests, not the repository live-eval runner. The runner's paid
+  live path remained `not_run` because its explicit API-key prerequisite was unavailable.
 
 ### Legacy live-eval runner validation
 

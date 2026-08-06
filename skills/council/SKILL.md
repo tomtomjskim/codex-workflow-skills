@@ -20,7 +20,9 @@ Also read the active repository's `AGENTS.md` and any directly applicable local 
 dispatch. Do not broad-scan unrelated project documentation. If the sibling
 `adversarial-review-loop` skill is available and the target is an existing plan, diff, PR,
 implementation, or review finding, reuse its evidence, disposition, re-verification, and
-residual-risk rules. Council still owns the meeting shape and independent ideation.
+residual-risk rules. Council still owns the meeting shape, reviewer lifecycle, and independent
+ideation. Reuse those contracts as evidence rules; do not start a second orchestration loop or
+announce a separate skill run unless the user explicitly invoked it.
 
 ## Parse The Invocation
 
@@ -106,6 +108,8 @@ max_loops: 1
 result: redefined
 write: none
 max_subagents: 2
+max_reviewer_attempts: 3
+reviewer_completion_ceiling_seconds: 600
 subagent_authority: read-only
 writer: main
 ```
@@ -136,9 +140,19 @@ Create the smallest packet that preserves decision context. Include the target, 
 acceptance criteria, sources of truth, constraints, non-goals, requested focus, detected risks,
 autonomy, preset, loop ceiling, and evidence scope.
 
+Preserve an explicit user-supplied target revision exactly. Do not rename, decrement, normalize, or
+replace it with Council's internal revision numbering. When the source has no revision, assign a
+session-local `v0` and label it as Council-assigned. Propagate the resolved source-bound revision
+unchanged through every reviewer prompt, attempt record, and final receipt.
+
 Do not pass the full session when a bounded packet is sufficient. Mark missing evidence as
 `unknown`; do not replace it with assumptions. Lock scope after the first review pass. A mid-loop
 scope change requires a packet revision and any approval demanded by host rules.
+
+Before dispatch, create reviewer seats separately from execution attempts. A seat is one required
+or optional independent lens that may contribute to the result. An attempt is one concrete runtime
+dispatch for a seat. Failed attempts do not become reviewer evidence and do not increase the
+completed-reviewer count.
 
 ## Route The Panel
 
@@ -149,8 +163,10 @@ lenses instead of duplicate general reviewers:
 2. Add mandatory risk lenses from host or repository rules.
 3. Merge overlapping lenses.
 4. Rank remaining lenses by risk, relevance, and independence.
-5. Dispatch no more than the preset, user, runtime, and host-policy limits allow.
-6. Report selected and materially skipped lenses with reasons.
+5. Mark each selected seat `required` or `optional` before dispatch. The first seat, user-requested
+   lenses, and hard-gated lenses are required.
+6. Dispatch no more than the preset, attempt, runtime, and host-policy limits allow.
+7. Report selected and materially skipped lenses with reasons.
 
 Prefer an asymmetric panel:
 
@@ -176,27 +192,52 @@ non-goals, and output schema. Keep first-pass conclusions hidden from the other 
 
 ## Handle Reviewer Failure
 
-Use the host's stall and timeout policy. If the host defines no start timeout, use 45 seconds as the
-Council reviewer-start ceiling and report that local ceiling in the failure receipt. Degrade
-explicitly instead of waiting without a bound or pretending that independent review completed:
+Track reviewer startup and reviewer completion with separate clocks. Use the host's stall and
+timeout policy when it distinguishes them. If the host defines no start timeout, use 45 seconds only
+for the interval from dispatch request until a canonical target or equivalent registration is
+returned. The reviewer-start ceiling must not be reused as a completion timeout. Once a target is
+registered, classify the attempt as `registered_started` and use the preset completion ceiling from
+the loop contract unless a stricter host completion policy applies.
 
-- If at least one reviewer completes, continue with that evidence and mark the result `partial`.
-- If none completes, return `incomplete`. A labeled `provisional_main_only` analysis may provide
-  value, but it is not consensus or independent review.
+Observe a running attempt in wait slices of at most 60 seconds so the chair can report useful
+progress and react to host state. A wait slice expiring is not a reviewer failure. `started`,
+`working`, or a current heartbeat is not a stall. Complete an attempt only when its returned
+artifact matches the locked target revision and reviewer contract.
+
+After an attempt reaches a terminal `failed`, `interrupted`, `start_timeout`, `completion_timeout`,
+or `unavailable` state, the chair may use one fresh alternate attempt when the preset attempt budget
+allows it. Do not launch a replacement while the original attempt remains active. The replacement
+must use a fresh context, preserve the same locked packet and required lens, use a different
+available role or a materially corrected prompt, and must not receive the failed attempt's partial
+conclusion. Record the supersession chain. Never run a replacement merely because a status line was
+rendered twice.
+
+Degrade explicitly after the allowed attempts terminate instead of pretending that independent
+review completed:
+
+- Return `complete` only when all required reviewer seats completed independently and every
+  material item has a supported disposition. An optional failed seat may be skipped with a receipt
+  and residual risk.
+- Return `partial` when at least one independent reviewer completed but at least one required
+  reviewer seat did not complete or lost independence.
+- Return `incomplete` when no independent reviewer completed. A labeled
+  `provisional_main_only` analysis may provide value, but it cannot satisfy a reviewer seat,
+  consensus, or independent-review claim.
 - If a missing reviewer was mandatory for auth, access, security, DB, migration, finance, privacy,
   or another hard-gated surface, block Council-driven writes and disposition the gap as `ask` or
   `defer` with residual risk.
-- Record failure class, reviewer role, last observed status, available heartbeat or interruption
-  evidence, fallback, and evaluator provenance.
+- Record seat ID, attempt ID, canonical target ID, requested/registered/terminal timestamps, wait
+  slices, elapsed time, failure class, reviewer role, last observed status, heartbeat or interruption
+  evidence, superseded attempt, fallback, and evaluator provenance.
 - If a runtime thread limit blocks a new reviewer, use a separately permitted fresh read-only
   evaluator only when host policy allows it. Record that runtime provenance.
 - Never reuse a reviewer that saw another first-pass conclusion and call it independent.
-- Do not count a stalled attempt as a completed loop or repeat the same failed role and prompt in
-  the same run.
+- Do not count a failed attempt as a completed loop or repeat the same failed role and prompt in the
+  same run.
 
 ## Run The Council
 
-1. Freeze target revision `v0` and its acceptance criteria.
+1. Freeze the resolved source-bound target revision and its acceptance criteria.
 2. Collect independent first-pass reviews.
 3. Normalize findings into evidence, impact, proposed improvement, uncertainty, and verification
    criteria. Do not request or expose hidden chain-of-thought.
@@ -222,6 +263,8 @@ Lead with the requested result, then include only the evidence needed to trust i
 - Execution: {preset, mode, depth, loops used}
 - Status: complete | partial | incomplete
 - Reviewer provenance: {runtime and role, without secrets}
+- Reviewer attempts: {seat/attempt IDs, terminal states, and supersession; collapse only exact
+  duplicate renderings of the same attempt ID}
 - Selected lenses: {lenses}
 - Skipped lenses: {lens and reason, when material}
 - Reviewer failures: {failure receipt summary; omit when none}

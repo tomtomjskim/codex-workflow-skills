@@ -121,6 +121,10 @@ Reject incompatible combinations instead of widening authority. Examples: `scope
 `write=none`. `personal-generated` may summarize an existing inbox source when target policy permits;
 it cannot write `reviewed` or `canonical` paths.
 
+Validate option compatibility before target discovery or file reads. On an incompatible
+combination, return `blocked` with the conflicting fields and the smallest valid correction. Do not
+scan for a target, reinterpret the scope, or silently reduce the requested trust boundary.
+
 The executable invocation authorizes only the selected documentation writes and the smallest
 repository-required documentation validation. It does not authorize implementation changes, tests
 unrelated to documentation, browser or API probes, DB access, process-lifecycle changes, deletion,
@@ -139,7 +143,8 @@ Before extraction, freeze the smallest packet that represents the finished sessi
 - applicable source-of-truth and documentation rules
 
 Do not silently absorb unrelated dirty files, other-session changes, or the entire conversation. If
-change ownership is mixed or stale, use only explicit sources and return `partial` for the rest.
+change ownership is mixed or stale, record ownership per claim, use only explicit current-session
+sources, and return `partial` for selected-scope claims that cannot be attributed safely.
 
 ## Extract And Review Candidates
 
@@ -149,11 +154,16 @@ Follow [references/knowledge-contract.md](references/knowledge-contract.md):
 2. Classify each candidate as `project`, `personal`, `both`, or `discard`.
 3. Classify durability as `stable`, `time-bound`, `transient`, or `unknown`.
 4. Attach source evidence, confidence, freshness, privacy, and an intended destination.
-5. Compare with existing targeted documentation and mark `new`, `merge`, `refresh`, `conflict`, or
-   `duplicate`.
-6. Reject task-log material, unsupported session claims, secret values, raw sensitive logs, and
-   unresolved ideas from durable project pages.
+5. Compare with existing targeted documentation and record `comparison` as `new`, `merge`,
+   `refresh`, `conflict`, `duplicate`, or `not_checked`.
+6. Record a separate `decision` as `accept`, `reject`, or `defer`. Reject task-log material, secret
+   values, raw sensitive logs, and unresolved ideas from durable project pages.
 7. In strict review, run a second pass for contradiction, privacy, provenance, and lifecycle errors.
+
+Unsupported session claims remain `decision=defer` even when they are plausible. Conflicting
+authoritative sources remain `comparison=conflict` with `decision=defer` until the selected source
+scope establishes which one is current. Strict review must record all four checks as
+`pass`, `fail`, or `unknown` per candidate; a generic statement that review passed is not evidence.
 
 Do not call a subagent or Council implicitly. If the user explicitly requests independent or
 Council review, follow the active host and `$council` rules and keep all wiki writes with the main

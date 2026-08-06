@@ -64,6 +64,42 @@ class SessionWikiContractTests(unittest.TestCase):
         self.assertIn("not_needed", source)
         self.assertIn("manufacture documentation", source)
 
+    def test_incompatible_write_scope_fails_closed_before_discovery(self):
+        source = SKILL.read_text(encoding="utf-8")
+
+        self.assertIn("Reject incompatible combinations", source)
+        self.assertIn("before target discovery or file reads", source)
+        self.assertIn("blocked", source)
+
+    def test_strict_review_separates_comparison_from_decision(self):
+        source = SKILL.read_text(encoding="utf-8")
+        contract = (
+            ROOT / "skills" / "session-wiki" / "references" / "knowledge-contract.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Unsupported session claims remain `decision=defer`", source)
+        self.assertIn(
+            "comparison: new | merge | refresh | conflict | duplicate | not_checked",
+            contract,
+        )
+        self.assertIn("decision: accept | reject | defer", contract)
+        self.assertIn("contradiction_check", contract)
+        self.assertIn("privacy_check", contract)
+        self.assertIn("provenance_check", contract)
+        self.assertIn("lifecycle_check", contract)
+        self.assertIn("pass | fail | unknown", contract)
+
+    def test_mixed_ownership_has_per_claim_provenance_and_partial_status(self):
+        source = SKILL.read_text(encoding="utf-8")
+        contract = (
+            ROOT / "skills" / "session-wiki" / "references" / "knowledge-contract.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("claim_id:", contract)
+        self.assertIn("ownership: current-session | other-session | unknown", contract)
+        self.assertIn("source_hash_or_revision:", contract)
+        self.assertIn("return `partial`", source)
+
     def test_references_and_plugin_surface_are_wired(self):
         source = SKILL.read_text(encoding="utf-8")
         manifest = json.loads(

@@ -53,3 +53,15 @@ Treat first-pass reviews as independent only when:
 
 If these conditions are not met, retain the analysis as a secondary critique but do not count it as
 an independent vote or consensus signal.
+
+## Replacement Route
+
+A replacement fills an existing seat; it does not create a new vote. Dispatch one only after the
+prior attempt has a terminal state and the preset attempt budget permits it. Preserve the locked
+target revision, acceptance criteria, lens, evidence threshold, and non-goals. Use a fresh context
+and either a different capable role or a materially corrected prompt. Do not include partial output
+from the failed attempt.
+
+Record the new attempt ID, canonical target ID, and `supersedes_attempt_id`. If the alternate cannot
+preserve the required lens or independence boundary, leave the seat incomplete instead of silently
+substituting a weaker review.

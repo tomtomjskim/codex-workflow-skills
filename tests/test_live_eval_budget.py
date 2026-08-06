@@ -53,14 +53,14 @@ class BudgetTests(unittest.TestCase):
 
         self.assertEqual(budget.next_decision(), "blocked_budget")
 
-    def test_release_budget_has_approved_fixed_limits_and_blocks_thirty_first_call(self):
+    def test_release_budget_has_approved_fixed_limits_and_blocks_forty_first_call(self):
         budget = Budget.release_suite()
 
         self.assertEqual(
             budget.policy,
-            BudgetPolicy(30, 2700.0, 2, 1024 * 1024),
+            BudgetPolicy(40, 5400.0, 2, 1024 * 1024),
         )
-        for _ in range(30):
+        for _ in range(40):
             budget.consume_call()
         self.assertEqual(budget.next_decision(), "blocked_budget")
 

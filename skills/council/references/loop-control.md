@@ -6,11 +6,16 @@ whole packet.
 
 ## Preset Limits
 
-| Preset | Reviewers | Max loops | Expected use |
-|---|---:|---:|---|
-| `quick review` | 1 | 1 | Fast material-risk check |
-| `default` | 1-2 | 1 | Normal critique and refined answer |
-| `deep refinement` | 2 | 2 | Conflicting constraints or valuable alternatives |
+| Preset | Completion ceiling per started attempt | Reviewer seats | Max attempts | Max loops |
+|---|---:|---:|---:|---:|
+| `quick review` | 300 seconds | 1 | 2 | 1 |
+| `default` | 600 seconds | 1-2 | 3 | 1 |
+| `deep refinement` | 900 seconds | 2 | 4 | 2 |
+
+The completion ceiling begins only after a canonical reviewer target is registered. Use a stricter
+host completion or stall policy when one exists. A start ceiling covers only dispatch registration;
+it cannot terminate a registered running attempt. Observe progress in bounded wait slices and do
+not infer a stall from a single quiet slice.
 
 Allow an explicit maximum of three loops. `deep` does not expand scope, grant writes, run tests, or
 add reviewers beyond the host cap.
@@ -59,22 +64,28 @@ evidence does not support completion.
 
 - Preflight reviewer capability before announcing a panel. No callable reviewer facility means an
   immediate `incomplete` fallback, not a pseudo-dispatch.
-- Continue as `partial` when one independent reviewer completed and skipped lenses are not hard-gated.
+- Required seats, not raw attempts, determine completion. Return `complete` only when every required
+  seat has independent completion evidence and every material item is dispositioned.
+- Continue as `partial` when one independent reviewer completed but a required seat did not.
 - Return `incomplete` with optional `provisional_main_only` analysis when no reviewer completed.
 - Block Council-driven writes when a mandatory risk lens is unavailable.
 - Preserve the failure receipt; do not turn a stall into an unexplained omission.
 - When a thread limit blocks a fresh reviewer, use a separately permitted fresh read-only evaluator
   or remain `partial`; never label a context-contaminated retry as independent.
-- Do not consume a loop for a stalled attempt or retry the same failed role and prompt.
-- Use the host reviewer-start timeout; when none exists, cap Council startup at 45 seconds.
+- Failed attempts do not consume a Council loop. Replace them only after terminal failure, within
+  the preset attempt budget, with a fresh alternate role or materially corrected prompt.
+- Use the host reviewer-start timeout; when none exists, cap only dispatch registration at 45
+  seconds. Apply the preset completion ceiling separately after registration.
 
-## Performance Rules
+## Quality And Resource Discipline
 
 - Reuse stable source evidence and target mappings.
-- Send bounded packets instead of full conversation forks.
+- Send bounded packets for scope integrity, but retain every source needed to judge the target.
 - Inline the reviewer contract; only the chair loads Council files.
 - Keep independent first-pass reviewers isolated from each other's conclusions.
-- Reuse the original reviewer for a cheap targeted recheck; cross-check only material high-risk
-  resolutions with another lens.
-- Stop after marginal review value reaches zero; do not consume all configured loops ceremonially.
-- Report reviewers used, loops used, useful findings, and any fallback in the final route summary.
+- Reuse a successfully completed original reviewer for a targeted delta recheck; use an independent
+  cross-check for material high-risk resolutions or unresolved disagreement.
+- Do not weaken evidence, drop a material lens, interrupt a valid active reviewer, or downgrade a required recheck merely to save tokens, latency, or model usage.
+- Stop when the evidence-based stop conditions are met; do not consume loops ceremonially or stop a
+  valid review solely for resource convenience.
+- Report seats, attempts, unique target IDs, loops, useful findings, and fallbacks in the receipt.

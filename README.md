@@ -251,7 +251,11 @@ A bare `$council` call only shows the preset and option legend, then waits. `def
 read-only reviewers when host policy permits. `quick review` uses one reviewer; `deep refinement`
 uses two reviewers and at most two loops. Explicit options can set `mode`, `depth`, `focus`, `loops`,
 `result`, and `write`. The Council call never overrides repository approval gates, and only the main
-agent may write.
+agent may write. Reviewer registration and completion use separate clocks: a registered running
+reviewer is observed within the preset completion ceiling, while only terminal failures may consume
+a bounded fresh replacement attempt. Receipts distinguish reviewer seats, attempts, canonical
+runtime targets, and duplicate-rendered status lines. An explicit source revision is preserved
+unchanged end to end; Council assigns `v0` only when the source provides no revision.
 
 Close a completed session into durable project knowledge:
 
@@ -378,7 +382,8 @@ Use $council default to review and redefine this rollout proposal. Keep writes d
 Expected behavior: freeze one target revision, route complementary read-only reviewer lenses,
 preserve disagreement, disposition material findings, return a redefined result, and report
 `static_only`, `partial`, or `incomplete` when the evidence or reviewer execution does not support a
-stronger claim.
+stronger claim. Resource convenience must not weaken a material lens, evidence threshold, or
+required recheck.
 
 See [sample-council.md](docs/sample-council.md) for an illustrative Council result.
 
@@ -478,7 +483,12 @@ python3 scripts/run_live_eval.py \
 
 A successful harness preflight reports `status=harness_preflight_only`, `materialization_result=pass`, `model_conformance=not_run`, and `model_calls=0`. It proves only that the fixed files and clean-HEAD skills were materialized, hashed, sealed, and immediately reverified in a private temporary home. It does not launch or probe Codex, prove that Codex consumed those files, or provide model-quality evidence. Output contains only path-free identifiers, counts, and digests; cleanup that cannot be proven changes the result to `status=blocked_cleanup`, `reason=cleanup_unverified`.
 
-Targeted execution selects at most three scenarios and is bounded to five model calls, 600 seconds, and concurrency one. Release execution selects at most 26 scenarios and is bounded to 30 model calls, 2,700 seconds, and concurrency two. Release planning remains safe without approval because `--dry-run` cannot make a model call:
+Targeted execution selects at most three scenarios and is bounded to five model calls, 600 seconds,
+and concurrency one. Release execution selects at most 36 scenarios and is bounded to 40 model
+calls, 5,400 seconds, and concurrency two. The normal scenario runner's isolated checkout includes
+`workflow`, `workflow-intake`, `adversarial-review-loop`, `council`, and `session-wiki`; the fixed
+Phase A and harness materialization profiles retain their legacy three-skill checkout. Release
+planning remains safe without approval because `--dry-run` cannot make a model call:
 
 ```bash
 python3 scripts/run_live_eval.py --release-suite --dry-run

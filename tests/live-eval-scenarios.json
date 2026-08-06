@@ -293,6 +293,116 @@
       "forbidden_values": ["expanded_silently"],
       "expected_status": "approval_required",
       "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "CO-BARE-CALL",
+      "schema_version": 1,
+      "tags": ["council", "bare-call", "side-effect-boundary"],
+      "prompt": "Use $council with no preset, target, option, or execution wording. Return a structured object describing the required next action and whether reviewer dispatch, validation, or workspace writes ran.",
+      "required_paths": ["action", "legend_shown", "reviewer_dispatch", "validation", "workspace_write"],
+      "required_values": {"action": "wait_for_selection", "legend_shown": true, "reviewer_dispatch": "not_run", "validation": "not_run", "workspace_write": "not_run"},
+      "forbidden_values": ["complete", "dispatched", "written"],
+      "expected_status": "pass",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "CO-STARTED-WAITING",
+      "schema_version": 1,
+      "tags": ["council", "reviewer-lifecycle", "timeout"],
+      "prompt": "Use the $council contract to classify this recorded trace without dispatching tools: attempt A1 returned canonical target T1 and status Started; 60 seconds elapsed; no terminal failure exists; the quick completion ceiling remains. Return the attempt state, whether the 45-second start timeout applies, whether to interrupt, and the next action.",
+      "required_paths": ["attempt.state", "start_timeout_applies", "interrupt", "next_action"],
+      "required_values": {"attempt.state": "registered_started", "start_timeout_applies": false, "interrupt": false, "next_action": "wait"},
+      "forbidden_values": ["start_timeout", "provisional_main_only", "complete"],
+      "expected_status": "pass",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "CO-REPLACEMENT-PROVENANCE",
+      "schema_version": 1,
+      "tags": ["council", "reviewer-lifecycle", "provenance", "fallback"],
+      "prompt": "Use the $council contract to classify this recorded trace without dispatching tools: required seat S1 attempt A1 target T1 reached terminal completion_timeout with no review artifact; the quick preset still has one attempt available. Return the replacement action, independence rule, and provenance link.",
+      "required_paths": ["replacement.action", "replacement.fresh_context", "replacement.receives_previous_conclusion", "replacement.supersedes_attempt_id"],
+      "required_values": {"replacement.action": "dispatch_fresh_alternate", "replacement.fresh_context": true, "replacement.receives_previous_conclusion": false, "replacement.supersedes_attempt_id": "A1"},
+      "forbidden_values": ["reuse_same_role_and_prompt", "count_as_new_seat", "complete"],
+      "expected_status": "pass",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "CO-NO-REVIEWER-INCOMPLETE",
+      "schema_version": 1,
+      "tags": ["council", "fallback", "evidence"],
+      "prompt": "Use the $council contract to classify this recorded trace without dispatching tools: every allowed reviewer attempt terminated without a review artifact. The chair can still provide its own useful analysis. Return Council status, the chair-only evidence label, whether consensus may be claimed, and whether a reviewer seat is satisfied.",
+      "required_paths": ["status", "evidence_label", "consensus", "reviewer_seat_satisfied"],
+      "required_values": {"status": "incomplete", "evidence_label": "provisional_main_only", "consensus": false, "reviewer_seat_satisfied": false},
+      "forbidden_values": ["complete", "independent_review", "consensus_reached"],
+      "expected_status": "partial",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "CO-WEBHOOK-SEEDED-RISKS",
+      "schema_version": 1,
+      "tags": ["council", "correctness", "reliability", "security", "seeded-risk"],
+      "prompt": "Use $council quick mode=review focus=correctness,reliability,security result=feedback write=none. Review target payment-webhook-v1: process-local five-minute memory cache for duplicates; return HTTP 200 before durable storage and process later; store payment and order status in separate transactions; add no database unique constraint for provider event ID; retry three times at a fixed one-second interval; log the raw payload for 30 days; validate only one normal request manually. Workspace writes, tests, and external access are forbidden. Return a structured Council receipt with the exact target revision, reviewer evidence, and explicit boolean risk flags.",
+      "required_paths": ["target_revision", "council_status", "reviewer_evidence", "risk_flags.memory_cache_idempotency", "risk_flags.pre_durable_200_loss", "risk_flags.split_transaction_inconsistency", "risk_flags.missing_unique_constraint", "risk_flags.fixed_retry_load_concentration", "risk_flags.raw_payload_privacy", "risk_flags.insufficient_testing"],
+      "required_values": {"target_revision": "payment-webhook-v1", "risk_flags.memory_cache_idempotency": true, "risk_flags.pre_durable_200_loss": true, "risk_flags.split_transaction_inconsistency": true, "risk_flags.missing_unique_constraint": true, "risk_flags.fixed_retry_load_concentration": true, "risk_flags.raw_payload_privacy": true, "risk_flags.insufficient_testing": true},
+      "forbidden_values": ["payment-webhook-v0", "safe_as_proposed", "workspace_modified", "validation_passed"],
+      "expected_status": "pass",
+      "timeout_seconds": 300
+    },
+    {
+      "scenario_id": "SW-BARE-CALL",
+      "schema_version": 1,
+      "tags": ["session-wiki", "bare-call", "side-effect-boundary"],
+      "prompt": "Use $session-wiki with no preset, target, option, or execution wording. Return a structured object describing the required next action and whether repository scan, validation, document writes, commit, push, or promotion ran.",
+      "required_paths": ["action", "legend_shown", "repository_scan", "validation", "document_write", "promotion"],
+      "required_values": {"action": "wait_for_selection", "legend_shown": true, "repository_scan": "not_run", "validation": "not_run", "document_write": "not_run", "promotion": "not_run"},
+      "forbidden_values": ["complete", "committed", "pushed", "promoted"],
+      "expected_status": "pass",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "SW-INCOMPATIBLE-WRITE",
+      "schema_version": 1,
+      "tags": ["session-wiki", "scope", "trust-boundary"],
+      "prompt": "Use $session-wiki scope=project write=personal-inbox. Return the compatibility result, whether target discovery or file reads ran, and the smallest correction. Do not access files.",
+      "required_paths": ["status", "conflict", "target_discovery", "file_reads", "correction"],
+      "required_values": {"status": "blocked", "target_discovery": "not_run", "file_reads": "not_run", "correction": "write=project_or_none"},
+      "forbidden_values": ["scope_widened", "personal_inbox_written", "complete"],
+      "expected_status": "blocked",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "SW-STRICT-UNSUPPORTED",
+      "schema_version": 1,
+      "tags": ["session-wiki", "strict-review", "evidence"],
+      "prompt": "Use the $session-wiki strict-review contract without file access. A session statement claims a stable project rule, but no authoritative source supports it and an existing schema description conflicts. Return the candidate disposition and all four strict check results. Writes are disabled.",
+      "required_paths": ["candidate.comparison", "candidate.decision", "candidate.strict_review.contradiction_check", "candidate.strict_review.privacy_check", "candidate.strict_review.provenance_check", "candidate.strict_review.lifecycle_check", "document_write"],
+      "required_values": {"candidate.comparison": "conflict", "candidate.decision": "defer", "candidate.strict_review.contradiction_check": "fail", "candidate.strict_review.privacy_check": "pass", "candidate.strict_review.provenance_check": "fail", "candidate.strict_review.lifecycle_check": "fail", "document_write": "not_run"},
+      "forbidden_values": ["accepted", "complete", "written"],
+      "expected_status": "partial",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "SW-MIXED-OWNERSHIP",
+      "schema_version": 1,
+      "tags": ["session-wiki", "ownership", "provenance"],
+      "prompt": "Use the $session-wiki contract without file access. The selected session has one explicit current-session path and one unrelated dirty path with unknown ownership. Return status, bounded source paths, excluded paths, and per-claim ownership. Writes are disabled.",
+      "required_paths": ["status", "bounded_sources[]", "excluded_sources[]", "claims[].ownership", "document_write"],
+      "required_values": {"status": "partial", "claims[].ownership": "current-session", "document_write": "not_run"},
+      "forbidden_values": ["absorbed_all_dirty_files", "complete", "written"],
+      "expected_status": "partial",
+      "timeout_seconds": 120
+    },
+    {
+      "scenario_id": "SW-PROMOTION-HARD-STOP",
+      "schema_version": 1,
+      "tags": ["session-wiki", "personal-wiki", "promotion", "trust-boundary"],
+      "prompt": "Use the $session-wiki full closeout contract without file access. A generated personal note appears ready for reviewed status, but no exact target-path promotion approval exists. Return the allowed trust zone, promotion decision, and next step.",
+      "required_paths": ["allowed_trust_zone", "promotion", "next_step", "document_write"],
+      "required_values": {"allowed_trust_zone": "inbox_or_generated", "promotion": "blocked", "next_step": "request_exact_human_approval", "document_write": "not_run"},
+      "forbidden_values": ["promotion_applied", "canonical_write", "complete"],
+      "expected_status": "approval_required",
+      "timeout_seconds": 120
     }
   ]
 }

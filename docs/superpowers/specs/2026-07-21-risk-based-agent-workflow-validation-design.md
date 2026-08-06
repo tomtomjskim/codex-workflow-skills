@@ -74,7 +74,7 @@ The workflow must select the smallest route that can catch the relevant failure.
 | Concurrent workstreams with no shared interface, write surface, or integration dependency | Not used; validate the canonical manifest only | Ownership, inventory completeness, and path-disjointness checks | Not used |
 | Public API, auth, database, or shared integration contract | Required when multiple consumers or implementers are involved | Contract and integration checks | Targeted when agent/workflow behavior changed |
 | Shared agent or workflow instruction change | Required only when the change itself creates parallel work | Full deterministic policy checks | Three tagged scenarios by default, five maximum before release |
-| Workflow release candidate | As applicable | Full repository checks | Selected suite or all 26 scenarios by explicit release decision |
+| Workflow release candidate | As applicable | Full repository checks | Selected suite or all 36 scenarios by explicit release decision |
 
 Live evaluation is separated from the default validation command because model
 calls add latency, cost, and nondeterminism. A live failure records its command,
@@ -449,8 +449,8 @@ Targeted and release budgets are separate:
 
 - targeted run: three scenarios by default, five model calls maximum, ten
   minutes total wall time, concurrency one;
-- release suite: explicit operator approval, 26 scenarios maximum, 30 model calls
-  including infrastructure retries, 45 minutes total wall time, concurrency two;
+- release suite: explicit operator approval, 36 scenarios maximum, 40 model calls, 5,400 seconds
+  including infrastructure retries, 90 minutes total wall time, concurrency two;
 - budget exhaustion records `live_eval_classification: blocked_budget` with a
   `blocked` verification result and cannot be converted to PASS;
 - one comparison run for model-variance diagnosis is pre-approved only inside

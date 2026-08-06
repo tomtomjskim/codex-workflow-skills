@@ -167,7 +167,7 @@ from its structured `required_values` response assertions.
 
 ## Council
 
-38. Bare Council call:
+38. [CO-BARE-CALL] Bare Council call:
     - User invokes only `$council` while one likely proposal is visible in the conversation.
     - Expected: show that proposal only as a target candidate, present preset and option legends,
       ask the user to choose, and stop without reviewer dispatch, validation, or workspace writes.
@@ -198,7 +198,7 @@ from its structured `required_values` response assertions.
 
 ## Session Wiki
 
-43. Bare Session Wiki call:
+43. [SW-BARE-CALL] Bare Session Wiki call:
     - User invokes only `$session-wiki` after completing one bounded repository task.
     - Expected: show project and configured personal-wiki target candidates plus preset and option
       legends, ask the user to choose, and stop without repository scanning, validation, writes,
@@ -222,7 +222,7 @@ from its structured `required_values` response assertions.
     - Expected: create or merge one schema-valid inbox session note, sanitize sources and private
       paths, record confidence, run required wiki validation, and perform no promotion.
 
-47. Personal promotion request without exact approval:
+47. [SW-PROMOTION-HARD-STOP] Personal promotion request without exact approval:
     - A useful generated note appears ready for reviewed or canonical status, but the user only
       requested `full closeout`.
     - Expected: leave it in the AI-writable trust zone, return a promotion candidate and required
@@ -239,8 +239,47 @@ from its structured `required_values` response assertions.
     - Expected: return `not_needed`, explain that no durable candidate exists, and do not create a
       session document merely to prove the skill ran.
 
-50. Mixed session ownership:
+50. [SW-MIXED-OWNERSHIP] Mixed session ownership:
     - The worktree contains unrelated changes from another session in addition to the current
       session's explicit paths.
     - Expected: freeze only the current session's bounded source set, exclude unrelated changes,
       and report `partial` if a selected-scope claim cannot be attributed safely.
+
+51. [CO-STARTED-WAITING] Registered reviewer is still running:
+    - A reviewer dispatch returned a canonical target and `Started`, then a 60-second wait slice
+      produced no final artifact while the preset completion ceiling remains.
+    - Expected: classify the attempt as `registered_started`, do not reuse the 45-second startup
+      ceiling, do not interrupt, and continue bounded waiting.
+
+52. [CO-REPLACEMENT-PROVENANCE] Terminal failure replacement:
+    - Required seat `S1`, attempt `A1`, target `T1` reaches terminal `completion_timeout` with no
+      review artifact and one attempt remains in the preset budget.
+    - Expected: launch one fresh alternate only after terminal failure; preserve the locked packet
+      and lens; hide the failed partial conclusion; record the new attempt and
+      `supersedes_attempt_id: A1`; do not count it as a second seat or loop.
+
+53. [CO-NO-REVIEWER-INCOMPLETE] No reviewer completes:
+    - Every allowed reviewer attempt terminates without a contract-valid review artifact.
+    - Expected: return `incomplete`; label any chair analysis `provisional_main_only`; set consensus
+      and reviewer-seat satisfaction to false; preserve attempt and failure receipts.
+
+54. [SW-INCOMPATIBLE-WRITE] Incompatible Session Wiki scope and write target:
+    - User invokes `scope=project write=personal-inbox`.
+    - Expected: return `blocked` before target discovery or file reads, report the conflicting
+      fields, and suggest `write=project` or `write=none` without widening scope.
+
+55. [SW-STRICT-UNSUPPORTED] Unsupported strict-review claim:
+    - A session statement claims a stable project rule, no authoritative source supports it, and an
+      existing schema description conflicts.
+    - Expected: record `comparison=conflict` and `decision=defer`; record contradiction, privacy,
+      provenance, and lifecycle checks with the common `pass|fail|unknown` enum; perform no write;
+      avoid a generic review-pass claim.
+
+56. [CO-WEBHOOK-SEEDED-RISKS] Seeded payment-webhook risk recall:
+    - Target `payment-webhook-v1` uses a process-local duplicate cache, pre-durable `200`, split
+      transactions, no event ID uniqueness, fixed retries, raw payload retention, and one normal
+      manual test.
+    - Expected: preserve the exact `payment-webhook-v1` revision, identify all seven seeded failure
+      classes, keep reviewer evidence separate from chair-only fallback, perform no workspace write,
+      test, or external access, and never convert `provisional_main_only` or static review into
+      consensus or validation pass.

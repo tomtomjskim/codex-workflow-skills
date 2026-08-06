@@ -7,6 +7,11 @@ All notable changes to this repository are documented here.
 ### Added
 
 - Added the zero-model-call Phase A harness experiment foundation with a preflight-only CLI, host-local-path-free fixed result output, repository validation coverage, and an explicit Python 3.9 CI baseline; live canary and pilot execution remain unavailable.
+- Added ten machine-readable Council and Session Wiki scenarios for bare calls, reviewer lifecycle,
+  replacement provenance, no-reviewer fallback, seeded-risk recall, strict knowledge review, mixed
+  ownership, incompatible writes, and Personal Wiki promotion hard stops.
+- Added an extended five-skill checkout for normal live-eval scenarios while preserving the legacy
+  three-skill Phase A and harness checkout APIs.
 
 ### Changed
 
@@ -14,6 +19,16 @@ All notable changes to this repository are documented here.
   `$session-wiki` directly discoverable, and declared documentation-write capability explicitly.
 - Added manifest contract coverage for starter-prompt limits, Council and Session Wiki exposure,
   and write-capability metadata.
+- Hardened Council reviewer lifecycle tracking with separate seats and attempts, canonical target
+  provenance, distinct start and completion clocks, terminal-only replacement, and evidence-based
+  `complete`, `partial`, and `incomplete` results.
+- Preserved explicit target revisions exactly across Council packets, reviewer attempts, delta
+  reviews, and final receipts; Council assigns `v0` only when the source has no revision.
+- Made Council quality gates independent of token, latency, and model-usage optimization, and
+  expanded the release corpus and budget to 36 scenarios, 40 calls, 5,400 seconds, and concurrency
+  two.
+- Hardened Session Wiki strict review with early scope/write validation, per-claim ownership,
+  separate source comparison and publication decisions, and four uniform strict checks.
 
 ## [0.4.0] - 2026-08-04
 

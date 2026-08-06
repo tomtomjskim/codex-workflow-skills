@@ -25,6 +25,13 @@ _EXPECTED_SKILLS = (
     "workflow",
     "workflow-intake",
 )
+_EXTENDED_EVAL_SKILLS = (
+    "adversarial-review-loop",
+    "council",
+    "session-wiki",
+    "workflow",
+    "workflow-intake",
+)
 _MANIFEST_NAME = ".live-eval-checkout.json"
 _MANIFEST_FIELDS = {
     "materialized_hashes",
@@ -125,10 +132,21 @@ def require_unique_canonical_names(names: Iterable[str]) -> Tuple[str, ...]:
 
 
 def install_checkout_skills(repo: Path, codex_home: Path) -> CheckoutManifest:
-    """Materialize exactly three skills from clean HEAD Git objects."""
+    """Materialize the legacy workflow skill set from clean HEAD Git objects."""
+    return _install_checkout_skill_set(repo, codex_home, _EXPECTED_SKILLS)
+
+
+def install_eval_checkout_skills(repo: Path, codex_home: Path) -> CheckoutManifest:
+    """Materialize the extended live-eval skill set from clean HEAD Git objects."""
+    return _install_checkout_skill_set(repo, codex_home, _EXTENDED_EVAL_SKILLS)
+
+
+def _install_checkout_skill_set(
+    repo: Path, codex_home: Path, expected_skills: Tuple[str, ...]
+) -> CheckoutManifest:
     root = _plain_directory(repo, "repository")
     home = _private_empty_home(codex_home)
-    snapshot = _checkout_snapshot(root, require_clean=True)
+    snapshot = _checkout_snapshot(root, require_clean=True, expected_skills=expected_skills)
     staged = Path(tempfile.mkdtemp(prefix=".skills-stage-", dir=str(home)))
     staged_token = _required_path_token(staged)
     published = home / "skills"
@@ -173,10 +191,32 @@ def verify_loaded_checkout(repo: Path, codex_home: Path) -> PreflightResult:
     )
 
 
+def verify_loaded_eval_checkout(repo: Path, codex_home: Path) -> PreflightResult:
+    """Fail closed unless the extended live-eval materialization matches HEAD."""
+    return _verify_skill_set_checkout_inventory(
+        repo,
+        codex_home,
+        frozenset({"skills", _MANIFEST_NAME}),
+        _EXTENDED_EVAL_SKILLS,
+    )
+
+
 def _verify_loaded_checkout_inventory(
     repo: Path, codex_home: Path, expected_home_entries: frozenset
 ) -> PreflightResult:
     """Verify a checkout within an internally supplied exact home inventory."""
+    return _verify_skill_set_checkout_inventory(
+        repo, codex_home, expected_home_entries, _EXPECTED_SKILLS
+    )
+
+
+def _verify_skill_set_checkout_inventory(
+    repo: Path,
+    codex_home: Path,
+    expected_home_entries: frozenset,
+    expected_skills: Tuple[str, ...],
+) -> PreflightResult:
+    """Verify one internally supplied exact skill-set inventory."""
     try:
         root = _plain_directory(repo, "repository")
         home = _private_home(codex_home)
@@ -184,8 +224,10 @@ def _verify_loaded_checkout_inventory(
         manifest_path = home / _MANIFEST_NAME
         if stat.S_IMODE(manifest_path.lstat().st_mode) != 0o400:
             raise ValueError("checkout manifest must remain read-only")
-        recorded = _read_manifest(manifest_path)
-        current = _checkout_snapshot(root, require_clean=False)
+        recorded = _read_manifest(manifest_path, expected_skills)
+        current = _checkout_snapshot(
+            root, require_clean=False, expected_skills=expected_skills
+        )
         if recorded != current.manifest:
             raise ValueError("HEAD Git-object snapshot no longer matches manifest")
         _verify_materialized(home / "skills", current)
@@ -203,7 +245,9 @@ def _verify_loaded_checkout_inventory(
     )
 
 
-def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
+def _checkout_snapshot(
+    repo: Path, require_clean: bool, expected_skills: Tuple[str, ...]
+) -> _CheckoutSnapshot:
     local_config = _raw_local_config_snapshot(repo)
     _require_git_root(repo)
     if require_clean and _git_text(
@@ -231,7 +275,7 @@ def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
     blobs: Dict[str, bytes] = {plugin_entry.oid: plugin_blob}
     skill_hashes = {}
     materialized_hashes = {}
-    for name in _EXPECTED_SKILLS:
+    for name in expected_skills:
         prefix = "skills/{}/".format(name)
         skill_entries = _ls_tree(repo, tree_oid, "skills/{}".format(name), recursive=True)
         if not skill_entries or any(not item.path.startswith(prefix) for item in skill_entries):
@@ -265,7 +309,7 @@ def _checkout_snapshot(repo: Path, require_clean: bool) -> _CheckoutSnapshot:
         plugin_manifest_hash=_sha256(canonical_bytes(plugin_value)),
         skill_hashes=skill_hashes,
         materialized_hashes=materialized_hashes,
-        skill_names=_EXPECTED_SKILLS,
+        skill_names=expected_skills,
     )
     return _CheckoutSnapshot(
         manifest=manifest,
@@ -452,7 +496,7 @@ def _manifest_bytes(manifest: CheckoutManifest) -> bytes:
     )
 
 
-def _read_manifest(path: Path) -> CheckoutManifest:
+def _read_manifest(path: Path, expected_skills: Tuple[str, ...]) -> CheckoutManifest:
     value = load_canonical_input(_read_regular_file(path))
     if not isinstance(value, dict) or set(value) != _MANIFEST_FIELDS:
         raise ValueError("checkout manifest has invalid fields")
@@ -460,10 +504,12 @@ def _read_manifest(path: Path) -> CheckoutManifest:
     if object_format not in _OID_LENGTHS:
         raise ValueError("checkout manifest has invalid object format")
     names = value["skill_names"]
-    if names != list(_EXPECTED_SKILLS):
+    if names != list(expected_skills):
         raise ValueError("checkout manifest has invalid skill inventory")
-    skill_hashes = _validated_hash_mapping(value["skill_hashes"])
-    materialized_hashes = _validated_hash_mapping(value["materialized_hashes"])
+    skill_hashes = _validated_hash_mapping(value["skill_hashes"], expected_skills)
+    materialized_hashes = _validated_hash_mapping(
+        value["materialized_hashes"], expected_skills
+    )
     tree_hash = value["tree_hash"]
     plugin_blob_oid = value["plugin_blob_oid"]
     if not _is_domain_oid(tree_hash, object_format) or not _is_domain_oid(
@@ -484,8 +530,10 @@ def _read_manifest(path: Path) -> CheckoutManifest:
     )
 
 
-def _validated_hash_mapping(value: object) -> Mapping[str, str]:
-    if not isinstance(value, dict) or tuple(sorted(value)) != _EXPECTED_SKILLS:
+def _validated_hash_mapping(
+    value: object, expected_skills: Tuple[str, ...]
+) -> Mapping[str, str]:
+    if not isinstance(value, dict) or tuple(sorted(value)) != expected_skills:
         raise ValueError("checkout manifest has invalid skill hash mapping")
     if not all(_is_sha256(item) for item in value.values()):
         raise ValueError("checkout manifest has invalid skill hashes")

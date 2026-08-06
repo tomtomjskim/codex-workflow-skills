@@ -29,6 +29,32 @@ council_packet:
     main_writer: true
     reviewers: read-only
     max_reviewers: 1 | 2
+    max_reviewer_attempts: 2 | 3 | 4
+    reviewer_completion_ceiling_seconds: 300 | 600 | 900
+  reviewer_seats:
+    - seat_id:
+      lens:
+      required: true | false
+      status: pending | in_progress | completed | failed | independence_lost
+      completion_evidence:
+  reviewer_attempts:
+    - seat_id:
+      attempt_id:
+      target_id:
+      role:
+      lens:
+      evaluator_runtime:
+      context: fresh | inherited
+      state: dispatch_requested | registered_started | heartbeat_observed | completed | failed | interrupted | start_timeout | completion_timeout | unavailable
+      requested_at:
+      registered_at:
+      last_heartbeat_at:
+      terminal_at:
+      wait_slices:
+      elapsed_seconds:
+      failure_class:
+      supersedes_attempt_id:
+      completion_evidence:
   reviewer_failures: []
   evidence_scope: []
   scope_change_policy:
@@ -36,6 +62,12 @@ council_packet:
 
 For conversation-only targets, include a compact verbatim excerpt or precise summary plus the
 acceptance criteria. Do not pass unrelated conversation history.
+
+The packet revision is source-bound revision evidence. Preserve an explicit revision exactly as the
+user or target artifact names it. If no revision exists, assign session-local `v0`, record that it
+was Council-assigned, and keep it distinct from any later refined-artifact revision. Reviewer
+prompts, attempt completion evidence, delta reviews, and the final receipt must use the same source
+revision unless a declared scope revision creates a new packet.
 
 ## Reviewer Prompt Contract
 
@@ -101,15 +133,30 @@ When a reviewer does not complete, append a receipt instead of inventing a revie
 
 ```yaml
 reviewer_failure:
-  failure_class: agent_execution_stall | spawn_rpc_stall | unavailable | interrupted | other
+  seat_id:
+  attempt_id:
+  failure_class: start_timeout | completion_timeout | agent_execution_stall | spawn_rpc_stall | thread_limit | unavailable | interrupted | evaluator_failure | other
   role:
-  canonical_target:
+  target_id:
+  requested_at:
+  registered_at:
+  last_heartbeat_at:
+  terminal_at:
+  wait_slices:
+  elapsed_seconds:
   last_status:
   heartbeat_evidence:
   interrupt_result:
+  supersedes_attempt_id:
   fallback: partial_council | provisional_main_only | stop
   evaluator_runtime:
   residual_risk:
 ```
 
 A receipt is execution evidence, not reviewer evidence. It cannot satisfy a required reviewer lens.
+
+Use unique `attempt_id` plus `target_id` as the identity boundary. Rendered duplicate status lines
+are not evidence of duplicate dispatch, completion, or interruption. Record two attempts only when
+the runtime returned two distinct dispatch identities or the chair actually issued two dispatches.
+Use `null` or `unknown` for unavailable targets, timestamps, or heartbeat data; never invent
+provenance to make a receipt look complete.

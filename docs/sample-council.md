@@ -9,6 +9,7 @@ the result contract; it is not evidence that the plan was executed or validated 
 - Execution: default, refine, standard, 1 loop
 - Status: complete
 - Reviewer provenance: two separate read-only reviewer contexts
+- Reviewer attempts: `S1/A1/T1 completed`; `S2/A2/T2 completed`; no replacement attempts
 - Selected lenses: falsifier; reliability and alternative design
 - Skipped lenses: security — no auth, secret, or trust-boundary change was present in the packet
 
