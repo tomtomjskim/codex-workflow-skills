@@ -17,8 +17,9 @@ host completion or stall policy when one exists. A start ceiling covers only dis
 it cannot terminate a registered running attempt. Observe progress in bounded wait slices and do
 not infer a stall from a single quiet slice.
 
-Allow an explicit maximum of three loops. `deep` does not expand scope, grant writes, run tests, or
-add reviewers beyond the host cap.
+Allow an explicit maximum of three loops. `deep` requests greater evidence depth; it does not grant
+authority for architecture growth, expand scope, grant writes, run tests, or add reviewers beyond
+the host cap.
 
 ## Diverge And Converge
 

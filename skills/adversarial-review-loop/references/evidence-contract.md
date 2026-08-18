@@ -40,3 +40,25 @@ Rules:
 - HIGH findings cannot be auto-applied or auto-rejected.
 - `reject-with-reason` requires counter-evidence.
 - `defer` requires why it is safe to defer and when it should be revisited.
+
+## Persistent Control Proposals
+
+When a finding proposes persistent approval or security infrastructure such as a manifest,
+evidence hash, attestation, signature, trust anchor, provider, registry, CLI, mutation API, or an
+equivalent durable control plane, require evidence for all of the following before accepting the
+proposal:
+
+- the concrete protected failure and relevant threat actor
+- the trust boundary the actor could cross
+- the expected frequency of the failure or control event
+- existing human approval, database constraint, audit, or operational controls
+- why those simpler controls are insufficient
+- a no-new-infrastructure operational alternative and its tradeoffs
+
+An unkeyed hash is a fingerprint or checksum. It may identify a retrievable immutable artifact, but
+it does not prove signer identity, authorization, or non-repudiation. Do not describe it as an
+attestation or signature without separate authenticated signing and trust evidence.
+
+If a reviewer finds a defect in an agent-proposed control, reassess whether that control needs to
+exist before proposing recursive hardening around it. Compare removal, reuse of an existing human
+or database control, and a bounded operational procedure before adding another persistent layer.

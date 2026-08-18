@@ -6,6 +6,10 @@ Default loop limits:
 - L3: at most 2 auto-apply/review iterations.
 - L4: at most 3 iterations; after that, summarize remaining risk and ask.
 
+Review depth governs evidence depth, not permission to grow the architecture. A deeper pass may
+request stronger evidence or expose residual risk, but it does not authorize new persistent
+controls, services, registries, trust infrastructure, or mutation surfaces.
+
 Stop when:
 
 - no new HIGH/MED findings remain

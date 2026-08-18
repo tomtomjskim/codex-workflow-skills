@@ -69,6 +69,29 @@ was Council-assigned, and keep it distinct from any later refined-artifact revis
 prompts, attempt completion evidence, delta reviews, and the final receipt must use the same source
 revision unless a declared scope revision creates a new packet.
 
+## Risk-First Target Lock
+
+When the target proposes persistent approval or security infrastructure, lock the Council target to
+the underlying risk or protected failure, not to the proposed mechanism. This applies to proposals
+for manifests, evidence hashes, attestations, signatures, trust anchors, providers, registries,
+CLIs, mutation APIs, and equivalent durable control planes.
+
+Before treating such infrastructure as necessary, add these facts to the packet's `detected_risks`,
+`unknowns`, or evidence scope:
+
+- the concrete protected failure and relevant threat actor
+- the trust boundary the actor could cross
+- the expected frequency of the failure or control event
+- existing human approval, database constraint, audit, or operational controls
+- evidence that those simpler controls are insufficient
+
+Keep the proposed mechanism as one candidate solution. Every Council comparison or refinement must
+also include a viable no-new-infrastructure operational alternative, or explicitly state why none
+can protect the locked risk.
+
+Treat an unkeyed hash only as a fingerprint or checksum. It may identify a retrievable immutable
+artifact, but it does not prove signer identity, authorization, or non-repudiation.
+
 ## Reviewer Prompt Contract
 
 Give each reviewer:
@@ -103,6 +126,7 @@ review:
       value:
       tradeoff:
       assumption:
+      infrastructure_impact: none | reuse | new
   no_material_findings:
   residual_risk:
 ```

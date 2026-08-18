@@ -23,6 +23,16 @@ Choose the second lens from the highest-value signal:
 | architecture, plan, ownership | architecture/delivery | Are boundaries, sequencing, dependencies, and rollback credible? |
 | decision among options | alternative/challenger | Is there a materially simpler or safer option with better tradeoffs? |
 
+When a target proposes persistent approval or security infrastructure such as a manifest, evidence
+hash, attestation, signature, trust anchor, provider, registry, CLI, mutation API, or equivalent
+durable control plane, route the `alternative/challenger` lens as a required consideration. Its
+questions must stay fixed on the underlying risk and a viable no-new-infrastructure operational
+alternative, not merely compare variants of the proposed mechanism. Under a two-seat host cap,
+combine this lens explicitly with the falsifier seat when a mandatory security or data specialist
+must occupy the other seat. Never displace a mandatory specialist; if the required challenger lens
+cannot be covered with adequate evidence or independence, record it as skipped and block
+Council-driven writes under the existing mandatory-lens rule.
+
 When several hard-gated signals exist, obey repository routing policy. If the permitted panel cannot
 cover every mandatory lens, report the skipped mandatory lens and stop Council-driven writes.
 
