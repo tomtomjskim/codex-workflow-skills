@@ -114,7 +114,14 @@ Common design artifacts:
 .
 ├── .codex-plugin/plugin.json
 ├── CHANGELOG.md
+├── policies/
+│   └── host-policy.json
 ├── scripts/
+│   ├── agent_contracts.py
+│   ├── host_migration_apply.py
+│   ├── host_migration_envelope.py
+│   ├── host_migration_snapshot.py
+│   ├── validate_host_policy.py
 │   ├── workflow
 │   ├── workflow_coordination/
 │   ├── validate_policy_contracts.py
@@ -434,7 +441,195 @@ python3 -m pip install --disable-pip-version-check -r requirements-ci.txt
 ./scripts/validate_repo.sh
 ```
 
-The script checks required files, coordination CLI and policy contracts, focused CLI/coordination tests, skill structure when Codex system validators are available, plugin structure, README links, manifest/changelog version alignment, `git diff --check`, and every tracked text file for public hygiene. Binary tracked files are skipped.
+The script checks required files, coordination CLI and policy contracts, host-policy fixtures,
+effective reviewer contracts, manifest-bound prepare/apply/rollback fixtures, focused CLI/coordination tests, skill
+structure when Codex system validators are available, plugin structure, README links,
+manifest/changelog version alignment, `git diff --check`, and every tracked text file for public
+hygiene. Binary tracked files are skipped.
+
+### Read-only host policy audit
+
+The repository validator tests host-policy failure modes with temporary fixtures; it does not read
+or change user-level configuration. Run the explicit host audit before and after an approved Codex,
+MCP, Serena, rules, or shared-agent migration:
+
+```bash
+/usr/bin/python3 -I scripts/validate_host_policy.py \
+  --policy policies/host-policy.json \
+  --codex-config "$HOME/.codex/config.toml" \
+  --codex-version 0.147.0 \
+  --codex-profile scout="$HOME/.codex/scout.config.toml" \
+  --codex-profile builder="$HOME/.codex/builder.config.toml" \
+  --codex-profile operator="$HOME/.codex/operator.config.toml" \
+  --codex-rules "$HOME/.codex/rules/default.rules" \
+  --serena-config "$HOME/.serena/serena_config.yml" \
+  --serena-project project-one=/absolute/path/to/project-one/.serena/project.yml \
+  --serena-project project-two=/absolute/path/to/project-two/.serena/project.yml \
+  --serena-version 1.6.1 \
+  --shared-agents-root "$HOME/.agents" \
+  --codex-agents-root "$HOME/.codex/agents" \
+  --claude-agents-root "$HOME/.claude/agents" \
+  --reviewer-routing skills/adversarial-review-loop/references/reviewer-routing.json \
+  --home-root "$HOME" \
+  --json
+```
+
+The command is read-only, emits structured findings, an aggregate input digest, and detailed input
+checksums/modes, and exits nonzero for
+policy violations or input errors. It requires the exact reviewed profile and Serena project
+inventories, pins MCP identities and the Serena version, and checks project-local reviewer
+shadowing. Missing trusted-project paths fail closed. An optional missing Claude active-agent directory and the model-cost advisory remain
+visible as warnings without changing the exit status.
+
+The default audit stage is `full` and requires Scout, Builder, and Operator. The default audit scope
+is `live`. Immediately after the
+baseline migration, pass `--stage baseline` and provide only the Scout `--codex-profile`; after the
+Builder stage, pass `--stage builder` with Scout and Builder. The JSON receipt records the selected
+stage and scope so a partial migration or proposed target tree is not misreported as a full-host
+acceptance result.
+
+Before approving a migration manifest, audit a complete proposed target tree rather than the
+pre-migration live host. First compute the canonical digest of the manifest's ordered stages and
+target inventory, then run the full validator with every mutable input path rooted in the proposed
+target tree, a synthetic direct-link active-agent inventory rooted at its proposed adapters, and
+these additional arguments:
+
+```bash
+/usr/bin/python3 -I scripts/host_migration_snapshot.py target-digest \
+  --manifest /private/approved/proposal/manifest.json
+/usr/bin/python3 -I scripts/validate_host_policy.py \
+  ...full proposed-target arguments... \
+  --audit-scope target --stage full \
+  --target-manifest /private/approved/proposal/manifest.json \
+  --target-root /private/approved/proposal/target --json
+```
+
+Copy a successful target receipt's validator ID, scope, stage, policy/input digests, target root,
+target inventory digest, and detailed input receipts into the manifest attestation. The validator
+sealed-reads the manifest and target artifacts, computes the digest itself, and requires every
+manifest target to be consumed by exactly matching policy-audit input bytes and mode. The applier requires
+`validate_host_policy.py@3`, `scope: target`, and `stage: full`, recomputes the inventory digest, and
+restricts writes to the reviewed Codex, Serena, and shared-agent path families under one home root.
+An arbitrary credential or DB configuration path is rejected even when its artifact checksum is
+otherwise valid, and every Codex base/profile artifact is parsed again to require
+`mcp_servers.db-mcp.enabled = false`. The later `baseline`, `builder`, and `operator` audits still run against the actual
+live host as acceptance receipts.
+
+Before an approved host migration, derive and verify one private checksum-bound snapshot directly
+from the manifest. No target paths are re-entered at the command line:
+
+```bash
+/usr/bin/python3 -I scripts/host_migration_snapshot.py prepare \
+  --manifest /private/approved/proposal/manifest.json \
+  --output-dir /private/approved/new-snapshot-directory
+/usr/bin/python3 -I scripts/host_migration_snapshot.py verify \
+  --receipt /private/approved/new-snapshot-directory/receipt.json --scope both
+```
+
+`prepare` rejects manifest/current-state checksum, mode, and absent-state drift before creating the
+snapshot directory, then binds the completed backup receipt to the manifest again.
+
+Manifest schema v3 contains a successful full proposed-target audit attestation with detailed
+input receipts, its canonical target-inventory digest, complete target inventory, and ordered stage membership. A live
+or baseline-only receipt cannot authorize a multi-stage manifest. Before any write, bind the
+manifest, target tree, and snapshot receipt with a dry-run:
+
+```bash
+/usr/bin/python3 -I scripts/host_migration_apply.py \
+  --manifest /private/approved/proposal/manifest.json \
+  --target-root /private/approved/proposal/target \
+  --snapshot-receipt /private/approved/new-snapshot-directory/receipt.json \
+  --stage baseline \
+  --dry-run
+```
+
+Then create one stage-scoped `approval-envelope.json` from a private build spec. The flat canonical
+envelope binds the exact manifest and external target audit, snapshot receipt, authorized stage and
+labels, policy/routing, evidence, post-apply commands, and a private copied executor bundle. Its
+SHA-256 is the approval ID. `host_migration_envelope.py build` refuses an existing output or executor
+root and requires its parent to be current-user-owned mode 0700. `verify` detects byte drift and
+rechecks the manifest, target-audit, snapshot, executor, and live-audit path bindings. Every Python
+executor invocation must use `-I`, so inherited `PYTHONPATH`, user-site packages, and
+`sitecustomize` cannot replace copied sibling modules. The Python 3.9-compatible pure-Python PyYAML
+and TOMLI sources under `vendor/` are copied into and digest-bound with the executor; their upstream
+license texts are retained under `vendor/licenses/`. A stdlib-only bootstrap verifies the embedded
+vendor-manifest digest, exact file inventory, every file digest, and owner/write permissions before
+either package is imported.
+The approved Python and Codex executables must be regular non-symlink files owned by root or the
+current user, with no group/other-writable file or ancestor; their digests are checked before and
+after post-apply probes. The build spec contains the absolute paths and argv arrays accepted by
+`build_from_spec()`:
+
+```bash
+/usr/bin/python3 -I scripts/host_migration_envelope.py build \
+  --spec /private/approved/proposal/baseline-envelope-spec.json \
+  --output /private/approved/proposal/approval-envelope.json \
+  --executor-root /private/approved/proposal/executor
+/usr/bin/python3 -I scripts/host_migration_envelope.py verify \
+  --envelope /private/approved/proposal/approval-envelope.json \
+  --expected-envelope-sha256 "$approved_envelope_sha256"
+```
+
+Run the confirmed stage only through the copied executor. Both the envelope and manifest approval
+digests are mandatory and are compared before a journal or host target is created:
+
+```bash
+/usr/bin/python3 -I /private/approved/proposal/executor/scripts/host_migration_apply.py \
+  --manifest /private/approved/proposal/manifest.json \
+  --target-root /private/approved/proposal/target \
+  --snapshot-receipt /private/approved/new-snapshot-directory/receipt.json \
+  --approval-envelope /private/approved/proposal/approval-envelope.json \
+  --expected-envelope-sha256 "$approved_envelope_sha256" \
+  --expected-manifest-sha256 "$approved_manifest_sha256" \
+  --journal-dir /private/approved/proposal/journal \
+  --stage baseline --confirm-apply
+```
+
+The applier verifies completed labels at target state and every current/future-stage label at its
+manifest pre-state before the selected write. It also parses base/profile and protected-reviewer
+TOML to keep DB MCP disabled. Confirmed execution requires the exact `baseline`, `builder`,
+`operator` stage layout; Codex base/rules/Scout/Builder/Operator, Serena global config, and every
+policy-listed Serena project target cannot be omitted from the manifest. The envelope projects the external target receipt's outer `status`
+into the manifest attestation, binds its Codex/Serena versions to the live audit argv, and requires
+the full policy-defined live-audit input inventory before any write. The approved Python and Codex
+executables are canonical-path and SHA-256 bound and rechecked around verification. After installation the schema-v3 journal enters
+`awaiting_stage_audit` with `rollback_required: true`. The same command runs the envelope-bound live
+stage audit plus fresh base and every installed-profile `codex --profile NAME mcp list --json`
+probe, rechecks live file state, and only then changes the journal to `ready` or terminal `complete`.
+Runtime probes force the approved host `HOME`/`CODEX_HOME` and cap execution time and captured
+output; child processes receive an allowlisted environment and raw stderr is not returned. Audit,
+runtime, or final-state failure automatically attempts journal rollback only when the current
+invocation's attempt ID has a durable target intent or current-stage mutation evidence; a pre-write or first-intent journal error in a later invocation
+cannot roll back an earlier accepted stage. A crash leaves a rollback-only journal and cannot open the next stage.
+Successful live-audit and MCP JSON receipts are canonicalized into mode-0600 files beside the
+journal, checksum-bound to that journal, and reverified before a later stage can write.
+
+Apply and rollback share one per-user host-operation lock. Absent targets use atomic no-replace;
+present targets use atomic exchange and retain the verified previous inode in the journal. Rollback
+derives the exact manifest and snapshot from that journal and requires no repeated target inventory:
+
+```bash
+/usr/bin/python3 -I /private/approved/proposal/executor/scripts/host_migration_snapshot.py rollback \
+  --journal /private/approved/proposal/journal/journal.json \
+  --confirm-rollback
+```
+
+Use the copied snapshot executor recorded by the journal-bound approval envelope; the repository
+source script is not interchangeable with that sealed copy. A rollback restores only completed
+labels plus the active uncertain label, requires each selected
+file to equal either its approved target state or original pre-state, and refuses an installed
+target omitted by journal progress. Each applied stage records the canonical approval-envelope path
+and digest; rollback verifies that envelope and the copied apply, envelope, and snapshot executors
+before importing a copied sibling. It durably records `rolling_back` plus per-label progress before
+terminal `rolled_back`, moves the pathname into an owned same-directory quarantine before verifying
+and restoring the approved pre-state, and never overwrites or automatically deletes a concurrently
+created path. Retained quarantine paths are recorded in the journal and require a separate identity,
+mode, and checksum review before any manual cleanup. It preflights the complete
+restore scope before writing, fsyncs restored parent directories, and terminalizes the journal as
+`rolled_back`; that journal cannot be reused for a later stage. The contract preserves file bytes
+and modes, but not ACLs or extended attributes. See the staged
+[host hardening and profile evaluation plan](docs/host-hardening-plan.md) before applying or
+rolling back host changes.
 
 Validate skill structure when the Codex system validation scripts are available:
 

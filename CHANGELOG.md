@@ -6,6 +6,11 @@ All notable changes to this repository are documented here.
 
 ### Added
 
+- Added a versioned host-policy manifest, read-only Codex/Serena/rules/shared-agent validator,
+  effective reviewer contract checks, and manifest-v3 `prepare`, ordered `apply --stage`, and
+  journal-bound rollback tooling with deterministic Python 3.9 fixtures.
+- Added a stage-scoped canonical approval envelope, private copied executor bundle, exact approval
+  digest gates, and envelope-bound live audit plus fresh-runtime acceptance.
 - Added the zero-model-call Phase A harness experiment foundation with a preflight-only CLI, host-local-path-free fixed result output, repository validation coverage, and an explicit Python 3.9 CI baseline; live canary and pilot execution remain unavailable.
 - Added ten machine-readable Council and Session Wiki scenarios for bare calls, reviewer lifecycle,
   replacement provenance, no-reviewer fallback, seeded-risk recall, strict knowledge review, mixed
@@ -15,6 +20,25 @@ All notable changes to this repository are documented here.
 
 ### Changed
 
+- Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
+  MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
+  routing, project-local shadow detection, fail-closed stale trust,
+  structured CLI errors, live/proposed-target scope, target-inventory binding, and audit receipts.
+- Simplified host migration operations around one authoritative manifest, one stage journal, a
+  detailed audit attestation, exact immutable reviewer boundary blocks, and DB-disabled profiles
+  pending server-side read-only evidence.
+- Made snapshot preparation reject stale manifest pre-state before publication, made later stages
+  revalidate completed targets, and made rollback stage-aware, preflighted, directory-fsynced, and
+  terminal in its journal. Added stage-scoped host audit receipts for baseline and Builder gates.
+- Sealed migration authority inputs to one read, restricted manifest targets to reviewed host-policy
+  path families, added no-replace snapshot publication and absent installs, atomic exchange for
+  present installs, host-global apply/rollback operation locking, durable journal-directory
+  publication, and non-destructive retained-quarantine rollback.
+- Made every stage verify completed and future target state before writing, hold the journal in
+  rollback-only `awaiting_stage_audit` until live policy and fresh MCP checks pass, and automatically
+  attempt rollback when the one-shot confirmed workflow fails.
+- Bound live-audit argv to manifest host paths, required private approval-envelope directories,
+  and persisted mode-0600 live-audit/runtime receipts whose hashes gate later stages.
 - Limited plugin starter prompts to the three supported UI entries while keeping `$council` and
   `$session-wiki` directly discoverable, and declared documentation-write capability explicitly.
 - Added manifest contract coverage for starter-prompt limits, Council and Session Wiki exposure,

@@ -12,8 +12,8 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! python3 -c 'import yaml' >/dev/null 2>&1; then
-  printf 'error: PyYAML is required; run: python3 -m pip install -r requirements-ci.txt\n' >&2
+if ! python3 -c 'import tomli, yaml' >/dev/null 2>&1; then
+  printf 'error: PyYAML and Tomli are required; run: python3 -m pip install -r requirements-ci.txt\n' >&2
   exit 1
 fi
 
@@ -63,10 +63,17 @@ require_file docs/sample-adversarial-review.md
 require_file docs/sample-council.md
 require_file docs/sample-session-wiki.md
 require_file docs/sample-resume-multi-review.md
+require_file docs/host-hardening-plan.md
 require_file tests/acceptance-scenarios.md
 require_file scripts/workflow
 require_file scripts/install_agent_adapters.py
+require_file scripts/agent_contracts.py
+require_file scripts/host_migration_apply.py
+require_file scripts/host_migration_envelope.py
+require_file scripts/host_migration_snapshot.py
+require_file scripts/validate_host_policy.py
 require_file scripts/validate_policy_contracts.py
+require_file policies/host-policy.json
 require_file scripts/workflow_coordination/canonical_json.py
 require_file scripts/workflow_coordination/reviewer_routing.py
 require_file tests/test_canonical_json.py
@@ -74,6 +81,10 @@ require_file tests/test_policy_contracts.py
 require_file tests/test_git_changes.py
 require_file tests/test_workflow_cli.py
 require_file tests/test_install_agent_adapters.py
+require_file tests/test_host_policy_contracts.py
+require_file tests/test_host_migration_apply.py
+require_file tests/test_host_migration_snapshot.py
+require_file tests/test_effective_agent_contracts.py
 require_file skills/workflow-intake/references/parallel-coordination.md
 require_file skills/adversarial-review-loop/references/reviewer-routing.json
 require_file scripts/run_live_eval.py

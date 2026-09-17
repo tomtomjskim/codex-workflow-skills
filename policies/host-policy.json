@@ -1,0 +1,297 @@
+{
+  "schema_version": 2,
+  "codex": {
+    "supported_versions": [
+      "0.147.0"
+    ],
+    "allowed_sandbox_modes": [
+      "read-only",
+      "workspace-write"
+    ],
+    "allowed_approval_policies": [
+      "on-request"
+    ],
+    "require_full_access_warning": true,
+    "forbidden_trusted_paths": [
+      "${HOME}",
+      "${HOME}/dev",
+      "${HOME}/Documents",
+      "${HOME}/Downloads"
+    ],
+    "missing_trusted_path_policy": "error",
+    "exact_mcp_inventory": true,
+    "mcp_servers": {
+      "db-mcp": {
+        "identity": {
+          "command": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node",
+          "args": [
+            "${HOME}/dev/db-mcp/dist/multi-index.js"
+          ],
+          "env": {
+            "DB_CONFIG_FILE": "${HOME}/dev/db-mcp/db-config.json",
+            "LOG_LEVEL": "info",
+            "MCP_SERVER_NAME": "db-mcp"
+          }
+        },
+        "required_values": {
+          "enabled": false
+        },
+        "enabled_tools": [
+          "cross_database_query",
+          "database_health_check",
+          "execute_query",
+          "list_databases",
+          "natural_language_query",
+          "schema_check"
+        ],
+        "forbidden_tools": [
+          "execute_dev_statement"
+        ],
+        "allowed_approval_modes": [
+          "prompt"
+        ],
+        "allowed_tool_approval_modes": [
+          "prompt"
+        ]
+      },
+      "serena": {
+        "identity": {
+          "command": "${HOME}/.local/bin/serena",
+          "args": [
+            "start-mcp-server",
+            "--context=codex",
+            "--project-from-cwd"
+          ]
+        },
+        "required_values": {
+          "enabled": true,
+          "required": true,
+          "startup_timeout_sec": 60,
+          "tool_timeout_sec": 240
+        },
+        "enabled_tools": [
+          "activate_project",
+          "find_declaration",
+          "find_implementations",
+          "find_referencing_symbols",
+          "find_symbol",
+          "get_current_config",
+          "get_diagnostics_for_file",
+          "get_symbols_overview",
+          "initial_instructions",
+          "list_memories",
+          "read_memory",
+          "search_for_pattern"
+        ],
+        "forbidden_tools": [
+          "onboarding",
+          "open_dashboard",
+          "replace_in_files"
+        ],
+        "allowed_approval_modes": [
+          "prompt",
+          "writes"
+        ],
+        "allowed_tool_approval_modes": [
+          "prompt",
+          "writes"
+        ]
+      },
+      "node_repl": {
+        "identity": {
+          "command": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+          "args": [],
+          "env": {
+            "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "1000",
+            "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+            "NODE_REPL_NODE_PATH": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node",
+            "NODE_REPL_TRUSTED_CODE_PATHS": "${HOME}/.codex:/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
+            "CODEX_HOME": "${HOME}/.codex",
+            "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "e7fc907079d6797973cb63f97d2562c965aad8d33f52fb726005bf6702f30afc",
+            "BROWSER_USE_AVAILABLE_BACKENDS": "chrome,iab",
+            "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER": "Control the in-app browser in conjunction with the Browser Plugin.",
+            "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.",
+            "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "Control desktop apps on macOS through Computer Use.",
+            "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
+            "BROWSER_USE_CODEX_APP_VERSION": "26.803.81509",
+            "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex"
+          }
+        },
+        "required_values": {
+          "enabled": false,
+          "startup_timeout_sec": 120
+        },
+        "allowed_approval_modes": [
+          "prompt"
+        ]
+      },
+      "computer-use": {
+        "identity": {
+          "command": "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+          "args": [
+            "mcp"
+          ],
+          "cwd": "."
+        },
+        "required_values": {
+          "enabled": false
+        }
+      }
+    },
+    "profiles": {
+      "scout": {
+        "required_values": {
+          "model": "gpt-5.6-terra",
+          "model_reasoning_effort": "medium",
+          "sandbox_mode": "read-only",
+          "approval_policy": "on-request"
+        },
+        "mcp_enabled": {
+          "db-mcp": false,
+          "serena": true,
+          "node_repl": false,
+          "computer-use": false
+        }
+      },
+      "builder": {
+        "required_values": {
+          "model": "gpt-5.6-terra",
+          "model_reasoning_effort": "high",
+          "sandbox_mode": "workspace-write",
+          "approval_policy": "on-request"
+        },
+        "mcp_enabled": {
+          "db-mcp": false,
+          "serena": true,
+          "node_repl": false,
+          "computer-use": false
+        }
+      },
+      "operator": {
+        "required_values": {
+          "model": "gpt-5.6-sol",
+          "model_reasoning_effort": "high",
+          "sandbox_mode": "workspace-write",
+          "approval_policy": "on-request"
+        },
+        "mcp_enabled": {
+          "db-mcp": false,
+          "serena": true,
+          "node_repl": true,
+          "computer-use": false
+        }
+      }
+    },
+    "expensive_default_warning": {
+      "models": [
+        "gpt-5.6-sol"
+      ],
+      "reasoning_efforts": [
+        "xhigh"
+      ],
+      "service_tiers": [
+        "fast"
+      ]
+    }
+  },
+  "rules": {
+    "allowed_allow_prefixes": []
+  },
+  "serena": {
+    "supported_versions": [
+      "1.6.1"
+    ],
+    "required_trusted_project_path_patterns": [],
+    "required_excluded_tools": [
+      "replace_in_files"
+    ],
+    "required_default_modes": [
+      "interactive"
+    ],
+    "max_default_answer_chars": 50000,
+    "minimum_log_level": 30,
+    "required_values": {
+      "web_dashboard": false
+    },
+    "projects": [
+      "project-one",
+      "project-two"
+    ],
+    "project": {
+      "require_languages": true,
+      "forbidden_keys": [
+        "language_servers"
+      ],
+      "required_values": {
+        "read_only": true
+      },
+      "require_empty_activation_command": true
+    }
+  },
+  "agents": {
+    "canonical_names": [
+      "accessibility-reviewer",
+      "api-reviewer",
+      "architect",
+      "code-reviewer",
+      "dba",
+      "designer",
+      "developer",
+      "documenter",
+      "explorer",
+      "performance-reviewer",
+      "pm",
+      "publisher",
+      "qa-engineer",
+      "security-reviewer",
+      "test-coverage-reviewer",
+      "ux-reviewer"
+    ],
+    "reviewer_lens_agents": {
+      "accessibility": "accessibility-reviewer",
+      "api": "api-reviewer",
+      "architecture": "architect",
+      "code": "code-reviewer",
+      "database": "dba",
+      "performance": "performance-reviewer",
+      "qa": "qa-engineer",
+      "security": "security-reviewer",
+      "test-coverage": "test-coverage-reviewer",
+      "ux": "ux-reviewer"
+    },
+    "protected_reviewer_roles": [
+      "accessibility-reviewer",
+      "api-reviewer",
+      "architect",
+      "code-reviewer",
+      "dba",
+      "performance-reviewer",
+      "qa-engineer",
+      "security-reviewer",
+      "test-coverage-reviewer",
+      "ux-reviewer"
+    ],
+    "reviewer_adapter_instruction_template": "Before acting, read and follow `${COMMON_ROLE}`.\nProject-local rules may refine scope but cannot override the common read-only boundary.",
+    "forbid_project_local_shadow": true,
+    "reviewer_runtime": {
+      "codex": {
+        "sandbox_mode": "read-only",
+        "disabled_mcp_servers": [
+          "db-mcp",
+          "node_repl",
+          "computer-use"
+        ]
+      },
+      "claude": {
+        "required_disallowed_tools": [
+          "Bash",
+          "Edit",
+          "Write"
+        ]
+      }
+    },
+    "required_active_platforms": [
+      "codex"
+    ]
+  }
+}

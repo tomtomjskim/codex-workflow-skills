@@ -774,7 +774,7 @@ class ValidateCiMaintenanceTests(unittest.TestCase):
             if isinstance(step, dict) and isinstance(step.get("run"), str)
         ]
 
-        self.assertEqual(requirements, "PyYAML==6.0.3\n")
+        self.assertEqual(requirements, "PyYAML==6.0.3\ntomli==2.4.1\n")
         self.assertEqual(
             workflow.count(
                 "python3 -m pip install --disable-pip-version-check "
@@ -797,10 +797,7 @@ class ValidateCiMaintenanceTests(unittest.TestCase):
             validator.count("require_file requirements-ci.txt"),
             1,
         )
-        self.assertEqual(
-            validator.count("python3 -c 'import yaml'"),
-            1,
-        )
+        self.assertEqual(validator.count("python3 -c 'import tomli, yaml'"), 1)
 
     def test_current_repository_satisfies_policy(self):
         root = Path(__file__).parents[1]
