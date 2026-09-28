@@ -58,7 +58,7 @@ side_effect_check:
   approval_required:
 ```
 
-If a discovered fix requires a new hard-stop surface, stop before editing that surface and ask.
+If a discovered fix requires a new, unapproved hard-stop surface for the requested outcome, hold only that surface, ask once, and continue independent in-scope work. Do not seek approval for an optional workaround or treat it as a blocker. An earlier exact approval is not a runtime tool approval prompt.
 
 ## Validation Plan
 

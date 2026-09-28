@@ -23,6 +23,7 @@ class Scenario:
     forbidden_values: Tuple[Any, ...]
     expected_status: str
     timeout_seconds: int
+    forbidden_paths: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ _SCENARIO_FIELDS = {
     "expected_status",
     "timeout_seconds",
 }
+_OPTIONAL_SCENARIO_FIELDS = {"forbidden_paths"}
 _EXPECTED_STATUSES = {
     "pass",
     "blocked",
@@ -122,7 +124,7 @@ def select_scenarios(
 
 
 def assert_response(scenario: Scenario, response: Mapping[str, Any]) -> AssertionReport:
-    """Evaluate required paths/values and forbidden values deterministically.
+    """Evaluate required paths/values and forbidden paths/values deterministically.
 
     ``expected_status`` is runner-facing scenario outcome metadata. It is exposed
     in the report but is intentionally independent of structured response checks.
@@ -139,7 +141,7 @@ def assert_response(scenario: Scenario, response: Mapping[str, Any]) -> Assertio
         for values in (path_values[path],)
         if values and not any(_same_json_value(value, expected) for value in values)
     )
-    forbidden_matches = tuple(
+    forbidden_value_matches = tuple(
         (path, value)
         for path, value in _walk_values(response)
         if any(
@@ -147,6 +149,12 @@ def assert_response(scenario: Scenario, response: Mapping[str, Any]) -> Assertio
             for forbidden in scenario.forbidden_values
         )
     )
+    forbidden_path_matches = tuple(
+        (path, value)
+        for path in scenario.forbidden_paths
+        for value in _values_at_path(response, path)
+    )
+    forbidden_matches = forbidden_value_matches + forbidden_path_matches
     return AssertionReport(
         passed=not missing_paths and not value_mismatches and not forbidden_matches,
         expected_status=scenario.expected_status,
@@ -160,7 +168,9 @@ def _parse_scenario(entry: Any, index: int) -> Scenario:
     label = "scenario at index {}".format(index)
     if not isinstance(entry, dict):
         raise ScenarioCorpusError("{} must be an object".format(label))
-    if set(entry) != _SCENARIO_FIELDS:
+    if not _SCENARIO_FIELDS.issubset(entry) or set(entry) - (
+        _SCENARIO_FIELDS | _OPTIONAL_SCENARIO_FIELDS
+    ):
         raise ScenarioCorpusError("{} has invalid fields".format(label))
 
     scenario_id = _nonempty_string(entry["scenario_id"], "{}.scenario_id".format(label))
@@ -172,6 +182,16 @@ def _parse_scenario(entry: Any, index: int) -> Scenario:
     required_paths = _path_tuple(
         entry["required_paths"], "{}.required_paths".format(label)
     )
+    forbidden_paths_value = entry.get("forbidden_paths", [])
+    if not isinstance(forbidden_paths_value, list):
+        raise ScenarioCorpusError("{}.forbidden_paths must be a path list".format(label))
+    forbidden_paths = (
+        _path_tuple(forbidden_paths_value, "{}.forbidden_paths".format(label))
+        if forbidden_paths_value
+        else ()
+    )
+    if set(forbidden_paths).intersection(required_paths):
+        raise ScenarioCorpusError("{}.forbidden_paths overlap required_paths".format(label))
 
     required_values_value = entry["required_values"]
     if not isinstance(required_values_value, dict):
@@ -214,6 +234,7 @@ def _parse_scenario(entry: Any, index: int) -> Scenario:
         forbidden_values=tuple(forbidden_values_value),
         expected_status=expected_status,
         timeout_seconds=timeout_seconds,
+        forbidden_paths=forbidden_paths,
     )
 
 

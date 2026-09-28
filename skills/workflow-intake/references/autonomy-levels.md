@@ -10,6 +10,8 @@ Use this reference when autonomy is missing, ambiguous, or above L2.
 | L3 | Semi-auto | Apply LOW, in-scope, reversible, testable fixes | MED/HIGH, hard stops, scope changes |
 | L4 | Auto within bounds | Iterate implementation, LOW fixes, and approved safe MED fixes inside scope | Hard stops, public contract changes, unresolved blocker loops |
 
+"Must ask before" applies only when the exact target and action lack approval in the active goal or current session. Do not re-ask for the same approved work. At L2, a concrete request to implement the stated scope satisfies implementation approval, but does not authorize scope expansion or a separately gated action.
+
 Severity is not permission. Auto-apply depends on fix risk class:
 
 | Fix risk class | L3 | L4 |

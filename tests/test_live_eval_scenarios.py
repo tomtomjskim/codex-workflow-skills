@@ -135,6 +135,69 @@ class ScenarioTests(unittest.TestCase):
         )
         self.assertEqual(report.expected_status, "blocked")
 
+    def test_goal_approval_scenario_rejects_reapproval(self):
+        scenarios = load_scenarios(FIXTURE)
+        initial = scenarios["SC-INITIAL-NONTRIVIAL-PLAN"]
+        response = {
+            "workflow_intake": {
+                "plan": {},
+                "next_action": "continue_in_scope",
+                "next_step": "continue_in_scope",
+                "side_effect_check": {
+                    "hard_stop_detected": False,
+                    "approval_required": False,
+                },
+                "validation_plan": {},
+                "approval_gates": [],
+            },
+        }
+
+        self.assertTrue(assert_response(initial, response).passed)
+        response["workflow_intake"]["side_effect_check"]["approval_required"] = True
+        initial_report = assert_response(initial, response)
+
+        self.assertFalse(initial_report.passed)
+        self.assertEqual(
+            initial_report.value_mismatches,
+            (("workflow_intake.side_effect_check.approval_required", False, (True,)),),
+        )
+
+        response["workflow_intake"]["side_effect_check"]["approval_required"] = False
+        response["workflow_intake"]["next_action"] = "ask_required_approval"
+        self.assertFalse(assert_response(initial, response).passed)
+
+        del response["workflow_intake"]["next_action"]
+        self.assertEqual(
+            assert_response(initial, response).missing_paths,
+            ("workflow_intake.next_action",),
+        )
+
+        response["workflow_intake"]["next_action"] = "continue_in_scope"
+        response["workflow_intake"]["approval_gates"] = ["nginx change"]
+        self.assertFalse(assert_response(initial, response).passed)
+
+        response["workflow_intake"]["approval_gates"] = []
+        response["next_step"] = "Please approve changing nginx and wait here."
+        contradiction = assert_response(initial, response)
+        self.assertFalse(contradiction.passed)
+        self.assertEqual(
+            contradiction.forbidden_matches,
+            (("next_step", "Please approve changing nginx and wait here."),),
+        )
+
+        del response["next_step"]
+        response["workflow_intake"]["next_step"] = "Wait for nginx approval."
+        self.assertEqual(
+            assert_response(initial, response).value_mismatches,
+            (
+                (
+                    "workflow_intake.next_step",
+                    "continue_in_scope",
+                    ("Wait for nginx approval.",),
+                ),
+            ),
+        )
+
     def test_required_and_forbidden_assertions_are_deterministic(self):
         scenario = load_scenarios(FIXTURE)["WI-MISSING-REPO"]
 
@@ -280,18 +343,32 @@ class ScenarioTests(unittest.TestCase):
             "items[][].status",
             "9status",
         )
-        for field in ("required_paths", "required_values"):
+        for field in ("required_paths", "required_values", "forbidden_paths"):
             for invalid_path in invalid_paths:
                 entry = valid_entry()
                 if field == "required_paths":
                     entry[field] = [invalid_path]
                     entry["required_values"] = {}
+                elif field == "forbidden_paths":
+                    entry[field] = [invalid_path]
                 else:
                     entry[field] = {invalid_path: "pass"}
                     entry["required_paths"] = [invalid_path]
                 with self.subTest(field=field, path=invalid_path):
                     with self.assertRaisesRegex(ScenarioCorpusError, "canonical path"):
                         self.load_payload({"schema_version": 1, "scenarios": [entry]})
+
+    def test_forbidden_paths_reject_overlap_and_duplicate(self):
+        invalid_cases = (
+            (["status"], "overlap"),
+            (["next_step", "next_step"], "duplicates"),
+        )
+        for paths, error in invalid_cases:
+            entry = valid_entry()
+            entry["forbidden_paths"] = paths
+            with self.subTest(paths=paths):
+                with self.assertRaisesRegex(ScenarioCorpusError, error):
+                    self.load_payload({"schema_version": 1, "scenarios": [entry]})
 
     def test_rejects_non_json_compatible_values_recursively(self):
         for field in ("required_values", "forbidden_values"):
