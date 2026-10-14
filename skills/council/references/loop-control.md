@@ -58,8 +58,11 @@ Do not produce cosmetic variations to inflate the option count.
 - the loop ceiling is reached with a material disagreement open
 - a mid-loop request materially changes target, scope, or side effects
 
-State `incomplete`, `blocked`, `partial`, or `static_only` instead of `complete` or `pass` when the
-evidence does not support completion.
+Use `meeting_status: complete | partial | incomplete` for reviewer completion and dispositions.
+Use `validation_status: not_run | static_only | partial | pass | fail | blocked` for target evidence.
+Missing target validation does not erase a completed review, but must remain explicit as blocked,
+unrun, or static evidence and cannot satisfy an unmet acceptance criterion. Missing required
+reviewers still prevent meeting completion. A successful provider call alone proves neither.
 
 ## Reviewer Failure Fallback
 

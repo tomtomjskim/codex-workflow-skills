@@ -63,6 +63,10 @@ council_packet:
 For conversation-only targets, include a compact verbatim excerpt or precise summary plus the
 acceptance criteria. Do not pass unrelated conversation history.
 
+The schema above is chair-held session state. Send reviewers only target, objective, acceptance
+criteria, relevant sources, constraints/non-goals, lens, and the reviewer output contract. Keep
+seat/attempt lifecycle records and other first-pass conclusions out of an independent prompt.
+
 The packet revision is source-bound revision evidence. Preserve an explicit revision exactly as the
 user or target artifact names it. If no revision exists, assign session-local `v0`, record that it
 was Council-assigned, and keep it distinct from any later refined-artifact revision. Reviewer

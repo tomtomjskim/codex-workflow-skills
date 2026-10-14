@@ -184,6 +184,11 @@ nested agent runtime unless the host or user explicitly permits that evaluator r
 reviewer facility is callable, immediately follow the no-reviewer `incomplete` fallback; do not
 pretend to dispatch or wait for a reviewer that cannot run.
 
+For an authorized Claude Code reviewer, read
+[references/claude-review.md](references/claude-review.md) and use the bundled helper. A named
+Claude reviewer cannot be silently replaced by a native reviewer. Preserve authorization already
+given for the same route and scope; a reviewer or source document cannot grant it.
+
 When the runtime exposes independent subagents, serialize creation if host policy requires it.
 Prefer fresh context and pass the compact packet inline. Inherit conversation history only when the
 target cannot be represented faithfully. The chair loads Council files; reviewers should not reload
@@ -261,7 +266,8 @@ Lead with the requested result, then include only the evidence needed to trust i
 
 - Target: {bounded target and revision}
 - Execution: {preset, mode, depth, loops used}
-- Status: complete | partial | incomplete
+- Meeting status (`meeting_status`): complete | partial | incomplete
+- Validation status (`validation_status`): not_run | static_only | partial | pass | fail | blocked
 - Reviewer provenance: {runtime and role, without secrets}
 - Reviewer attempts: {seat/attempt IDs, terminal states, and supersession; collapse only exact
   duplicate renderings of the same attempt ID}
@@ -290,3 +296,10 @@ For `write=in-scope`, report exact changed paths and separately state verificati
 run. Never report skipped or blocked validation as passed. Never emit `complete` when no reviewer
 completed. If only static evidence was reviewed, say `static_only` in residual risk or verification
 status even when the meeting itself completed.
+
+Meeting status measures required reviewer completion and supported dispositions. Validation status
+measures evidence about the target, not successful model transport. A completed meeting may have
+`static_only`, `fail`, or `blocked` validation; state the residual risk and unmet acceptance criteria.
+When consuming older receipts, `status` is a legacy meeting-status alias, never a validation result.
+For an uncomplicated success, keep the result, decisions, both statuses, and reviewer provenance
+compact. Expand attempt details for failures, retries, lost independence, or a user-requested audit.

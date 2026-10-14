@@ -153,6 +153,30 @@ class PolicyContractTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_upstream_comments_do_not_disable_sensitive_content_checks(self):
+        content = (
+            "# TO" "DO: upstream implementation detail\n"
+            "token = 'sk-" + "a" * 24 + "'\n"
+            "path = '/U" "sers/example/private'\n"
+            "BEGIN PRI" "VATE KEY\n"
+        ).encode("utf-8")
+        for package in ("yaml", "tomli"):
+            with self.subTest(package=package):
+                errors = _scan_file_stream(io.BytesIO(content), Path("vendor/py39") / package / "source.py")
+                self.assertEqual(len(errors), 3)
+                self.assertTrue(any(error.endswith(": token") for error in errors))
+                self.assertTrue(any(error.endswith(": private path") for error in errors))
+                self.assertTrue(any(error.endswith(": private key") for error in errors))
+
+    def test_placeholder_exception_does_not_extend_to_project_or_other_vendor_files(self):
+        for path in (
+            "skills/council/scripts/review.py", "vendor/py39/other/source.py",
+            "vendor/py39/yaml/README.md", "vendor/py39/yaml.py",
+        ):
+            with self.subTest(path=path):
+                errors = _scan_file_stream(io.BytesIO(b"# TO" b"DO: incomplete\n"), Path(path))
+                self.assertEqual(errors, [path + ":1: placeholder"])
+
     def test_hygiene_scans_symlink_text_itself(self):
         with tempfile.TemporaryDirectory() as directory:
             repo_root = Path(directory)

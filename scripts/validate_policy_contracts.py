@@ -37,6 +37,7 @@ _HYGIENE_PATTERNS = (
         "placeholder",
     ),
 )
+_UPSTREAM_PYTHON_PACKAGES = frozenset(("yaml", "tomli"))
 _REPOSITORY_CONTRACT_SNIPPETS = {
     "skills/workflow-intake/references/parallel-coordination.md": (
         "current validation receipt",
@@ -199,10 +200,18 @@ def _tracked_paths(repo_root: Path) -> List[Path]:
 
 
 def _scan_line(line: str, relative_path: Path, line_number: int) -> List[str]:
+    # Upstream development comments are not unfinished project scaffolding.
+    # Credentials and private paths remain forbidden in these bundled sources.
+    upstream_source = (
+        relative_path.parts[:2] == ("vendor", "py39")
+        and len(relative_path.parts) >= 4
+        and relative_path.parts[2] in _UPSTREAM_PYTHON_PACKAGES
+        and relative_path.suffix == ".py"
+    )
     return [
         "{}:{}: {}".format(relative_path, line_number, label)
         for pattern, label in _HYGIENE_PATTERNS
-        if pattern.search(line)
+        if not (upstream_source and label == "placeholder") and pattern.search(line)
     ]
 
 
