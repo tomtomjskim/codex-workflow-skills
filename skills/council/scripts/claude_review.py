@@ -116,6 +116,15 @@ def run_review(request, *, authorized=False, timeout=600):
 
     def finish(failure=None):
         receipt["failure_class"] = failure
+        if failure == "auth_unavailable":
+            receipt["follow_up"] = {
+                "status": "pending",
+                "reason": "claude_authentication_or_access_unavailable",
+                "user_action": "Check Claude Code login and account access; reauthenticate if needed.",
+                "unfinished_work": "The requested Claude review has not completed.",
+                "resume_condition": "Restore access, then obtain a fresh successful review for the target revision.",
+                "automatic_retry": False,
+            }
         receipt["elapsed_seconds"] = round(time.monotonic() - started, 3)
         return receipt
 

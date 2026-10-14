@@ -72,6 +72,19 @@ does not override a later failed model call. No automatic retry or provider subs
 Apply Council's existing required-seat fallback; a requested Claude seat remains missing after
 failure even if the chair can provide provisional analysis.
 
+An `auth_unavailable` receipt includes a pending `follow_up`: check login and account access,
+reauthenticate if needed, and obtain a fresh successful review for the current target revision.
+This includes unavailable or unreadable authentication status and structured 401/403 responses;
+it does not prove token expiry specifically. Untyped provider errors remain `provider_error` and
+must not be presented as diagnosed expiry. Do not sign in, refresh credentials or retry automatically.
+
+Always include pending authentication follow-up in the final response, even when other work
+succeeds. Name the unfinished Claude review, the user action and resume condition. Keep it pending
+until the required review actually succeeds; logged-in status alone is insufficient.
+
+Report this follow-up in the response only. Do not create a checklist file, schedule a notification,
+or claim that it will automatically reappear in a later session.
+
 Receipts carry local attempt ID, phase, CLI version when available, elapsed time and selected model
 usage counters on success. Provider `total_cost_usd` is a reported metric, not proof of billed cost.
 The model list may include provider auxiliary models; do not count those as reviewer seats. Keep

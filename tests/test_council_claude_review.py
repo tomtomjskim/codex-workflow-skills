@@ -117,6 +117,49 @@ class ClaudeReviewTests(unittest.TestCase):
         self.assertEqual(receipt["failure_class"], "auth_unavailable")
         self.assertNotIn("SECRET", json.dumps(receipt))
 
+    def test_auth_failure_carries_pending_action_without_claiming_expiry(self):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                receipt, run = self.run_attempt(envelope(api_error_status=status), 1)
+                follow_up = receipt['follow_up']
+                self.assertEqual(follow_up['status'], 'pending')
+                self.assertFalse(follow_up['automatic_retry'])
+                self.assertIn('account access', follow_up['user_action'])
+                self.assertIn('fresh successful review', follow_up['resume_condition'])
+                self.assertEqual(run.call_count, 3)
+                self.assertNotIn('expired', json.dumps(follow_up))
+
+    def test_success_and_untyped_provider_failure_do_not_create_auth_reminder(self):
+        for response, code in ((envelope(), 0), (envelope(is_error=True), 1)):
+            receipt, _ = self.run_attempt(response, code)
+            self.assertNotIn('follow_up', receipt)
+
+    def test_cli_auth_failure_reports_follow_up_without_writing_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / 'claude'
+            fake.write_text(
+                '#!/usr/bin/env python3\n'
+                'import sys\n'
+                'if "--version" in sys.argv: print("2.1.178 (Claude Code)")\n'
+                'elif "auth" in sys.argv: print(\'{"loggedIn":false}\')\n'
+                'else: raise RuntimeError("model must not run")\n', encoding='utf-8',
+            )
+            fake.chmod(0o700)
+            env = dict(os.environ, PATH=directory + os.pathsep + os.environ.get('PATH', ''))
+            original = {p.name: p.read_bytes() for p in root.iterdir()}
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), '--authorized'], input=json.dumps(request()),
+                text=True, capture_output=True, env=env, cwd=root, timeout=10,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stderr, '')
+            receipt = json.loads(result.stdout)
+            self.assertEqual(receipt['failure_class'], 'auth_unavailable')
+            self.assertEqual(receipt['follow_up']['status'], 'pending')
+            self.assertFalse(receipt['follow_up']['automatic_retry'])
+            self.assertEqual({p.name: p.read_bytes() for p in root.iterdir()}, original)
+
     def test_transport_and_shape_failures_never_complete(self):
         cases = [
             (envelope(), 1, "provider_error"),

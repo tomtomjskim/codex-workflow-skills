@@ -43,6 +43,9 @@ source set is identified, and target policy allows agent-generated synthesis. Pr
 confidence, conflicts, and review status. Prefer merging with an existing generated topic over
 creating duplicates.
 
+The selected inbox or reviewed documents are read-only evidence. Synthesizing them into a generated
+draft does not authorize editing the sources or inheriting their reviewed lifecycle status.
+
 ## Promotion Hard Stop
 
 Without exact user approval for the target paths and lifecycle action, do not:

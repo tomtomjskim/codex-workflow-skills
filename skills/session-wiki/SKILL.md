@@ -118,8 +118,9 @@ Apply a preset before explicit overrides:
 
 Reject incompatible combinations instead of widening authority. Examples: `scope=project` cannot use
 `write=personal-inbox`; `scope=personal` cannot use `write=project`; `result=candidates` implies
-`write=none`. `personal-generated` may summarize an existing inbox source when target policy permits;
-it cannot write `reviewed` or `canonical` paths.
+`write=none`. `personal-generated` may summarize existing inbox or reviewed sources when target policy
+permits; treat those sources as read-only and write only to the selected generated destination.
+It cannot write `reviewed` or `canonical` paths.
 
 Validate option compatibility before target discovery or file reads. On an incompatible
 combination, return `blocked` with the conflicting fields and the smallest valid correction. Do not
@@ -190,8 +191,9 @@ include reusable work preferences, learning notes, decision heuristics, cross-pr
 prompt candidates, and a concise session summary after private or sensitive material is removed.
 
 Write only to the selected target's AI-writable trust zones. By default this means a dated session
-note in `inbox`; an existing inbox source may be synthesized into `generated` only when explicitly
-selected and target policy allows it. Never write or move content into `reviewed` or `canonical`,
+note in `inbox`; existing inbox or reviewed sources may be synthesized into `generated` only when
+explicitly selected and target policy allows it. Source documents remain read-only.
+Never write or move content into `reviewed` or `canonical`,
 never change lifecycle status to those values, and never archive or delete content without exact
 user approval for those actions.
 
