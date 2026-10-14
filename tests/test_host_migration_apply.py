@@ -1049,7 +1049,8 @@ class HostMigrationApplyTests(unittest.TestCase):
                 self.assertFalse(build_executor.exists())
 
     def test_copied_executor_ignores_hostile_pythonpath_for_verify_apply_and_rollback(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # Copied executors require trusted ancestry; Linux system temp is world-writable.
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             fixture = ApplyFixture(directory)
             envelope, executor = fixture.build_private_envelope("baseline")
             hostile = fixture.root / "hostile"
@@ -1717,7 +1718,7 @@ class HostMigrationApplyTests(unittest.TestCase):
             self.assertFalse((fixture.root / "journal").exists())
 
     def test_private_executor_drift_is_rejected_before_host_writes(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             fixture = ApplyFixture(directory)
             envelope, executor_root = fixture.build_private_envelope("baseline")
             validator = executor_root / "scripts/validate_host_policy.py"
@@ -1857,7 +1858,7 @@ class HostMigrationApplyTests(unittest.TestCase):
             self.assertEqual(TARGET_CONFIG, fixture.first.read_text(encoding="utf-8"))
 
     def test_vendored_dependency_permissions_fail_before_validator_import(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             fixture = ApplyFixture(directory)
             _, executor_root = fixture.build_private_envelope("baseline")
             vendored_parser = executor_root / "vendor/py39/tomli/_parser.py"
@@ -1877,10 +1878,10 @@ class HostMigrationApplyTests(unittest.TestCase):
 
             self.assertEqual(1, result.returncode, result.stdout)
             self.assertEqual("", result.stderr)
-            self.assertIn("not owner-controlled", result.stdout)
+            self.assertIn("vendored dependency file is not owner-controlled", result.stdout)
 
     def test_one_shot_cli_rolls_back_when_live_audit_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             fixture = ApplyFixture(directory)
             envelope, executor_root = fixture.build_private_envelope("baseline")
             result = subprocess.run(
