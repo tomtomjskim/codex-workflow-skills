@@ -23,7 +23,8 @@ TARGET_CONFIG = '[mcp_servers.db-mcp]\nenabled = false\n'
 POLICY_SHA256 = host_migration_apply._canonical_policy_sha256(
     (ROOT / "policies" / "host-policy.json").read_bytes()
 )
-PYTHON = "/usr/bin/python3"
+# Linux commonly exposes system Python through a symlink; approved fixtures bind its real file.
+PYTHON = str(Path("/usr/bin/python3").resolve())
 CODEX = PYTHON
 
 
@@ -1217,10 +1218,17 @@ class HostMigrationApplyTests(unittest.TestCase):
             executable.chmod(0o755)
             self.assertRegex(
                 host_migration_envelope._executable_reference(
-                    Path("/usr/bin/python3"), "system Python"
+                    Path(PYTHON), "system Python"
                 )["sha256"],
                 r"^[0-9a-f]{64}$",
             )
+
+            executable_link = root / "python-link"
+            executable_link.symlink_to(PYTHON)
+            with self.assertRaisesRegex(ValueError, "regular non-symlink file"):
+                host_migration_envelope._executable_reference(
+                    executable_link, "linked Python"
+                )
 
             executable.chmod(0o777)
             with self.assertRaisesRegex(ValueError, "non-writable by group/other"):
