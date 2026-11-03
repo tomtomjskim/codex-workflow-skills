@@ -66,6 +66,7 @@ require_file docs/sample-resume-multi-review.md
 require_file docs/host-hardening-plan.md
 require_file tests/acceptance-scenarios.md
 require_file scripts/workflow
+require_file scripts/run_tests_parallel.py
 require_file scripts/install_agent_adapters.py
 require_file scripts/agent_contracts.py
 require_file scripts/host_migration_apply.py
@@ -154,7 +155,8 @@ if [ -z "${SHARED_AGENTS_ROOT:-}" ]; then
   printf 'not_run: external shared-agent audit requires SHARED_AGENTS_ROOT\n'
 fi
 # Full discovery includes tests.test_workflow_cli and every other repository-owned test.
-run python3 -m unittest discover -s tests -v
+# It runs one process per test module; VALIDATE_TEST_JOBS=1 runs them one at a time.
+run python3 scripts/run_tests_parallel.py
 
 require_match '\[sample-workflow-intake\.md\]\(docs/sample-workflow-intake\.md\)' README.md 'workflow intake sample link'
 require_match '\[sample-adversarial-review\.md\]\(docs/sample-adversarial-review\.md\)' README.md 'adversarial review sample link'

@@ -25,6 +25,11 @@ All notable changes to this repository are documented here.
   `actions/setup-python` has no Python 3.9 build for Ubuntu 26.04. CI installs ripgrep only
   when the runner lacks it. Tests now import extensionless scripts with `exec_module`, because
   Python 3.15 removed `SourceFileLoader.load_module()`.
+- `scripts/validate_repo.sh` now runs full unittest discovery through
+  `scripts/run_tests_parallel.py`, one process per test module with four at a time
+  (`VALIDATE_TEST_JOBS` overrides). It fails when a module runs fewer tests than discovery
+  found or exits without reporting a result, which plain `unittest discover` does not catch.
+  The local full test run went from about 285 seconds to about 95 seconds.
 - Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
   MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
   routing, project-local shadow detection, fail-closed stale trust,

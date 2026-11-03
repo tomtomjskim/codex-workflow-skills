@@ -1222,11 +1222,16 @@ class RepositoryValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            validator.count(
-                "run python3 -m unittest discover -s tests -v"
-            ),
+            validator.count("run python3 scripts/run_tests_parallel.py"),
             1,
         )
+        runner = (root / "scripts" / "run_tests_parallel.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'loader.discover("tests", top_level_dir=str(ROOT))', runner
+        )
+        self.assertNotIn("unittest discover", validator)
         self.assertNotIn(
             "python3 -m unittest tests.test_live_eval_",
             validator,
@@ -1629,7 +1634,7 @@ class RepositoryValidationTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "run python3 -m unittest discover -s tests -v",
+            "run python3 scripts/run_tests_parallel.py",
             (
                 root / "scripts" / "validate_repo.sh"
             ).read_text(encoding="utf-8"),

@@ -1780,7 +1780,7 @@ class RunnerTests(unittest.TestCase):
 
         self.assertIn("require_file scripts/run_live_eval.py", validation)
         self.assertIn("require_file scripts/live_eval/harness.py", validation)
-        self.assertIn("unittest discover -s tests -v", validation)
+        self.assertIn("run python3 scripts/run_tests_parallel.py", validation)
         self.assertIn("require_file tests/test_live_eval_harness.py", validation)
         self.assertIn("preflight_only", readme)
         self.assertIn("harness_preflight_only", readme)
