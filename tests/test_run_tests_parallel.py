@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import textwrap
 import unittest
@@ -55,6 +56,24 @@ EXITS = textwrap.dedent(
     """
 )
 
+TEMPDIR = textwrap.dedent(
+    """
+    import os
+    import tempfile
+    import unittest
+
+
+    class ReportsTemporaryDirectory(unittest.TestCase):
+        def test_reports(self):
+            print("TMPDIR=" + tempfile.gettempdir())
+            self.assertEqual(os.environ["TMPDIR"], tempfile.gettempdir())
+            locked = os.path.join(tempfile.mkdtemp(), "locked")
+            os.mkdir(locked)
+            open(os.path.join(locked, "file"), "w").close()
+            os.chmod(locked, 0o555)
+    """
+)
+
 PROBE_CLASSES = {
     "probe_module.Passes": ["probe_module.Passes.test_one", "probe_module.Passes.test_two"],
     "probe_module.SkipsItself": ["probe_module.SkipsItself.test_hidden"],
@@ -69,6 +88,7 @@ class RunTestsParallelTests(unittest.TestCase):
         path = Path(directory.name)
         (path / "probe_module.py").write_text(PROBE, encoding="utf-8")
         (path / "exits_module.py").write_text(EXITS, encoding="utf-8")
+        (path / "tempdir_module.py").write_text(TEMPDIR, encoding="utf-8")
         environment = mock.patch.dict(
             os.environ, {"PYTHONPATH": directory.name, "PYTHONDONTWRITEBYTECODE": "1"}
         )
@@ -97,6 +117,18 @@ class RunTestsParallelTests(unittest.TestCase):
 
         self.assertIsNone(report)
         self.assertEqual("exits_module exited 0 without a result", failure)
+
+    def test_each_module_gets_a_private_temporary_directory_that_is_removed(self):
+        seen = []
+        for _ in range(2):
+            _module, _code, output, report, _seconds = RUNNER.run_group("tempdir_module")
+            self.assertTrue(report["ok"], output)
+            seen.append(re.search(r"TMPDIR=(\S+)", output).group(1))
+
+        self.assertNotEqual(seen[0], seen[1])
+        for path in seen:
+            self.assertNotEqual(os.path.realpath(path), os.path.realpath(tempfile.gettempdir()))
+            self.assertFalse(os.path.exists(path))
 
     def test_fewer_tests_than_discovered_fails(self):
         report = {"ran": 2, "ok": True, "skipped_classes": []}

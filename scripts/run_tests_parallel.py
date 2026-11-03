@@ -5,6 +5,8 @@ Discovery is the same as `python3 -m unittest discover -s tests`. Each test
 module runs in its own Python process, and the run fails if any module fails or
 runs a different number of tests than discovery found for it. A class that
 skips itself in setUpClass counts as zero tests, as in unittest.
+Each module process gets its own private TMPDIR, because some tests fail closed
+when another process changes the temporary directory they share.
 VALIDATE_TEST_JOBS sets the number of parallel processes; 1 runs the modules one
 after another.
 """
@@ -13,8 +15,10 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -23,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_JOBS = 4
 RESULT_MARKER = "@@run_tests_parallel "
 CLASS_HOOK = re.compile(r"^setUpClass \(([\w.]+)\)$")
+# A short base keeps AF_UNIX socket paths in tests under the 104-byte macOS limit.
+TEMP_BASE = "/tmp" if os.path.isdir("/tmp") else None
 
 
 def iter_tests(suite):
@@ -65,15 +71,28 @@ def run_child(module):
     return 0 if result.wasSuccessful() else 1
 
 
+def remove_private_temp(path):
+    # Some tests leave read-only directories behind, which rmtree cannot empty.
+    for directory, _subdirectories, _files in os.walk(path):
+        os.chmod(directory, 0o700)
+    shutil.rmtree(path)
+
+
 def run_group(name):
     started = time.monotonic()
-    completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "--child", name],
-        cwd=str(ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        universal_newlines=True,
-    )
+    private_temp = tempfile.mkdtemp(prefix="vt-", dir=TEMP_BASE)
+    environment = dict(os.environ, TMPDIR=private_temp, TEMP=private_temp, TMP=private_temp)
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--child", name],
+            cwd=str(ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+        )
+    finally:
+        remove_private_temp(private_temp)
     report = None
     output = []
     for line in completed.stdout.splitlines(True):

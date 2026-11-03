@@ -29,6 +29,8 @@ All notable changes to this repository are documented here.
   `scripts/run_tests_parallel.py`, one process per test module with four at a time
   (`VALIDATE_TEST_JOBS` overrides). It fails when a module runs fewer tests than discovery
   found or exits without reporting a result, which plain `unittest discover` does not catch.
+  Each module process gets its own private `TMPDIR` under `/tmp`, because the task snapshot
+  tests fail closed when another process changes a shared temporary directory.
   The local full test run went from about 285 seconds to about 95 seconds.
 - Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
   MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
