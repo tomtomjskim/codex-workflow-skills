@@ -44,16 +44,68 @@ def completed(stdout, code=0):
 
 
 class ClaudeReviewTests(unittest.TestCase):
-    def run_attempt(self, response=None, code=0, data=None):
+    def run_attempt(self, response=None, code=0, data=None, **options):
         responses = [
             completed("2.1.178 (Claude Code)\n"),
             completed(json.dumps({"loggedIn": True, "email": "SECRET EMAIL"})),
             completed(json.dumps(response if response is not None else envelope()), code),
         ]
-        with patch.object(reviewer.shutil, "which", return_value="/fake/claude"), \
+        with patch.object(reviewer.shutil, "which", return_value=options.get('claude_bin', '/fake/claude')), \
                 patch.object(reviewer, "run_command", side_effect=responses) as run:
-            receipt = reviewer.run_review(data or request(), authorized=True)
+            receipt = reviewer.run_review(data or request(), authorized=True, **options)
         return receipt, run
+
+    def test_completed_structured_tool_output_is_accepted(self):
+        receipt, run = self.run_attempt(envelope(stop_reason="tool_use"))
+        self.assertEqual(receipt['attempt_state'], 'completed')
+        self.assertEqual(receipt['review'], envelope()['structured_output']['review'])
+        self.assertEqual(run.call_count, 3)
+
+    def test_tool_output_still_requires_completion_shape_and_revision(self):
+        cases = [
+            (envelope(stop_reason='tool_use', terminal_reason=None), 'incomplete_output'),
+            (envelope(stop_reason='tool_use', terminal_reason='cancelled'), 'incomplete_output'),
+            (envelope(stop_reason='tool_use', structured_output=None), 'empty_output'),
+            (envelope(stop_reason='tool_use', structured_output={'review':'missing fields'}), 'invalid_output'),
+            (envelope(stop_reason='tool_use', structured_output={
+                **envelope()['structured_output'], 'target_revision':'wrong'}), 'revision_mismatch'),
+            (envelope(stop_reason='tool_use', structured_output={
+                **envelope()['structured_output'], 'phase':'critique'}), 'phase_mismatch'),
+        ]
+        for response, expected in cases:
+            with self.subTest(expected=expected):
+                receipt, _ = self.run_attempt(response)
+                self.assertEqual(receipt['failure_class'], expected)
+                self.assertIsNone(receipt['review'])
+
+    def test_failure_preserves_safe_diagnostics_not_provider_text(self):
+        receipt, _ = self.run_attempt(envelope(
+            stop_reason='max_tokens', terminal_reason='SECRET', result='SECRET',
+            structured_output={'review':'SECRET'}, subtype='success'))
+        self.assertEqual(receipt['failure_class'], 'incomplete_output')
+        self.assertEqual(receipt['diagnostics']['stop_reason'], 'max_tokens')
+        self.assertEqual(receipt['diagnostics']['terminal_reason'], 'unrecognized')
+        self.assertTrue(receipt['diagnostics']['has_structured_output'])
+        self.assertEqual(receipt['provider_metrics']['models'], ['claude-example'])
+        self.assertNotIn('SECRET', json.dumps(receipt))
+
+    def test_explicit_model_and_executable_are_used_without_relaxing_isolation(self):
+        receipt, run = self.run_attempt(model='opus', claude_bin='/fake/pinned-claude')
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], '/fake/pinned-claude')
+        self.assertEqual(command[command.index('--model') + 1], 'opus')
+        self.assertEqual(receipt['requested_model'], 'opus')
+        self.assertEqual(command[command.index('--tools') + 1], '')
+        self.assertIn('--safe-mode', command)
+        self.assertNotIn('--fallback-model', command)
+
+    def test_invalid_model_or_relative_executable_never_invokes_provider(self):
+        for options in ({'model':'--unsafe'}, {'model':''}, {'model':42},
+                        {'claude_bin':'relative/claude'}, {'claude_bin':''}):
+            with self.subTest(options=options), patch.object(reviewer.shutil, 'which') as resolve:
+                receipt = reviewer.run_review(request(), authorized=True, **options)
+                self.assertEqual(receipt['failure_class'], 'invalid_input')
+                resolve.assert_not_called()
 
     def test_no_authorization_never_checks_cli(self):
         with patch.object(reviewer.shutil, "which") as resolve:

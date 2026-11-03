@@ -106,7 +106,25 @@ def public_metrics(envelope):
     return metrics
 
 
-def run_review(request, *, authorized=False, timeout=600):
+def public_diagnostics(envelope, returncode):
+    """Preserve completion signals without echoing arbitrary provider/error text."""
+    allowed = {
+        "type": ("result",),
+        "subtype": ("success", "error_max_turns", "error_max_budget_usd",
+                    "error_during_execution", "error_max_structured_output_retries"),
+        "stop_reason": ("end_turn", "tool_use", "max_tokens", "stop_sequence",
+                        "refusal", "pause_turn"),
+        "terminal_reason": ("completed", "cancelled", "interrupted"),
+    }
+    values = {"returncode": returncode,
+              "has_structured_output": envelope.get("structured_output") is not None}
+    for key, known in allowed.items():
+        value = envelope.get(key)
+        values[key] = value if value is None or value in known else "unrecognized"
+    return values
+
+
+def run_review(request, *, authorized=False, timeout=600, model=None, claude_bin=None):
     started = time.monotonic()
     receipt = {
         "attempt_id": str(uuid.uuid4()), "runtime": "claude-code",
@@ -133,6 +151,12 @@ def run_review(request, *, authorized=False, timeout=600):
         return finish("not_authorized")
     if not valid_request(request) or type(timeout) is not int or not 1 <= timeout <= 900:
         return finish("invalid_input")
+    if model is not None and (not isinstance(model, str)
+                              or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,79}", model)):
+        return finish("invalid_input")
+    if claude_bin is not None and (not isinstance(claude_bin, str)
+                                   or not os.path.isabs(claude_bin)):
+        return finish("invalid_input")
     try:
         input_text = json.dumps(request, ensure_ascii=False, separators=(",", ":"))
         if len(input_text.encode("utf-8")) > MAX_PACKET_BYTES:
@@ -140,10 +164,13 @@ def run_review(request, *, authorized=False, timeout=600):
     except UnicodeError:
         return finish("invalid_input")
     receipt.update(target_revision=request["target_revision"], phase=request["phase"])
-    executable = shutil.which("claude")
+    executable = shutil.which(claude_bin if claude_bin is not None else "claude")
     if executable is None:
         receipt["attempt_state"] = "unavailable"
         return finish("cli_unavailable")
+    receipt["cli_path"] = executable
+    if model is not None:
+        receipt["requested_model"] = model
     stage = "preflight"
     try:
         version = run_command([executable, "--safe-mode", "--version"], timeout=10)
@@ -158,12 +185,15 @@ def run_review(request, *, authorized=False, timeout=600):
             receipt["attempt_state"] = "unavailable"
             return finish("auth_unavailable")
         stage = "completion"
-        result = run_command([
+        command = [
             executable, "--safe-mode", "-p", "--tools", "",
             "--no-session-persistence", "--output-format", "json",
             "--json-schema", json.dumps(REVIEW_SCHEMA),
             "--system-prompt", SYSTEM_PROMPT,
-        ], timeout=timeout, input_text=input_text)
+        ]
+        if model is not None:
+            command.extend(["--model", model])
+        result = run_command(command, timeout=timeout, input_text=input_text)
     except subprocess.TimeoutExpired:
         return finish(stage + "_timeout")
     except (OSError, UnicodeError):
@@ -173,6 +203,9 @@ def run_review(request, *, authorized=False, timeout=600):
         return finish("interrupted")
 
     envelope = json_object(result.stdout)
+    if envelope is not None:
+        receipt["diagnostics"] = public_diagnostics(envelope, result.returncode)
+        receipt["provider_metrics"] = public_metrics(envelope)
     # Auth metadata can be stale even after loggedIn=true. Never echo error bodies.
     if envelope and envelope.get("api_error_status") in (401, 403):
         receipt["attempt_state"] = "unavailable"
@@ -187,7 +220,11 @@ def run_review(request, *, authorized=False, timeout=600):
             or envelope.get("is_error") is not False or envelope.get("permission_denials")
             or envelope.get("api_error_status") is not None):
         return finish("provider_error")
-    if (envelope.get("stop_reason") not in (None, "end_turn")
+    # Structured output can finish its model turn with tool_use in recent CLIs.
+    # Require explicit CLI completion, then validate the payload below.
+    structured_tool_completion = (envelope.get("stop_reason") == "tool_use"
+                                  and envelope.get("terminal_reason") == "completed")
+    if ((envelope.get("stop_reason") not in (None, "end_turn") and not structured_tool_completion)
             or envelope.get("terminal_reason") not in (None, "completed")):
         return finish("incomplete_output")
     review = envelope.get("structured_output")
@@ -214,6 +251,8 @@ def main():
     parser.add_argument("--authorized", action="store_true",
                         help="Chair confirms this external evaluator route is already authorized.")
     parser.add_argument("--timeout-seconds", type=int, default=600)
+    parser.add_argument("--model", help="Explicit Claude model alias or ID; no automatic fallback.")
+    parser.add_argument("--claude-bin", help="Absolute CLI executable path, avoiding PATH wrappers.")
     args = parser.parse_args()
     request = None
     if args.authorized:
@@ -223,7 +262,8 @@ def main():
                 request = json.loads(data)
             except (ValueError, UnicodeError, RecursionError):
                 pass
-    receipt = run_review(request, authorized=args.authorized, timeout=args.timeout_seconds)
+    receipt = run_review(request, authorized=args.authorized, timeout=args.timeout_seconds,
+                         model=args.model, claude_bin=args.claude_bin)
     print(json.dumps(receipt, ensure_ascii=False))
     return 0 if receipt["attempt_state"] == "completed" else 1
 

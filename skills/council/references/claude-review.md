@@ -29,6 +29,13 @@ version and `auth status`, then calls `--safe-mode -p --tools "" --no-session-pe
 --output-format json --json-schema ...` with a fixed reviewer system prompt. The schema uses
 Claude's [documented `structured_output` field](https://code.claude.com/docs/en/headless#get-structured-output);
 free-form text in `result` is not accepted as a review.
+Use `--model opus` (or an explicit model ID) when the user names a model. Use
+`--claude-bin /absolute/path/to/claude` when PATH wrappers select another installed version.
+These flags do not change global CLI configuration or enable provider fallback.
+An observed CLI structured-output response may use `stop_reason: tool_use` with
+`terminal_reason: completed`; the helper accepts this only after the successful envelope,
+review schema, target revision and phase all validate. A pending tool call, truncated response,
+missing structured payload or cancelled run is still a failure.
 Unsupported flags fail closed; do not retry without isolation or bypass permissions. Managed host
 policies still apply. Deadlines stop
 only the process/group created by this invocation, never another session's process.
@@ -72,6 +79,10 @@ does not override a later failed model call. No automatic retry or provider subs
 Apply Council's existing required-seat fallback; a requested Claude seat remains missing after
 failure even if the chair can provide provisional analysis.
 
+`diagnostics` retains only allowlisted completion labels, exit code and structured-output presence;
+unknown provider strings become `unrecognized`. Safe model/usage counters are retained on failure
+as well as success so a rejected completion can be diagnosed without exposing its content.
+
 An `auth_unavailable` receipt includes a pending `follow_up`: check login and account access,
 reauthenticate if needed, and obtain a fresh successful review for the current target revision.
 This includes unavailable or unreadable authentication status and structured 401/403 responses;
@@ -85,8 +96,9 @@ until the required review actually succeeds; logged-in status alone is insuffici
 Report this follow-up in the response only. Do not create a checklist file, schedule a notification,
 or claim that it will automatically reappear in a later session.
 
-Receipts carry local attempt ID, phase, CLI version when available, elapsed time and selected model
-usage counters on success. Provider `total_cost_usd` is a reported metric, not proof of billed cost.
+Receipts carry local attempt ID, phase, CLI path/version when available, requested model when
+specified, elapsed time and safe provider model/usage counters when available. Provider
+`total_cost_usd` is a reported metric, not proof of billed cost.
 The model list may include provider auxiliary models; do not count those as reviewer seats. Keep
 receipts in session memory unless durable output is requested. Do not invent provider registration
 times or heartbeats from a running shell session. Report `meeting_status` separately from
