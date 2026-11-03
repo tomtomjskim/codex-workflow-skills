@@ -11,18 +11,18 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Set up Python 3.9
+      - name: Set up Python 3.13
         uses: actions/setup-python@v7
         with:
-          python-version: "3.9"
+          python-version: "3.13"
 
       - name: Verify Python baseline
-        run: python3 -c 'import sys; assert sys.version_info[:2] == (3, 9), sys.version'
+        run: python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
 
       - name: Install Python validation dependencies
         run: python3 -m pip install --disable-pip-version-check -r requirements-ci.txt

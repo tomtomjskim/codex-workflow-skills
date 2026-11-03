@@ -20,6 +20,9 @@ All notable changes to this repository are documented here.
 
 ### Changed
 
+- Moved CI to the `ubuntu-26.04` runner with Python 3.13, because `actions/setup-python` has
+  no Python 3.9 build for Ubuntu 26.04. Local host tooling still targets the macOS Python 3.9.6
+  baseline.
 - Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
   MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
   routing, project-local shadow detection, fail-closed stale trust,

@@ -1249,23 +1249,23 @@ class RepositoryValidationTests(unittest.TestCase):
                     1,
                 )
 
-    def test_ci_checks_out_before_the_python_39_validation(self):
+    def test_ci_checks_out_before_the_python_313_validation(self):
         root = Path(__file__).parents[1]
         workflow = (root / ".github" / "workflows" / "validate.yml")
         source = workflow.read_text(encoding="utf-8")
         self.assertEqual(source.count("uses: actions/checkout@"), 1)
         checkout = source.index("uses: actions/checkout@")
         setup = source.index("uses: actions/setup-python@v7")
-        baseline = source.index('python-version: "3.9"')
+        baseline = source.index('python-version: "3.13"')
         assertion = source.index(
-            "assert sys.version_info[:2] == (3, 9)"
+            "assert sys.version_info[:2] == (3, 13)"
         )
         validation = source.index("run: ./scripts/validate_repo.sh")
 
         self.assertEqual(source.count("uses: actions/setup-python@v7"), 1)
-        self.assertEqual(source.count('python-version: "3.9"'), 1)
+        self.assertEqual(source.count('python-version: "3.13"'), 1)
         self.assertEqual(
-            source.count("assert sys.version_info[:2] == (3, 9)"),
+            source.count("assert sys.version_info[:2] == (3, 13)"),
             1,
         )
         self.assertLess(checkout, setup)
