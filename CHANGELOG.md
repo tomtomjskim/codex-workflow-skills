@@ -20,9 +20,11 @@ All notable changes to this repository are documented here.
 
 ### Changed
 
-- Moved CI to the `ubuntu-26.04` runner with Python 3.13, because `actions/setup-python` has
-  no Python 3.9 build for Ubuntu 26.04. Local host tooling still targets the macOS Python 3.9.6
-  baseline.
+- Moved CI to a two-job matrix: Python 3.15 on `ubuntu-26.04`, and Python 3.9 on
+  `ubuntu-24.04` to keep the macOS Python 3.9.6 host baseline checked, because
+  `actions/setup-python` has no Python 3.9 build for Ubuntu 26.04. CI installs ripgrep only
+  when the runner lacks it. Tests now import extensionless scripts with `exec_module`, because
+  Python 3.15 removed `SourceFileLoader.load_module()`.
 - Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
   MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
   routing, project-local shadow detection, fail-closed stale trust,

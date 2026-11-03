@@ -1249,25 +1249,31 @@ class RepositoryValidationTests(unittest.TestCase):
                     1,
                 )
 
-    def test_ci_checks_out_before_the_python_313_validation(self):
+    def test_ci_validates_python_315_and_the_python_39_baseline(self):
         root = Path(__file__).parents[1]
         workflow = (root / ".github" / "workflows" / "validate.yml")
         source = workflow.read_text(encoding="utf-8")
+        for runner, python in (("ubuntu-26.04", "3.15"), ("ubuntu-24.04", "3.9")):
+            with self.subTest(runner=runner):
+                self.assertEqual(
+                    source.count(
+                        "- runner: {}\n            python: \"{}\"\n".format(runner, python)
+                    ),
+                    1,
+                )
+        self.assertIn("runs-on: ${{ matrix.runner }}", source)
+        self.assertIn("fail-fast: false", source)
         self.assertEqual(source.count("uses: actions/checkout@"), 1)
         checkout = source.index("uses: actions/checkout@")
         setup = source.index("uses: actions/setup-python@v7")
-        baseline = source.index('python-version: "3.13"')
+        baseline = source.index("python-version: ${{ matrix.python }}")
         assertion = source.index(
-            "assert sys.version_info[:2] == (3, 13)"
+            "assert \"%d.%d\" % sys.version_info[:2] == sys.argv[1]"
         )
         validation = source.index("run: ./scripts/validate_repo.sh")
 
         self.assertEqual(source.count("uses: actions/setup-python@v7"), 1)
-        self.assertEqual(source.count('python-version: "3.13"'), 1)
-        self.assertEqual(
-            source.count("assert sys.version_info[:2] == (3, 13)"),
-            1,
-        )
+        self.assertIn('"${{ matrix.python }}"', source[assertion:validation])
         self.assertLess(checkout, setup)
         self.assertLess(setup, baseline)
         self.assertLess(baseline, assertion)

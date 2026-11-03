@@ -1,4 +1,3 @@
-import importlib.machinery
 import itertools
 import re
 import tempfile
@@ -12,6 +11,7 @@ from scripts.workflow_coordination.reviewer_routing import (
     derive_reviewers,
     load_reviewer_routing,
 )
+from tests.script_loading import load_script
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,9 +77,7 @@ class ReviewerRoutingTests(unittest.TestCase):
         cls.packet = PACKET.read_text(encoding="utf-8")
         cls.skill = SKILL.read_text(encoding="utf-8")
         cls.readme = README.read_text(encoding="utf-8")
-        cls.cli = importlib.machinery.SourceFileLoader(
-            "workflow_reviewer_routing_test", str(CLI)
-        ).load_module()
+        cls.cli = load_script("workflow_reviewer_routing_test", CLI)
 
     def test_json_is_the_exact_canonical_lens_registry(self):
         self.assertEqual(1, self.routing.schema_version)

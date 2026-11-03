@@ -11,26 +11,40 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-26.04
+    name: validate (${{ matrix.runner }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            python: "3.15"
+          # Python 3.9 has no Ubuntu 26.04 build; this job keeps the macOS 3.9.6 host baseline honest.
+          - runner: ubuntu-24.04
+            python: "3.9"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Set up Python 3.13
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
 
       - name: Verify Python baseline
-        run: python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), sys.version'
+        run: python3 -c 'import sys; assert "%d.%d" % sys.version_info[:2] == sys.argv[1], sys.version' "${{ matrix.python }}"
 
       - name: Install Python validation dependencies
         run: python3 -m pip install --disable-pip-version-check -r requirements-ci.txt
 
       - name: Install validation dependency
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
+          if command -v rg >/dev/null 2>&1; then
+            rg --version | head -1
+          else
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          fi
 
       - name: Validate repository
         run: ./scripts/validate_repo.sh

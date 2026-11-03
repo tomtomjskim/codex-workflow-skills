@@ -1,5 +1,4 @@
 import json
-import importlib.machinery
 import io
 import errno
 import subprocess
@@ -12,14 +11,13 @@ from unittest import mock
 from scripts.workflow_coordination.canonical_json import sha256_id
 from scripts.workflow_coordination.derive import derive_coordination
 from scripts.workflow_coordination import reviewer_routing
+from tests.script_loading import load_script
 
 
 ROOT = Path(__file__).parents[1]
 CLI = ROOT / "scripts" / "workflow"
 PLAN_FIXTURE = ROOT / "tests" / "fixtures" / "coordination" / "approved-plan.json"
-WORKFLOW_MODULE = importlib.machinery.SourceFileLoader(
-    "workflow_cli_test_module", str(CLI)
-).load_module()
+WORKFLOW_MODULE = load_script("workflow_cli_test_module", CLI)
 
 
 def run_cli(*arguments):
@@ -655,9 +653,7 @@ class WorkflowCLITests(unittest.TestCase):
             "load_reviewer_routing",
             side_effect=reviewer_routing.ReviewerRoutingError("injected routing failure"),
         ) as loader:
-            imported = importlib.machinery.SourceFileLoader(
-                module_name, str(CLI)
-            ).load_module()
+            imported = load_script(module_name, CLI)
 
         self.assertEqual(imported.CLI_VERSION, 1)
         loader.assert_not_called()
