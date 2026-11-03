@@ -128,7 +128,14 @@ Crash(p) ==
     /\ Goto(p, "crashed")
     /\ UNCHANGED <<target, stage, first>>
 
+\* Every run has ended and the output path exists, so nothing else can happen.
+Done ==
+    /\ \A p \in Preparers : pc[p] \in {"done", "failed", "crashed"}
+    /\ target.kind # "none"
+    /\ UNCHANGED vars
+
 Next ==
+    \/ Done
     \/ ExternalCreate
     \/ \E p \in Preparers :
          \/ Mkdtemp(p) \/ WriteStaged(p) \/ WriteFails(p) \/ FsyncDir(p)

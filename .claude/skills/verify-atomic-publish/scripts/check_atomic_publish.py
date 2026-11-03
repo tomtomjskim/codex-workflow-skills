@@ -137,17 +137,56 @@ def conformance(work):
     ):
         failures.append("A successful publish did not hold both files with the given bytes.")
 
-    probe_src = parent / "probe-src"
-    probe_src.mkdir()
-    probe_empty = parent / "probe-empty"
-    probe_empty.mkdir()
-    try:
-        os.rename(str(probe_src), str(probe_empty))
-    except OSError:
-        failures.append(
-            "Plain rename(2) did not replace an empty directory here, so the "
-            "check_then_rename variant models the wrong filesystem."
-        )
+    failures.extend(replay_check_then_rename(workflow, parent))
+    return failures
+
+
+def replay_check_then_rename(workflow, parent):
+    """Replay the check_then_rename counterexample through the real function.
+
+    Between the run seeing the path free and its rename, another process
+    creates an empty folder. With a plain rename that folder must be replaced,
+    which shows the broken variant's harm is real on this filesystem. With the
+    real no-replace rename the publish must be refused and the folder kept.
+    """
+    failures = []
+
+    def racing(rename):
+        def publish(staged, destination):
+            free = not os.path.lexists(str(destination))
+            destination.mkdir()
+            if rename is None:
+                if not free:
+                    raise FileExistsError(str(destination))
+                os.rename(str(staged), str(destination))
+            else:
+                rename(staged, destination)
+        return publish
+
+    for label, rename, must_replace in (
+        ("plain rename", None, True),
+        ("real no-replace rename", workflow._rename_directory_noreplace, False),
+    ):
+        target = parent / "replay-{}".format(label.replace(" ", "-"))
+        try:
+            workflow._publish_prepared_output(target, b"{}\n", b"{}\n", publish=racing(rename))
+            succeeded = True
+        except workflow.ValidationError:
+            succeeded = False
+        except Exception as error:
+            failures.append("Replay with {} raised {!r}.".format(label, error))
+            continue
+        replaced = succeeded and sorted(p.name for p in target.iterdir()) == ["inventory.json", "manifest.json"]
+        if must_replace and not replaced:
+            failures.append(
+                "Replay with plain rename did not replace the other process's empty "
+                "folder, so the check_then_rename variant models the wrong filesystem."
+            )
+        if not must_replace and (succeeded or list(target.iterdir())):
+            failures.append(
+                "Replay with the real no-replace rename replaced or changed the other "
+                "process's empty folder created after the run saw the path free."
+            )
     return failures
 
 

@@ -42,6 +42,8 @@ The confirmed SHA-256 is `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23
 
 `--keep` keeps every TLC output and trace in the printed temp directory. Read each TLA+ result, a violation trace or a passing model, with the pstack `/statechart` skill. It tells a violation as its shortest path in plain words and draws the state chart of a passing model.
 
+The full model has too many states for one chart, so `model/` also holds chart inputs for `/statechart`: `chart-real.cfg` and `chart-check_then_rename.cfg` each run one preparer with the outside creator, and `chart-view.ts` is the view module that gives states and steps their plain-word labels. Work on copies in a scratch folder. The `Done` action exists so that a finished run is not reported as a deadlock. The view hides only `Done` steps, which never leave their state. At `2cad251` the real chart had 13 states and 14 arrows with every rule holding. The check_then_rename chart showed one extra arrow, from someone else's empty folder to this run's output, on a 7 step path that breaks NoReplace and ExternalPreserved.
+
 ## What runs
 
 1. TLC checks `model/AtomicPublish.tla` with `model/AtomicPublish.cfg`, which sets `Variant = "real"` and three preparers. Deadlock checking is off, because every run ends in a terminal state.
@@ -49,7 +51,7 @@ The confirmed SHA-256 is `936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23
    - `check_then_rename` checks `exists()` and then calls plain `rename(2)`. It must violate NoReplace.
    - `publish_then_write` renames the empty staged directory first and writes the files after. It must violate Complete.
    - `no_cleanup` skips `shutil.rmtree` in the except branch. It must violate NoLeftover.
-3. Conformance runs the real `_publish_prepared_output` in a temp directory. For each of an empty directory, a directory with a file, a regular file, and a symlink to a directory, the call must raise `ValidationError("output directory must not already exist")`, leave the path byte for byte unchanged, and leave no staged sibling. A fresh path must end up with both files. It also confirms that plain `rename(2)` replaces an empty directory on this filesystem, which is what makes `check_then_rename` a real bug and not a modeling artifact.
+3. Conformance runs the real `_publish_prepared_output` in a temp directory. For each of an empty directory, a directory with a file, a regular file, and a symlink to a directory, the call must raise `ValidationError("output directory must not already exist")`, leave the path byte for byte unchanged, and leave no staged sibling. A fresh path must end up with both files. Last, it replays the check_then_rename counterexample through the real function by passing a racing publisher as its `publish` argument. Another process creates an empty folder after the run sees the path free. A plain rename must replace that folder, which shows the broken variant's harm is real on this filesystem. The real `_rename_directory_noreplace` must refuse and leave the folder empty.
 
 ## How the model maps to the code
 
@@ -81,7 +83,7 @@ It does not cover these.
 
 - `scripts/workflow`: `_write_staged_file`, `_rename_directory_noreplace`, `_atomic_publish_directory`, and `_publish_prepared_output`.
 
-**Sync commit: `5538237`.** The last change to `scripts/workflow` before it was `73998b1`. At this commit the model passed, all three broken variants were caught, and conformance passed. A scratch edit that changed the macOS flag in `_rename_directory_noreplace` from `0x00000004` to `0x00000000`, which makes it a plain rename, made conformance report that an outside empty directory was replaced. It also reported that publishing over a file or a symlink raised `NotADirectoryError`. The run ended with `RESULT: FINDING` and exit 1. After the edit was reverted, the run passed again.
+**Sync commit: `5538237`.** The last change to `scripts/workflow` before it was `73998b1`. At this commit the model passed, all three broken variants were caught, and conformance passed. A scratch edit that changed the macOS flag in `_rename_directory_noreplace` from `0x00000004` to `0x00000000`, which makes it a plain rename, made conformance report that an outside empty directory was replaced. It also reported that publishing over a file or a symlink raised `NotADirectoryError`, and that the counterexample replay with the real rename replaced the other process's empty folder. The run ended with `RESULT: FINDING` and exit 1, with 5 failures. After the edit was reverted, the run passed again. `scripts/workflow` was unchanged when the chart inputs and the replay were added, so the sync commit did not move.
 
 Before trusting a pass, run `git log --oneline 5538237..HEAD -- scripts/workflow`. If it lists commits, read their diffs for the four functions above and confirm the mapping in this file still holds. Move the sync commit forward only after that review and a passing run at the new commit.
 
