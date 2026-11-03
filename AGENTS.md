@@ -17,3 +17,5 @@ python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/w
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/adversarial-review-loop
 python3 ~/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
 ```
+
+If the Codex system plugin validator is not installed, run `python3 scripts/validate_plugin_manifest.py .` instead. It is a repository-owned structural check, not a replacement for full plugin validation evidence.

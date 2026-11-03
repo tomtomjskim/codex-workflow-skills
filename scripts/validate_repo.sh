@@ -119,6 +119,8 @@ require_file tests/test_run_harness_canary_readiness.py
 require_file tests/test_council_contract.py
 require_file tests/test_session_wiki_contract.py
 require_file tests/test_plugin_manifest_contract.py
+require_file tests/test_validate_plugin_manifest.py
+require_file scripts/validate_plugin_manifest.py
 
 if [ ! -x scripts/workflow ]; then
   printf 'error: workflow CLI is not executable: scripts/workflow\n' >&2
@@ -139,7 +141,8 @@ fi
 if [ -f "$PLUGIN_VALIDATOR" ]; then
   run python3 "$PLUGIN_VALIDATOR" .
 else
-  printf 'skip: plugin validator not found at %s\n' "$PLUGIN_VALIDATOR"
+  printf 'fallback: plugin validator not found at %s; using repository-owned check\n' "$PLUGIN_VALIDATOR"
+  run python3 scripts/validate_plugin_manifest.py .
 fi
 
 run git diff --check
