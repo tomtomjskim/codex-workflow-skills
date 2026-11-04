@@ -283,3 +283,9 @@ from its structured `required_values` response assertions.
       classes, keep reviewer evidence separate from chair-only fallback, perform no workspace write,
       test, or external access, and never convert `provisional_main_only` or static review into
       consensus or validation pass.
+
+57. [ARL-UNPROVEN-FINDING] Finding supported only by reading the code:
+    - A MED race-condition candidate could not be run because a repro needs a shared database;
+      one style-only candidate and one non-reproducible candidate were dropped.
+    - Expected: record `finding_evidence.proof: static_only`, never describe the finding as proven
+      or confirmed, and report `dropped_candidates.count: 2` with a reason for each.

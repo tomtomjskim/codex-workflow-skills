@@ -429,7 +429,7 @@ class RunnerTests(unittest.TestCase):
             run_eval(unapproved, FakeCodex())
 
         planned = run_eval(EvalRequest.dry_run(release_suite=True), FakeCodex())
-        self.assertEqual(len(planned.manifest.scenario_ids), 36)
+        self.assertEqual(len(planned.manifest.scenario_ids), 37)
         self.assertEqual(planned.model_calls, 0)
 
     def test_runner_uses_fixed_targeted_and_release_budget_factories(self):
@@ -466,7 +466,7 @@ class RunnerTests(unittest.TestCase):
                 FakeCodex(),
             )
         self.assertEqual(release.verification_result, "pass")
-        self.assertEqual(len(release.manifest.scenario_ids), 36)
+        self.assertEqual(len(release.manifest.scenario_ids), 37)
         self.assertEqual(set(captured), {BudgetPolicy(40, 5400.0, 2, 1024 * 1024)})
 
     def test_live_run_uses_same_sealed_invocation_and_asserts_redacted_response(self):

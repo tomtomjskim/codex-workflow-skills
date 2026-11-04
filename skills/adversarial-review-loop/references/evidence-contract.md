@@ -12,6 +12,8 @@ finding:
     observed_problem:
     failure_mode:
     source:
+    proof: run | static_only
+    command_or_output:
   impact:
   proposed_fix:
   fix_risk_class:
@@ -29,6 +31,8 @@ finding:
 Rules:
 
 - Finding evidence explains why the issue exists.
+- `finding_evidence.proof` is `run` only when a command, test, or repro against the real code showed the wrong behavior; record that command and its relevant output in `command_or_output`. Otherwise it is `static_only`, and the finding must not be described as proven or confirmed.
+- `finding_evidence.proof` records how the problem was shown. `verification_evidence.result` records how the fix was checked. Do not use one in place of the other.
 - Verification evidence explains why the fix worked.
 - A test pass is not enough for any finding unless the executed assertion would fail for the original failure mode or actual regression. Truthiness-only assertions, smoke tests, "does not throw" checks, and unrelated coverage must be recorded as `partial` when they would not catch that failure mode.
 - If the review packet requires or recommends E2E/browser validation, evidence must include the route or entrypoint, interaction steps, assertions, and artifacts or command output. Screenshot-only evidence, page-load smoke checks, or tests that miss the original failure mode are `partial`.
@@ -40,6 +44,18 @@ Rules:
 - HIGH findings cannot be auto-applied or auto-rejected.
 - `reject-with-reason` requires counter-evidence.
 - `defer` requires why it is safe to defer and when it should be revisited.
+
+Candidates that were considered but not reported as findings are summarized once per review:
+
+```yaml
+dropped_candidates:
+  count:
+  reasons:
+    - reason: not_reproducible | style_only | needs_future_change | out_of_scope
+      count:
+```
+
+Report `count: 0` with an empty `reasons` list when nothing was dropped. The reason counts must sum to `count`.
 
 ## Persistent Control Proposals
 

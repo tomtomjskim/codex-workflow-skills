@@ -218,6 +218,17 @@
       "timeout_seconds": 120
     },
     {
+      "scenario_id": "ARL-UNPROVEN-FINDING",
+      "schema_version": 1,
+      "tags": ["adversarial-review-loop", "evidence", "proof"],
+      "prompt": "A reviewer found one MED race-condition candidate only by reading the code, because a repro would need a shared database. Two other candidates were dropped: one is style-only and one could not be reproduced. Report the findings and dropped candidates.",
+      "required_paths": ["findings[].finding_evidence.proof", "dropped_candidates.count", "dropped_candidates.reasons[].reason"],
+      "required_values": {"findings[].finding_evidence.proof": "static_only", "dropped_candidates.count": 2},
+      "forbidden_values": ["proven", "confirmed"],
+      "expected_status": "partial",
+      "timeout_seconds": 120
+    },
+    {
       "scenario_id": "SC-INITIAL-NONTRIVIAL-PLAN",
       "schema_version": 1,
       "tags": ["session-conduct", "workflow-intake", "planning"],

@@ -679,7 +679,7 @@ python3 scripts/run_live_eval.py \
 A successful harness preflight reports `status=harness_preflight_only`, `materialization_result=pass`, `model_conformance=not_run`, and `model_calls=0`. It proves only that the fixed files and clean-HEAD skills were materialized, hashed, sealed, and immediately reverified in a private temporary home. It does not launch or probe Codex, prove that Codex consumed those files, or provide model-quality evidence. Output contains only path-free identifiers, counts, and digests; cleanup that cannot be proven changes the result to `status=blocked_cleanup`, `reason=cleanup_unverified`.
 
 Targeted execution selects at most three scenarios and is bounded to five model calls, 600 seconds,
-and concurrency one. Release execution selects at most 36 scenarios and is bounded to 40 model
+and concurrency one. Release execution selects at most 37 scenarios and is bounded to 40 model
 calls, 5,400 seconds, and concurrency two. The normal scenario runner's isolated checkout includes
 `workflow`, `workflow-intake`, `adversarial-review-loop`, `council`, and `session-wiki`; the fixed
 Phase A and harness materialization profiles retain their legacy three-skill checkout. Release

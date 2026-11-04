@@ -35,6 +35,11 @@ All notable changes to this repository are documented here.
 - The three harness cleanup-preservation tests in `tests/test_live_eval_runner.py` now remove
   the directories they make `run_harness_dry_run` preserve, so test runs no longer leave
   read-only `codex-harness-preflight-root-*` directories in the temporary directory.
+- Gave the adversarial-review-loop proof rules a place in the schema. `finding_evidence` now has
+  `proof: run | static_only` and `command_or_output`, separate from the fix's
+  `verification_evidence.result`, and the output contract has `dropped_candidates` with a count
+  and reasons. The new `ARL-UNPROVEN-FINDING` eval scenario checks both, which raises the release
+  suite to 37 scenarios within the same 40-call budget.
 - Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
   MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
   routing, project-local shadow detection, fail-closed stale trust,

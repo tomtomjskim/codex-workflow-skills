@@ -41,7 +41,7 @@ class ScenarioTests(unittest.TestCase):
     def test_loads_versioned_corpus_with_all_documented_scenarios(self):
         scenarios = load_scenarios(FIXTURE)
 
-        self.assertEqual(len(scenarios), 36)
+        self.assertEqual(len(scenarios), 37)
         self.assertEqual(tuple(scenarios), tuple(sorted(scenarios)))
         self.assertTrue(all(item.schema_version == 1 for item in scenarios.values()))
         self.assertTrue(all(item.required_values for item in scenarios.values()))
@@ -196,6 +196,42 @@ class ScenarioTests(unittest.TestCase):
                     ("Wait for nginx approval.",),
                 ),
             ),
+        )
+
+    def test_unproven_finding_scenario_rejects_overclaimed_proof(self):
+        scenario = load_scenarios(FIXTURE)["ARL-UNPROVEN-FINDING"]
+        response = {
+            "findings": [{"severity": "MED", "finding_evidence": {"proof": "static_only"}}],
+            "dropped_candidates": {
+                "count": 2,
+                "reasons": [
+                    {"reason": "style_only", "count": 1},
+                    {"reason": "not_reproducible", "count": 1},
+                ],
+            },
+        }
+
+        self.assertTrue(assert_response(scenario, response).passed)
+
+        claimed_run = copy.deepcopy(response)
+        claimed_run["findings"][0]["finding_evidence"]["proof"] = "run"
+        self.assertEqual(
+            assert_response(scenario, claimed_run).value_mismatches,
+            (("findings[].finding_evidence.proof", "static_only", ("run",)),),
+        )
+
+        confirmed = copy.deepcopy(response)
+        confirmed["findings"][0]["status"] = "confirmed"
+        self.assertEqual(
+            assert_response(scenario, confirmed).forbidden_matches,
+            (("findings[0].status", "confirmed"),),
+        )
+
+        unreported = copy.deepcopy(response)
+        del unreported["dropped_candidates"]
+        self.assertEqual(
+            assert_response(scenario, unreported).missing_paths,
+            ("dropped_candidates.count", "dropped_candidates.reasons[].reason"),
         )
 
     def test_required_and_forbidden_assertions_are_deterministic(self):
