@@ -40,6 +40,9 @@ All notable changes to this repository are documented here.
   `verification_evidence.result`, and the output contract has `dropped_candidates` with a count
   and reasons. The new `ARL-UNPROVEN-FINDING` eval scenario checks both, which raises the release
   suite to 37 scenarios within the same 40-call budget.
+- The Council timeout test now waits up to five seconds for the killed descendant to release its
+  lock instead of checking once, and its cleanup tolerates the `EPERM` that macOS returns for a
+  process group with only exited members. Both made the test fail intermittently under load.
 - Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
   MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
   routing, project-local shadow detection, fail-closed stale trust,

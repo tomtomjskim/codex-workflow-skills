@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -378,15 +379,25 @@ class ClaudeReviewTests(unittest.TestCase):
                         )
                 self.assertTrue(ready_path.exists(), 'descendant must acquire lock before timeout')
                 self.assertEqual(owned[0].returncode, -signal.SIGKILL)
+                # SIGKILL is delivered asynchronously, so give the killed descendant a moment
+                # to exit. A live descendant sleeps 30 seconds and would keep the lock.
+                deadline = time.monotonic() + 5
                 with lock_path.open('r+') as lock:
-                    # A live descendant would still own this lock; zombies hold no locks.
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    while True:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() > deadline:
+                                self.fail('descendant still holds the lock after timeout')
+                            time.sleep(0.05)
                 self.assertIsNone(sentinel.poll(), 'unrelated process must remain alive')
             finally:
                 for process in owned:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, PermissionError):
+                        # macOS reports EPERM when only exited members of the group remain.
                         pass
                 sentinel.terminate()
                 sentinel.wait(timeout=5)
