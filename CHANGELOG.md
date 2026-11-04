@@ -32,6 +32,9 @@ All notable changes to this repository are documented here.
   Each module process gets its own private `TMPDIR` under `/tmp`, because the task snapshot
   tests fail closed when another process changes a shared temporary directory.
   The local full test run went from about 285 seconds to about 95 seconds.
+- The three harness cleanup-preservation tests in `tests/test_live_eval_runner.py` now remove
+  the directories they make `run_harness_dry_run` preserve, so test runs no longer leave
+  read-only `codex-harness-preflight-root-*` directories in the temporary directory.
 - Hardened the host-policy audit with a strict v3 manifest, Tomli-backed Python 3.9 parsing, exact
   MCP/rules/profile/project inventories, canonical path and direct-link checks, protected reviewer
   routing, project-local shadow detection, fail-closed stale trust,

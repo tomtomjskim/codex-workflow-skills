@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
@@ -273,6 +274,19 @@ class RunnerTests(unittest.TestCase):
         self._git("config", "user.name", "Runner Test")
         self._git("add", ".")
         self._git("commit", "-qm", "fixture")
+
+    def _remove_preserved_harness_paths(self, *paths):
+        # blocked_cleanup preserves these by design; the test performs the manual cleanup.
+        def remove():
+            for path in paths:
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    for directory, _subdirectories, _files in os.walk(path):
+                        os.chmod(directory, 0o700)
+                    shutil.rmtree(path)
+
+        self.addCleanup(remove)
 
     def _create_harness_bundle_fixture(self):
         bundle = self.root / "harness-bundle"
@@ -1433,6 +1447,7 @@ class RunnerTests(unittest.TestCase):
             marker.write_text("preserve\n", encoding="utf-8")
             marker.chmod(0o600)
             replacements.append((temp_root, moved, marker))
+            self._remove_preserved_harness_paths(temp_root, moved)
             return cleanup(temp_root, root_identity, codex_home, home_identity)
 
         request = live_runner.HarnessDryRunRequest(
@@ -1482,6 +1497,7 @@ class RunnerTests(unittest.TestCase):
             target.rename(moved)
             target.symlink_to(replacement_target, target_is_directory=True)
             replacements.append((target, moved))
+            self._remove_preserved_harness_paths(temp_root)
             return captured
 
         request = live_runner.HarnessDryRunRequest(
@@ -1523,6 +1539,7 @@ class RunnerTests(unittest.TestCase):
             target.write_text("replacement\n", encoding="utf-8")
             target.chmod(0o400)
             replacements.append((target, moved))
+            self._remove_preserved_harness_paths(temp_root)
             return captured
 
         request = live_runner.HarnessDryRunRequest(
