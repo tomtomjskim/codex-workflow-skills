@@ -1,2 +1,2 @@
-PyYAML==6.0.3
+PyYAML==6.0.4
 tomli==2.4.1
